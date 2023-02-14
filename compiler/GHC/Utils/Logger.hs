@@ -75,6 +75,7 @@ module GHC.Utils.Logger
     )
 where
 
+import Data.Maybe (fromMaybe)
 import GHC.Prelude
 import GHC.Driver.Flags
 import GHC.Types.Error
@@ -258,7 +259,10 @@ initLogger = do
 
 -- | Log something
 putLogMsg :: Logger -> LogAction
-putLogMsg logger = foldr ($) defaultLogAction (log_hook logger)
+putLogMsg logger =
+  let
+      dumps = generated_dumps logger
+  in foldr ($) (defaultLogAction' (Just dumps)) (log_hook logger)
 
 -- | Dump something
 putDumpFile :: Logger -> DumpAction
@@ -329,13 +333,17 @@ makeThreadSafe logger = do
 
 -- See Note [JSON Error Messages]
 --
-jsonLogAction :: LogAction
-jsonLogAction _ (MCDiagnostic SevIgnore _ _) _ _ = return () -- suppress the message
-jsonLogAction logflags msg_class srcSpan msg
-  =
-    defaultLogActionHPutStrDoc logflags True stdout
-      (withPprStyle PprCode (doc $$ text ""))
+jsonLogAction :: DumpCache -> LogAction
+jsonLogAction _ _ (MCDiagnostic SevIgnore _ _) _ _ = return () -- suppress the message
+jsonLogAction dumps logflags msg_class srcSpan msg
+    | log_dump_to_file logflags
+    = withDumpFileHandle dumps logflags Opt_D_dump_json (log_action . fromMaybe stdout)
+    | otherwise
+    = log_action stdout
     where
+      log_action handle =
+        defaultLogActionHPutStrDoc logflags True handle
+          (withPprStyle PprCode (doc $$ text ""))
       str = renderWithContext (log_default_user_context logflags) msg
       doc = renderJSON $
               JSObject [ ( "span", json srcSpan )
@@ -344,17 +352,24 @@ jsonLogAction logflags msg_class srcSpan msg
                        ]
 
 defaultLogAction :: LogAction
-defaultLogAction logflags msg_class srcSpan msg
-  | log_dopt Opt_D_dump_json logflags = jsonLogAction logflags msg_class srcSpan msg
-  | otherwise = case msg_class of
-      MCOutput                     -> printOut msg
-      MCDump                       -> printOut (msg $$ blankLine)
-      MCInteractive                -> putStrSDoc msg
-      MCInfo                       -> printErrs msg
-      MCFatal                      -> printErrs msg
-      MCDiagnostic SevIgnore _ _   -> pure () -- suppress the message
-      MCDiagnostic _sev _rea _code -> printDiagnostics
+defaultLogAction = defaultLogAction' Nothing
+
+defaultLogAction' :: Maybe DumpCache -> LogAction
+defaultLogAction' mDumps logflags msg_class srcSpan msg
+  = case mDumps of
+      Just dumps | log_dopt Opt_D_dump_json logflags ->
+        jsonLogAction dumps logflags msg_class srcSpan msg
+      _ -> deflt
     where
+      deflt = case msg_class of
+        MCOutput                     -> printOut msg
+        MCDump                       -> printOut (msg $$ blankLine)
+        MCInteractive                -> putStrSDoc msg
+        MCInfo                       -> printErrs msg
+        MCFatal                      -> printErrs msg
+        MCDiagnostic SevIgnore _ _   -> pure () -- suppress the message
+        MCDiagnostic _sev _rea _code -> printDiagnostics
+
       printOut   = defaultLogActionHPrintDoc  logflags False stdout
       printErrs  = defaultLogActionHPrintDoc  logflags False stderr
       putStrSDoc = defaultLogActionHPutStrDoc logflags False stdout
@@ -393,10 +408,10 @@ defaultLogActionHPutStrDoc logflags asciiSpace h d
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~
 --
 -- When the user requests the compiler output to be dumped as json
--- we used to collect them all in an IORef and then print them at the end.
--- This doesn't work very well with GHCi. (See #14078) So instead we now
--- use the simpler method of just outputting a JSON document inplace to
--- stdout.
+-- (-ddump-json) without -ddump-to-file, GHC output a JSON document
+-- inplace to stdout. However, if log_dump_to_file is set to True,
+-- the JSON logs are redirected to a dump file with the .dump_json
+-- extension.
 --
 -- Before the compiler calls log_action, it has already turned the `ErrMsg`
 -- into a formatted message. This means that we lose some possible
