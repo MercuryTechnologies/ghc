@@ -265,6 +265,7 @@ import GHC.SysTools (initSysTools)
 import GHC.SysTools.BaseDir (findTopDir)
 
 import Data.Data hiding (Fixity, TyCon)
+import Data.Foldable (toList)
 import Data.List        ( nub, isPrefixOf, partition )
 import qualified Data.List.NonEmpty as NE
 import Control.Monad
@@ -855,6 +856,18 @@ hscRecompStatus
         msg $ NeedsRecompile reason
         return $ HscRecompNeeded $ fmap (mi_iface_hash . mi_final_exts) mb_checked_iface
       UpToDateItem checked_iface -> do
+        let deps = dep_direct_mods $ mi_deps checked_iface
+            hug = hsc_HUG hsc_env
+            uid = ms_unitid mod_summary
+            hpt :: HomePackageTable
+            hpt = expectJust "hscRecompStatus" (homeUnitEnv_hpt <$> unitEnv_lookup_maybe uid hug)
+            depObjExists = flip fmap (toList deps) $ \(uid, modwithboot) ->
+              let mod_name = gwib_mod modwithboot
+                  mobj = do
+                     mod_info <- lookupHpt hpt mod_name
+                     homeModInfoObject mod_info
+               in isJust mobj
+            allDepObjReady = and depObjExists
         let lcl_dflags = ms_hspp_opts mod_summary
         if | not (backendGeneratesCode (backend lcl_dflags)) -> do
                -- No need for a linkable, we're good to go
@@ -900,8 +913,8 @@ hscRecompStatus
                              -- If bytecode is available for Interactive then don't load object code
                              UpToDateItem _ -> just_bc
                              _ -> case obj_linkable of
-                                     -- If o is availabe, then just use that
-                                     UpToDateItem _ -> just_o
+                                     -- If o is available, then just use that
+                                     UpToDateItem _ | allDepObjReady -> just_o
                                      _ -> outOfDateItemBecause MissingBytecode Nothing
                         -- Need object files for making object files
                         | backendWritesFiles (backend lcl_dflags) ->
