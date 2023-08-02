@@ -574,8 +574,8 @@ data IfaceExpr
 data IfaceTickish
   = IfaceHpcTick    Module Int               -- from HpcTick x
   | IfaceSCC        CostCentre Bool Bool     -- from ProfNote
-  | IfaceSource  RealSrcSpan String          -- from SourceNote
-  | IfaceBreakpoint Int [IfaceIdBndr] Module -- from Breakpoint
+  | IfaceSource  RealSrcSpan String      -- from SourceNote
+  | IfaceBreakpoint Int [IfaceExpr] Module   -- from Breakpoint
 
 data IfaceAlt = IfaceAlt IfaceConAlt [IfLclName] IfaceExpr
         -- Note: IfLclName, not IfaceBndr (and same with the case binder)
@@ -1793,7 +1793,7 @@ freeNamesIfExpr (IfaceTuple _ as)     = fnList freeNamesIfExpr as
 freeNamesIfExpr (IfaceLam (b,_) body) = freeNamesIfBndr b &&& freeNamesIfExpr body
 freeNamesIfExpr (IfaceApp f a)        = freeNamesIfExpr f &&& freeNamesIfExpr a
 freeNamesIfExpr (IfaceCast e co)      = freeNamesIfExpr e &&& freeNamesIfCoercion co
-freeNamesIfExpr (IfaceTick _ e)       = freeNamesIfExpr e
+freeNamesIfExpr (IfaceTick t e)       = freeNamesIfTickish t &&& freeNamesIfExpr e
 freeNamesIfExpr (IfaceECase e ty)     = freeNamesIfExpr e &&& freeNamesIfType ty
 freeNamesIfExpr (IfaceCase s _ alts)
   = freeNamesIfExpr s &&& fnList fn_alt alts &&& fn_cons alts
@@ -1839,6 +1839,11 @@ freeNamesIfaceTyConParent :: IfaceTyConParent -> NameSet
 freeNamesIfaceTyConParent IfNoParent = emptyNameSet
 freeNamesIfaceTyConParent (IfDataInstance ax tc tys)
   = unitNameSet ax &&& freeNamesIfTc tc &&& freeNamesIfAppArgs tys
+
+freeNamesIfTickish :: IfaceTickish -> NameSet
+freeNamesIfTickish (IfaceBreakpoint _ fvs _) =
+  fnList freeNamesIfExpr fvs
+freeNamesIfTickish _ = emptyNameSet
 
 -- helpers
 (&&&) :: NameSet -> NameSet -> NameSet

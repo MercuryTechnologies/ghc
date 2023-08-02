@@ -581,7 +581,7 @@ toIfaceTickish (HpcTick modl ix)       = IfaceHpcTick modl ix
 toIfaceTickish (SourceNote src names) =
   IfaceSource src names
 toIfaceTickish (Breakpoint _ ix fv m) =
-  IfaceBreakpoint ix (toIfaceIdBndr <$> fv) m
+  IfaceBreakpoint ix (toIfaceVar <$> fv) m
 
 ---------------------
 toIfaceBind :: Bind Id -> IfaceBinding IfaceLetBndr

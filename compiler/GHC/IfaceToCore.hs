@@ -1643,8 +1643,8 @@ tcIfaceTickish (IfaceHpcTick modl ix)   = return (HpcTick modl ix)
 tcIfaceTickish (IfaceSCC  cc tick push) = return (ProfNote cc tick push)
 tcIfaceTickish (IfaceSource src name)   = return (SourceNote src name)
 tcIfaceTickish (IfaceBreakpoint ix fvs modl) = do
-  fvs' <- bindIfaceIds fvs pure
-  return (Breakpoint NoExtField ix fvs' modl)
+  fvs' <- mapM tcIfaceExpr fvs
+  return (Breakpoint NoExtField ix [f | Var f <- fvs'] modl)
 
 -------------------------
 tcIfaceLit :: Literal -> IfL Literal
