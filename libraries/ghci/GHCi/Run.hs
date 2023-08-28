@@ -52,8 +52,10 @@ run m = case m of
   InitLinker -> initObjLinker RetainCAFs
   RtsRevertCAFs -> rts_revertCAFs
   LookupSymbol str -> fmap toRemotePtr <$> lookupSymbol str
+  LookupSymbolInDLL dll str ->
+    fmap toRemotePtr <$> lookupSymbolInDLL (fromRemotePtr dll) str
   LookupClosure str -> lookupClosure str
-  LoadDLL str -> loadDLL str
+  LoadDLL str -> fmap toRemotePtr <$> loadDLL str
   LoadArchive str -> loadArchive str
   LoadObj str -> loadObj str
   UnloadObj str -> unloadObj str
