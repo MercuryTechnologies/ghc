@@ -579,7 +579,7 @@ typedef
 static OpenedSO* openedSOs = NULL;
 
 static void *
-internal_dlopen(const char *dll_name, const char **errmsg_ptr)
+internal_dlopen(const char *dll_name, char **errmsg_ptr)
 {
    OpenedSO* o_so;
    void *hdl;
@@ -718,7 +718,7 @@ void *lookupSymbolInDLL(void *handle, const char *symbol_name)
 }
 #  endif
 
-void *addDLL(pathchar* dll_name, const char **errmsg_ptr)
+void* addDLL(pathchar *dll_name, char **errmsg_ptr)
 {
 #  if defined(OBJFORMAT_ELF) || defined(OBJFORMAT_MACHO)
    /* ------------------- ELF DLL loader ------------------- */
@@ -726,7 +726,6 @@ void *addDLL(pathchar* dll_name, const char **errmsg_ptr)
 #define NMATCH 5
    regmatch_t match[NMATCH];
    void *handle;
-   const char *errmsg;
    FILE* fp;
    size_t match_length;
 #define MAXLINE 1000
@@ -734,7 +733,8 @@ void *addDLL(pathchar* dll_name, const char **errmsg_ptr)
    int result;
 
    IF_DEBUG(linker, debugBelch("addDLL: dll_name = '%s'\n", dll_name));
-   handle = internal_dlopen(dll_name, &errmsg);
+   handle = internal_dlopen(dll_name, errmsg_ptr);
+   char *errmsg = *errmsg_ptr;
 
    if (handle != NULL) {
       return handle;
