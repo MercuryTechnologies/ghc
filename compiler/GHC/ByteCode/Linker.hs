@@ -22,7 +22,6 @@ import GHC.Runtime.Interpreter
 import GHC.ByteCode.Types
 import GHCi.RemoteTypes
 import GHCi.ResolvedBCO
-import GHCi.BreakArray
 
 import GHC.Builtin.PrimOps
 import GHC.Builtin.Names
@@ -58,15 +57,14 @@ linkBCO
   -> PkgsLoaded
   -> LinkerEnv
   -> NameEnv Int
-  -> RemoteRef BreakArray
   -> UnlinkedBCO
   -> IO ResolvedBCO
-linkBCO interp pkgs_loaded le bco_ix breakarray
+linkBCO interp pkgs_loaded le bco_ix
            (UnlinkedBCO _ arity insns bitmap lits0 ptrs0) = do
   -- fromIntegral Word -> Word64 should be a no op if Word is Word64
   -- otherwise it will result in a cast to longlong on 32bit systems.
   lits <- mapM (fmap fromIntegral . lookupLiteral interp pkgs_loaded le) (ssElts lits0)
-  ptrs <- mapM (resolvePtr interp pkgs_loaded le bco_ix breakarray) (ssElts ptrs0)
+  ptrs <- mapM (resolvePtr interp pkgs_loaded le bco_ix) (ssElts ptrs0)
   return (ResolvedBCO isLittleEndian arity insns bitmap
               (listArray (0, fromIntegral (sizeSS lits0)-1) lits)
               (addListToSS emptySS ptrs))
@@ -141,10 +139,9 @@ resolvePtr
   -> PkgsLoaded
   -> LinkerEnv
   -> NameEnv Int
-  -> RemoteRef BreakArray
   -> BCOPtr
   -> IO ResolvedBCOPtr
-resolvePtr interp pkgs_loaded le bco_ix breakarray ptr = case ptr of
+resolvePtr interp pkgs_loaded le bco_ix ptr = case ptr of
   BCOPtrName nm
     | Just ix <- lookupNameEnv bco_ix nm
     -> return (ResolvedBCORef ix) -- ref to another BCO in this group
@@ -165,10 +162,10 @@ resolvePtr interp pkgs_loaded le bco_ix breakarray ptr = case ptr of
     -> ResolvedBCOStaticPtr <$> lookupPrimOp interp op
 
   BCOPtrBCO bco
-    -> ResolvedBCOPtrBCO <$> linkBCO interp pkgs_loaded le bco_ix breakarray bco
+    -> ResolvedBCOPtrBCO <$> linkBCO interp pkgs_loaded le bco_ix bco
 
-  BCOPtrBreakArray
-    -> return (ResolvedBCOPtrBreakArray breakarray)
+  BCOPtrBreakArray breakarray
+    -> withForeignRef breakarray $ \ba -> return (ResolvedBCOPtrBreakArray ba)
 
 lookupHsSymbol :: Interp -> PkgsLoaded -> Name -> String -> IO (Maybe (Ptr ()))
 lookupHsSymbol interp pkgs_loaded nm sym_suffix = do

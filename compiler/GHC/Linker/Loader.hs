@@ -596,10 +596,9 @@ loadExpr interp hsc_env span root_ul_bco = do
         -- Load the expression itself
         -- Load the necessary packages and linkables
         let le = linker_env pls
-            nobreakarray = error "no break array"
             bco_ix = mkNameEnv [(unlinkedBCOName root_ul_bco, 0)]
-        resolved <- linkBCO interp (pkgs_loaded pls) le bco_ix nobreakarray root_ul_bco
-        bco_opts <- initBCOOpts (hsc_dflags hsc_env)
+        resolved <- linkBCO interp (pkgs_loaded pls) le bco_ix root_ul_bco
+        bco_opts <- initBCOOpts (hsc_dflags hsc_env)                    
         [root_hvref] <- createBCOs interp bco_opts [resolved]
         fhv <- mkFinalizedHValue interp root_hvref
         return (pls, fhv)
@@ -1200,19 +1199,14 @@ linkSomeBCOs :: BCOOpts
 
 linkSomeBCOs bco_opts interp pkgs_loaded le mods = foldr fun do_link mods []
  where
-  fun CompiledByteCode{..} inner accum =
-    case bc_breaks of
-      Nothing -> inner ((panic "linkSomeBCOs: no break array", bc_bcos) : accum)
-      Just mb -> withForeignRef (modBreaks_flags mb) $ \breakarray ->
-                   inner ((breakarray, bc_bcos) : accum)
+  fun CompiledByteCode{..} inner accum = inner (bc_bcos : accum)
 
   do_link [] = return []
   do_link mods = do
-    let flat = [ (breakarray, bco) | (breakarray, bcos) <- mods, bco <- bcos ]
-        names = map (unlinkedBCOName . snd) flat
+    let flat = [ bco | bcos <- mods, bco <- bcos ]
+        names = map unlinkedBCOName flat
         bco_ix = mkNameEnv (zip names [0..])
-    resolved <- sequence [ linkBCO interp pkgs_loaded le bco_ix breakarray bco
-                         | (breakarray, bco) <- flat ]
+    resolved <- sequence [ linkBCO interp pkgs_loaded le bco_ix bco | bco <- flat ]
     hvrefs <- createBCOs interp bco_opts resolved
     return (zip names hvrefs)
 

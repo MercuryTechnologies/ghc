@@ -14,6 +14,7 @@ module GHCi.Message
   , THMessage(..), THMsg(..)
   , QResult(..)
   , EvalStatus_(..), EvalStatus, EvalResult(..), EvalOpts(..), EvalExpr(..)
+  , EvalBreakpoint (..)
   , SerializableException(..)
   , toSerializableException, fromSerializableException
   , THResult(..), THResultType(..)
@@ -229,6 +230,12 @@ data Message a where
     :: RemoteRef (ResumeContext ())
     -> Message (EvalStatus ())
 
+  -- | Allocate a string for a breakpoint module name.
+  -- This uses an empty dummy type because @ModuleName@ isn't available here.
+  NewBreakModule
+   :: String
+   -> Message (RemotePtr BreakModule)
+
 deriving instance Show (Message a)
 
 
@@ -380,15 +387,22 @@ type EvalStatus a = EvalStatus_ a a
 
 data EvalStatus_ a b
   = EvalComplete Word64 (EvalResult a)
-  | EvalBreak Bool
+  | EvalBreak
        HValueRef{- AP_STACK -}
-       Int {- break index -}
-       Int {- uniq of ModuleName -}
+       (Maybe EvalBreakpoint)
        (RemoteRef (ResumeContext b))
        (RemotePtr CostCentreStack) -- Cost centre stack
   deriving (Generic, Show)
 
 instance Binary a => Binary (EvalStatus_ a b)
+
+data EvalBreakpoint =
+  EvalBreakpoint
+    Int -- ^ break index
+    String -- ^ ModuleName
+  deriving (Generic, Show)
+
+instance Binary EvalBreakpoint
 
 data EvalResult a
   = EvalException SerializableException
@@ -531,7 +545,7 @@ getMessage = do
       36 -> Msg <$> (Seq <$> get)
       37 -> Msg <$> return RtsRevertCAFs
       38 -> Msg <$> (ResumeSeq <$> get)
-      -- 39 -> Msg <$> (NewBreakModule <$> get)
+      39 -> Msg <$> (NewBreakModule <$> get)
       40 -> Msg <$> (LookupSymbolInDLL <$> get <*> get)
       _  -> error $ "Unknown Message code " ++ (show b)
 
@@ -565,7 +579,7 @@ putMessage m = case m of
   MkCostCentres mod ccs       -> putWord8 25 >> put mod >> put ccs
   CostCentreStackInfo ptr     -> putWord8 26 >> put ptr
   NewBreakArray sz            -> putWord8 27 >> put sz
-  SetupBreakpoint arr ix cnt    -> putWord8 28 >> put arr >> put ix >> put cnt
+  SetupBreakpoint arr ix cnt  -> putWord8 28 >> put arr >> put ix >> put cnt
   BreakpointStatus arr ix     -> putWord8 29 >> put arr >> put ix
   GetBreakpointVar a b        -> putWord8 30 >> put a >> put b
   StartTH                     -> putWord8 31
@@ -576,7 +590,7 @@ putMessage m = case m of
   Seq a                       -> putWord8 36 >> put a
   RtsRevertCAFs               -> putWord8 37
   ResumeSeq a                 -> putWord8 38 >> put a
-  -- NewBreakModule name         -> putWord8 39 >> put name
+  NewBreakModule name         -> putWord8 39 >> put name
   LookupSymbolInDLL dll str   -> putWord8 40 >> put dll >> put str
 
 -- -----------------------------------------------------------------------------

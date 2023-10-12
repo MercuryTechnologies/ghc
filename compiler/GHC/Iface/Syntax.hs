@@ -572,10 +572,10 @@ data IfaceExpr
   | IfaceTick   IfaceTickish IfaceExpr    -- from Tick tickish E
 
 data IfaceTickish
-  = IfaceHpcTick Module Int                -- from HpcTick x
-  | IfaceSCC     CostCentre Bool Bool      -- from ProfNote
-  | IfaceSource  RealSrcSpan String        -- from SourceNote
-  -- no breakpoints: we never export these into interface files
+  = IfaceHpcTick    Module Int               -- from HpcTick x
+  | IfaceSCC        CostCentre Bool Bool     -- from ProfNote
+  | IfaceSource  RealSrcSpan String          -- from SourceNote
+  | IfaceBreakpoint Int [IfaceIdBndr] Module -- from Breakpoint
 
 data IfaceAlt = IfaceAlt IfaceConAlt [IfLclName] IfaceExpr
         -- Note: IfLclName, not IfaceBndr (and same with the case binder)
@@ -1487,6 +1487,8 @@ pprIfaceTickish (IfaceSCC cc tick scope)
   = braces (pprCostCentreCore cc <+> ppr tick <+> ppr scope)
 pprIfaceTickish (IfaceSource src _names)
   = braces (pprUserRealSpan True src)
+pprIfaceTickish (IfaceBreakpoint m ix fvs)
+  = braces (text "break" <+> ppr m <+> ppr ix <+> ppr fvs)
 
 ------------------
 pprIfaceApp :: IfaceExpr -> [SDoc] -> SDoc
@@ -2496,6 +2498,11 @@ instance Binary IfaceTickish where
         put_ bh (srcSpanEndLine src)
         put_ bh (srcSpanEndCol src)
         put_ bh name
+    put_ bh (IfaceBreakpoint m ix fvs) = do
+        putByte bh 3
+        put_ bh m
+        put_ bh ix
+        put_ bh fvs
 
     get bh = do
         h <- getByte bh
@@ -2516,6 +2523,10 @@ instance Binary IfaceTickish where
                         end = mkRealSrcLoc file el ec
                     name <- get bh
                     return (IfaceSource (mkRealSrcSpan start end) name)
+            3 -> do m <- get bh
+                    ix <- get bh
+                    fvs <- get bh
+                    return (IfaceBreakpoint m ix fvs)
             _ -> panic ("get IfaceTickish " ++ show h)
 
 instance Binary IfaceConAlt where
@@ -2773,6 +2784,7 @@ instance NFData IfaceTickish where
     IfaceHpcTick m i -> rnf m `seq` rnf i
     IfaceSCC cc b1 b2 -> cc `seq` rnf b1 `seq` rnf b2
     IfaceSource src str -> src `seq` rnf str
+    IfaceBreakpoint m i fvs -> rnf m `seq` rnf i `seq` rnf fvs
 
 instance NFData IfaceConAlt where
   rnf = \case
