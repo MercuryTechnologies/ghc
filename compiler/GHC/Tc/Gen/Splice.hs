@@ -1680,7 +1680,7 @@ runTHDec :: ForeignHValue -> TcM [TH.Dec]
 runTHDec = runTH THDec
 
 runTH :: Binary a => THResultType -> ForeignHValue -> TcM a
-runTH ty fhv = do
+runTH ty fhv = updTopEnv (discardIC) $ do
   interp <- tcGetInterp
   case interpInstance interp of
 #if defined(HAVE_INTERNAL_INTERPRETER)
