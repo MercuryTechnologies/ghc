@@ -440,7 +440,10 @@ soon as it is completed.
 -- Abstract interface to a cache of HomeModInfo
 -- See Note [Caching HomeModInfo]
 data ModIfaceCache = ModIfaceCache { iface_clearCache :: IO [CachedIface]
-                                   , iface_addToCache :: CachedIface -> IO () }
+                                   , iface_addToCache :: CachedIface -> IO ()
+                                   , iface_setOldHPT :: M.Map ModNodeKeyWithUid HomeModInfo -> IO ()
+                                   , iface_findFromOldHPT :: ModNodeKeyWithUid -> IO (Maybe HomeModInfo)
+                                   }
 
 addHmiToCache :: ModIfaceCache -> HomeModInfo -> IO ()
 addHmiToCache c (HomeModInfo i _ l) = iface_addToCache c (CachedIface i l)
@@ -454,16 +457,27 @@ instance Outputable CachedIface where
 noIfaceCache :: Maybe ModIfaceCache
 noIfaceCache = Nothing
 
+add_ :: CachedIface -> [CachedIface] -> [CachedIface]
+add_ x ys = x : ys
+
+remove_ :: ModNodeKeyWithUid -> M.Map ModNodeKeyWithUid HomeModInfo -> M.Map ModNodeKeyWithUid HomeModInfo
+remove_ k m = M.delete k m
+
 newIfaceCache :: IO ModIfaceCache
 newIfaceCache = do
-  ioref <- newIORef []
+  ioref <- newIORef ([], Map.empty) -- (new, old)
   return $
     ModIfaceCache
-      { iface_clearCache = atomicModifyIORef' ioref (\c -> ([], c))
-      , iface_addToCache = \hmi -> atomicModifyIORef' ioref (\c -> (hmi:c, ()))
+      { iface_clearCache = atomicModifyIORef' ioref (\(new, _old) -> (([], M.empty), new))
+      , iface_addToCache =
+          \hmi -> atomicModifyIORef' ioref $ \(new, old) ->
+                    let k = miKey (cached_modiface hmi)
+                        !new' = add_ hmi new
+                        !old' = remove_ k old
+                     in ((new', old'), ())
+      , iface_setOldHPT = \old' -> atomicModifyIORef' ioref (\(new, _) -> ((new, old'), ()))
+      , iface_findFromOldHPT = \k -> atomicModifyIORef' ioref (\(new, old) -> ((new, old), M.lookup k old))
       }
-
-
 
 
 -- | Try to load the program.  See 'LoadHowMuch' for the different modes.
@@ -717,8 +731,7 @@ load' mhmi_cache how_much mHscMessage mod_graph = do
 
         build_plan = createBuildPlan mod_graph maybe_top_mod
 
-
-    cache <- liftIO $ maybe (return []) iface_clearCache mhmi_cache
+    !cache <- liftIO $ maybe (return []) iface_clearCache mhmi_cache
     let
         -- prune the HPT so everything is not retained when doing an
         -- upsweep.
@@ -746,7 +759,9 @@ load' mhmi_cache how_much mHscMessage mod_graph = do
     setSession $ hscUpdateHUG (unitEnv_map pruneHomeUnitEnv) hsc_env
     (upsweep_ok, new_deps) <- withDeferredDiagnostics $ do
       hsc_env <- getSession
-      liftIO $ upsweep n_jobs hsc_env mhmi_cache mHscMessage (toCache pruned_cache) build_plan
+      forM_ mhmi_cache $ \hmi_cache ->
+        liftIO $ iface_setOldHPT hmi_cache (toCache pruned_cache)
+      liftIO $ upsweep n_jobs hsc_env mhmi_cache mHscMessage build_plan
     modifySession (addDepsToHscEnv new_deps)
     case upsweep_ok of
       Failed -> loadFinish upsweep_ok
@@ -1056,12 +1071,11 @@ type RunMakeM a = ReaderT MakeEnv (MaybeT IO) a
 -- See Note [Upsweep] for a high-level description.
 interpretBuildPlan :: HomeUnitGraph
                    -> Maybe ModIfaceCache
-                   -> M.Map ModNodeKeyWithUid HomeModInfo
                    -> [BuildPlan]
                    -> IO ( Maybe [ModuleGraphNode] -- Is there an unresolved cycle
                          , [MakeAction] -- Actions we need to run in order to build everything
                          , IO [Maybe (Maybe HomeModInfo)]) -- An action to query to get all the built modules at the end.
-interpretBuildPlan hug mhmi_cache old_hpt plan = do
+interpretBuildPlan hug mhmi_cache plan = do
   hug_var <- newMVar hug
   ((mcycle, plans), build_map) <- runStateT (buildLoop plan) (BuildLoopState M.empty 1 hug_var)
   let wait = collect_results (buildDep build_map)
@@ -1121,8 +1135,11 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
                 executeInstantiationNode mod_idx n_mods hug uid iu
                 return (Nothing, deps)
               ModuleNode _build_deps ms -> do
-                let !old_hmi = M.lookup (msKey ms) old_hpt
-                    rehydrate_mods = mapMaybe nodeKeyModName <$> rehydrate_nodes
+                !old_hmi <-
+                  case mhmi_cache of
+                    Nothing -> pure Nothing
+                    Just hmi_cache -> liftIO $ iface_findFromOldHPT hmi_cache (msKey ms)
+                let rehydrate_mods = mapMaybe nodeKeyModName <$> rehydrate_nodes
                 hmi <- executeCompileNode mod_idx n_mods old_hmi hug rehydrate_mods ms
                 -- Write the HMI to an external cache (if one exists)
                 -- See Note [Caching HomeModInfo]
@@ -1224,11 +1241,10 @@ upsweep
     -> HscEnv -- ^ The base HscEnv, which is augmented for each module
     -> Maybe ModIfaceCache -- ^ A cache to incrementally write final interface files to
     -> Maybe Messager
-    -> M.Map ModNodeKeyWithUid HomeModInfo
     -> [BuildPlan]
     -> IO (SuccessFlag, [HomeModInfo])
-upsweep n_jobs hsc_env hmi_cache mHscMessage old_hpt build_plan = do
-    (cycle, pipelines, collect_result) <- interpretBuildPlan (hsc_HUG hsc_env) hmi_cache old_hpt build_plan
+upsweep n_jobs hsc_env hmi_cache mHscMessage build_plan = do
+    (cycle, pipelines, collect_result) <- interpretBuildPlan (hsc_HUG hsc_env) hmi_cache build_plan
     runPipelines n_jobs hsc_env mHscMessage pipelines
     res <- collect_result
 
