@@ -284,7 +284,6 @@ import System.IO
 import {-# SOURCE #-} GHC.Driver.Pipeline
 import Data.Time
 
-import System.IO.Unsafe ( unsafeInterleaveIO )
 import GHC.Iface.Env ( trace_if )
 import GHC.Stg.InferTags.TagSig (seqTagSig)
 import GHC.StgToCmm.Utils (IPEStats)
@@ -1020,11 +1019,7 @@ initWholeCoreBindings hsc_env mod_iface details (LM utc_time this_mod uls) = LM 
         -- with these files, do we have to read and serialise the foreign file? I will leave it for now until someone
         -- reports a bug.
         let cgi_guts = CgInteractiveGuts this_mod core_binds (typeEnvTyCons (md_types details)) NoStubs Nothing []
-        -- The bytecode generation itself is lazy because otherwise even when doing
-        -- recompilation checking the bytecode will be generated (which slows things down a lot)
-        -- the laziness is OK because generateByteCode just depends on things already loaded
-        -- in the interface file.
-        LoadedBCOs <$> (unsafeInterleaveIO $ do
+        LoadedBCOs <$> (do
                   trace_if (hsc_logger hsc_env) (text "Generating ByteCode for" <+> (ppr this_mod))
                   generateByteCode hsc_env cgi_guts (wcb_mod_location fi))
     go ul = return ul
