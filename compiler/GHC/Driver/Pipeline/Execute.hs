@@ -854,7 +854,7 @@ runHscPostTcPhase ::
   -> ModSummary
   -> FrontendResult
   -> Messages GhcMessage
-  -> Maybe Fingerprint
+  -> Maybe (Fingerprint, Bool)
   -> IO HscBackendAction
 runHscPostTcPhase hsc_env mod_summary tc_result tc_warnings mb_old_hash = do
         runHsc hsc_env $ do

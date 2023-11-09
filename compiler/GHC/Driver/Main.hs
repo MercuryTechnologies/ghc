@@ -853,7 +853,9 @@ hscRecompStatus
     case recomp_if_result of
       OutOfDateItem reason mb_checked_iface -> do
         msg $ NeedsRecompile reason
-        return $ HscRecompNeeded $ fmap (mi_iface_hash . mi_final_exts) mb_checked_iface
+        let mb_old_iface_hash =
+               fmap (\ifc -> (mi_iface_hash (mi_final_exts ifc), isJust (mi_extra_decls ifc))) mb_checked_iface
+        return $ HscRecompNeeded mb_old_iface_hash
       UpToDateItem checked_iface -> do
         let deps = dep_direct_mods $ mi_deps checked_iface
             hug = hsc_HUG hsc_env
@@ -930,7 +932,9 @@ hscRecompStatus
                    return $ HscUpToDate checked_iface $ linkable
                  OutOfDateItem reason _ -> do
                    msg $ NeedsRecompile reason
-                   return $ HscRecompNeeded $ Just $ mi_iface_hash $ mi_final_exts $ checked_iface
+                   let old_iface_hash =
+                         (mi_iface_hash (mi_final_exts checked_iface), isJust (mi_extra_decls checked_iface))
+                   return $ HscRecompNeeded $ Just old_iface_hash
 
 -- | Check that the .o files produced by compilation are already up-to-date
 -- or not.
@@ -1081,7 +1085,7 @@ See !5492 and #13586
 hscDesugarAndSimplify :: ModSummary
        -> FrontendResult
        -> Messages GhcMessage
-       -> Maybe Fingerprint
+       -> Maybe (Fingerprint, Bool)
        -> Hsc HscBackendAction
 hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_hash = do
   hsc_env <- getHscEnv
@@ -1210,9 +1214,10 @@ hscMaybeWriteIface
   -- ^ Is this a simple interface generated after the core pipeline, or one
   -- with information from the backend? See: Note [Writing interface files]
   -> ModIface
-  -> Maybe Fingerprint
+  -> Maybe (Fingerprint, Bool)
   -- ^ The old interface hash, used to decide if we need to actually write the
   -- new interface.
+  -- and does old interface have simplified core or not.
   -> ModLocation
   -> IO ()
 hscMaybeWriteIface logger dflags is_simple iface old_iface mod_location = do
@@ -1244,7 +1249,7 @@ hscMaybeWriteIface logger dflags is_simple iface old_iface mod_location = do
       --    dynamic interfaces. Hopefully both the dynamic and the non-dynamic
       --    interfaces stay in sync...
       --
-      let change = old_iface /= Just (mi_iface_hash (mi_final_exts iface))
+      let change = old_iface /= Just (mi_iface_hash (mi_final_exts iface), isJust (mi_extra_decls iface))
 
       let dt = dynamicTooState dflags
 
@@ -1262,7 +1267,8 @@ hscMaybeWriteIface logger dflags is_simple iface old_iface mod_location = do
                DT_Dont   -> return ()
                DT_Dyn    -> panic "Unexpected DT_Dyn state when writing simple interface"
                DT_OK     -> write_iface (setDynamicNow dflags) iface
-         else case dt of
+         else do
+           case dt of
                DT_Dont | change                    -> write_iface dflags iface
                DT_OK   | change                    -> write_iface dflags iface
                -- FIXME: see change' comment above

@@ -20,7 +20,7 @@ data HscRecompStatus
     -- | Recompilation of module, or update of interface is required. Optionally
     -- pass the old interface hash to avoid updating the existing interface when
     -- it has not changed.
-    | HscRecompNeeded (Maybe Fingerprint)
+    | HscRecompNeeded (Maybe (Fingerprint, Bool))
 
 -- | Action to perform in backend compilation
 data HscBackendAction
@@ -34,11 +34,12 @@ data HscBackendAction
           -- ^ Module info
         , hscs_partial_iface  :: !PartialModIface
           -- ^ Partial interface
-        , hscs_old_iface_hash :: !(Maybe Fingerprint)
+        , hscs_old_iface_hash :: !(Maybe (Fingerprint, Bool))
           -- ^ Old interface hash for this compilation, if an old interface file
           -- exists. Pass to `hscMaybeWriteIface` when writing the interface to
           -- avoid updating the existing interface when the interface isn't
           -- changed.
+          -- and whether the interface has extra decls or not.
         }
 
 
