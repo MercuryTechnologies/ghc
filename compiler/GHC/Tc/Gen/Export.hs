@@ -3,7 +3,7 @@
 {-# LANGUAGE RankNTypes        #-}
 {-# LANGUAGE TypeFamilies      #-}
 
-module GHC.Tc.Gen.Export (rnExports, exports_from_avail) where
+module GHC.Tc.Gen.Export (rnExports, exports_from_avail, classifyGREs, all_rdr_exports) where
 
 import GHC.Prelude
 
@@ -217,6 +217,21 @@ rnExports explicit_mod exports
                           , tcg_dus = tcg_dus tcg_env `plusDU`
                                       usesOnly final_ns }) }
 
+all_rdr_exports :: GlobalRdrEnv -> Avails
+all_rdr_exports rdr_env = map fix_faminst . gresToAvailInfo . filter isLocalGRE . globalRdrEnvElts $ rdr_env
+  where
+    -- #11164: when we define a data instance
+    -- but not data family, re-export the family
+    -- Even though we don't check whether this is actually a data family
+    -- only data families can locally define subordinate things (`ns` here)
+    -- without locally defining (and instead importing) the parent (`n`)
+    fix_faminst avail@(AvailTC n ns)
+      | availExportsDecl avail
+      = avail
+      | otherwise
+      = AvailTC n (NormalGreName n:ns)
+    fix_faminst avail = avail
+
 exports_from_avail :: Maybe (LocatedL [LIE GhcPs])
                          -- ^ 'Nothing' means no explicit export list
                    -> GlobalRdrEnv
@@ -238,21 +253,8 @@ exports_from_avail Nothing rdr_env _imports _this_mod
   = do {
     ; addDiagnostic
         (TcRnMissingExportList $ moduleName _this_mod)
-    ; let avails =
-            map fix_faminst . gresToAvailInfo
-              . filter isLocalGRE . globalRdrEnvElts $ rdr_env
+    ; let avails = all_rdr_exports rdr_env
     ; return (Nothing, avails) }
-  where
-    -- #11164: when we define a data instance
-    -- but not data family, re-export the family
-    -- Even though we don't check whether this is actually a data family
-    -- only data families can locally define subordinate things (`ns` here)
-    -- without locally defining (and instead importing) the parent (`n`)
-    fix_faminst avail@(AvailTC n ns)
-      | availExportsDecl avail = avail
-      | otherwise = AvailTC n (NormalGreName n:ns)
-    fix_faminst avail = avail
-
 
 exports_from_avail (Just (L _ rdr_items)) rdr_env imports this_mod
   = do ie_avails <- accumExports do_litem rdr_items

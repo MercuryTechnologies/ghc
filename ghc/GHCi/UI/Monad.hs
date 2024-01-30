@@ -24,7 +24,8 @@ module GHCi.UI.Monad (
         runStmt, runDecls, runDecls', resume, recordBreak, revertCAFs,
         ActionStats(..), runAndPrintStats, runWithStats, printStats,
 
-        printForUserNeverQualify, printForUserModInfo,
+        printForUserNeverQualify,
+        printForUserGlobalRdrEnv,
         printForUser, printForUserPartWay, prettyLocations,
 
         compileGHCiExpr,
@@ -44,11 +45,12 @@ import GHC.Types.Name.Occurrence
 import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Driver.Env
+import GHC.Types.Name.Ppr as Ppr
 import GHC.Types.SrcLoc
 import GHC.Types.SafeHaskell
 import GHC.Driver.Make (ModIfaceCache(..))
 import GHC.Unit
-import GHC.Types.Name.Reader as RdrName (mkOrig)
+import GHC.Types.Name.Reader as RdrName (GlobalRdrEnv, mkOrig)
 import GHC.Builtin.Names (gHC_GHCI_HELPERS)
 import GHC.Runtime.Interpreter
 import GHC.Runtime.Context
@@ -361,12 +363,19 @@ printForUserNeverQualify doc = do
   dflags <- GHC.getInteractiveDynFlags
   liftIO $ Ppr.printForUser dflags stdout neverQualify AllTheWay doc
 
-printForUserModInfo :: GhcMonad m => GHC.ModuleInfo -> SDoc -> m ()
-printForUserModInfo info doc = do
+printForUserGlobalRdrEnv :: (GhcMonad m)
+                         => Maybe RdrName.GlobalRdrEnv -> SDoc -> m ()
+printForUserGlobalRdrEnv mb_rdr_env doc = do
   dflags <- GHC.getInteractiveDynFlags
-  m_name_ppr_ctx <- GHC.mkNamePprCtxForModule info
-  name_ppr_ctx <- maybe GHC.getNamePprCtx return m_name_ppr_ctx
+  name_ppr_ctx <- mkNamePprCtxFromGlobalRdrEnv dflags mb_rdr_env
   liftIO $ Ppr.printForUser dflags stdout name_ppr_ctx AllTheWay doc
+    where
+      mkNamePprCtxFromGlobalRdrEnv _ Nothing = GHC.getNamePprCtx
+      mkNamePprCtxFromGlobalRdrEnv dflags (Just rdr_env) =
+        withSession $ \ hsc_env ->
+        let unit_env = hsc_unit_env hsc_env
+            ptc = initPromotionTickContext dflags
+        in  return $ Ppr.mkNamePprCtx ptc unit_env rdr_env
 
 printForUser :: GhcMonad m => SDoc -> m ()
 printForUser doc = do

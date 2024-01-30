@@ -549,7 +549,7 @@ backendRespectsSpecialise (Named JavaScript)  = True
 backendRespectsSpecialise (Named Interpreter) = False
 backendRespectsSpecialise (Named NoBackend)   = False
 
--- | This back end wants the `mi_globals` field of a
+-- | This back end wants the `mi_top_env` field of a
 -- `ModIface` to be populated (with the top-level bindings
 -- of the original source).  True for the interpreter, and
 -- also true for "no backend", which is used by Haddock.

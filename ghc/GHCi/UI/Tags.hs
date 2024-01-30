@@ -15,12 +15,18 @@ module GHCi.UI.Tags (
 
 import GHC.Utils.Exception
 import GHC
+import GHCi.UI.Info (modInfo_rdrs)
 import GHCi.UI.Monad
+import GHC.Runtime.Eval (mkTopLevEnv)
+
+import GHC.Unit.Module.ModIface (ModIface (..))
+import GHC.Driver.Env.Types (hsc_mod_graph)
 
 -- ToDo: figure out whether we need these, and put something appropriate
 -- into the GHC API instead
 import GHC.Types.Name (nameOccName)
 import GHC.Types.Name.Occurrence (occNameString)
+import GHC.Types.Name.Reader (globalRdrEnvElts, grePrintableName)
 import GHC.Core.ConLike
 import GHC.Utils.Monad
 import GHC.Data.FastString
@@ -29,6 +35,7 @@ import Control.Monad
 import Data.Function
 import Data.List (sort, sortOn)
 import qualified Data.List.NonEmpty as NE
+import qualified Data.Map as M
 import Data.Maybe
 import Data.Ord
 import GHC.Driver.Phases
@@ -94,17 +101,28 @@ listModuleTags m = do
   case mbModInfo of
     Nothing -> return []
     Just mInfo -> do
-       let names = fromMaybe [] $ GHC.modInfoTopLevelScope mInfo
-       let localNames = filter ((m==) . nameModule) names
-       mbTyThings <- mapM GHC.lookupName localNames
-       return $! [ tagInfo exported kind name realLoc
-                     | tyThing <- catMaybes mbTyThings
-                     , let name = getName tyThing
-                     , let exported = GHC.modInfoIsExportedName mInfo name
-                     , let kind = tyThing2TagKind tyThing
-                     , let loc = srcSpanStart (nameSrcSpan name)
-                     , RealSrcLoc realLoc _ <- [loc]
-                     ]
+       let mbModule = mi_module <$> (GHC.modInfoIface mInfo)
+       case mbModule of
+         Nothing -> return []
+         Just modl -> do
+           names <- do
+             hsc_env <- GHC.getSession
+             let ms = M.fromList [(moduleName modl, ms) | Just ms <- [GHC.mgLookupModule (hsc_mod_graph hsc_env) modl]]
+             mmod_env <- liftIO $ mkTopLevEnv hsc_env ms (moduleName modl)
+             case mmod_env of
+               Left err -> throwGhcException (CmdLineError (GHC.moduleNameString (GHC.moduleName modl) ++ " " ++ err))
+               Right mod_env -> pure $ map grePrintableName . globalRdrEnvElts $ mod_env
+
+           let localNames = filter ((m==) . nameModule) names
+           mbTyThings <- mapM GHC.lookupName localNames
+           return $! [ tagInfo exported kind name realLoc
+                         | tyThing <- catMaybes mbTyThings
+                         , let name = getName tyThing
+                         , let exported = GHC.modInfoIsExportedName mInfo name
+                         , let kind = tyThing2TagKind tyThing
+                         , let loc = srcSpanStart (nameSrcSpan name)
+                         , RealSrcLoc realLoc _ <- [loc]
+                         ]
 
   where
     tyThing2TagKind (AnId _)                 = 'v'

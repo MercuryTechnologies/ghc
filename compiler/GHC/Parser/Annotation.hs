@@ -99,6 +99,8 @@ import GHC.Utils.Outputable hiding ( (<>) )
 import GHC.Utils.Panic
 import qualified GHC.Data.Strict as Strict
 
+import Control.DeepSeq
+
 {-
 Note [exact print annotations]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -309,6 +311,9 @@ data AnnKeywordId
     | AnnRarrowtailU -- ^ '>>-', unicode variant
     deriving (Eq, Ord, Data, Show)
 
+instance NFData AnnKeywordId where
+  rnf = rwhnf
+
 instance Outputable AnnKeywordId where
   ppr x = text (show x)
 
@@ -361,6 +366,9 @@ data EpaComment =
     }
     deriving (Eq, Data, Show)
 
+instance NFData EpaComment where
+  rnf (EpaComment a b) = rnf a `seq` rnf b
+
 data EpaCommentTok =
   -- Documentation annotations
     EpaDocComment      HsDocString -- ^ a docstring that can be pretty printed using pprHsDocString
@@ -378,6 +386,13 @@ data EpaCommentTok =
 -- Note: these are based on the Token versions, but the Token type is
 -- defined in GHC.Parser.Lexer and bringing it in here would create a loop
 
+instance NFData EpaCommentTok where
+  rnf (EpaDocComment doc) = rnf doc
+  rnf (EpaDocOptions s) = rnf s
+  rnf (EpaLineComment s) = rnf s
+  rnf (EpaBlockComment s) = rnf s
+  rnf EpaEofComment = rwhnf EpaEofComment
+
 instance Outputable EpaComment where
   ppr x = text (show x)
 
@@ -394,6 +409,9 @@ instance Outputable EpaComment where
 -- annotation.
 data AddEpAnn = AddEpAnn AnnKeywordId EpaLocation deriving (Data,Eq)
 
+instance NFData AddEpAnn where
+  rnf (AddEpAnn a b) = rnf a `seq` rnf b
+
 -- | The anchor for an @'AnnKeywordId'@. The Parser inserts the
 -- @'EpaSpan'@ variant, giving the exact location of the original item
 -- in the parsed source.  This can be replaced by the @'EpaDelta'@
@@ -406,6 +424,10 @@ data AddEpAnn = AddEpAnn AnnKeywordId EpaLocation deriving (Data,Eq)
 data EpaLocation = EpaSpan !RealSrcSpan !(Strict.Maybe BufSpan)
                  | EpaDelta !DeltaPos ![LEpaComment]
                deriving (Data,Eq)
+
+instance NFData EpaLocation where
+  rnf (EpaSpan s m) = rnf s `seq` rnf m
+  rnf (EpaDelta d c) = rnf d `seq` rnf c
 
 -- | Tokens embedded in the AST have an EpaLocation, unless they come from
 -- generated code (e.g. by TH).
@@ -431,6 +453,9 @@ data DeltaPos
       { deltaLine   :: !Int, -- ^ deltaLine should always be > 0
         deltaColumn :: !Int
       } deriving (Show,Eq,Ord,Data)
+
+instance NFData DeltaPos where
+  rnf = rwhnf -- already strict
 
 -- | Smart constructor for a 'DeltaPos'. It preserves the invariant
 -- that for the 'DifferentLine' constructor 'deltaLine' is always > 0.
@@ -509,6 +534,10 @@ data EpAnn ann
                   -- e.g. from TH, deriving, etc.
         deriving (Data, Eq, Functor)
 
+instance NFData a => NFData (EpAnn a) where
+  rnf (EpAnn a b c) = rnf a `seq` rnf b `seq` rnf c
+  rnf EpAnnNotUsed = rwhnf EpAnnNotUsed
+
 -- | An 'Anchor' records the base location for the start of the
 -- syntactic element holding the annotations, and is used as the point
 -- of reference for calculating delta positions for contained
@@ -524,6 +553,9 @@ data Anchor = Anchor        { anchor :: RealSrcSpan
                             , anchor_op :: AnchorOperation }
         deriving (Data, Eq, Show)
 
+instance NFData Anchor where
+  rnf (Anchor a b) = rnf a `seq` rnf b
+
 -- | If tools modify the parsed source, the 'MovedAnchor' variant can
 -- directly provide the spacing for this item relative to the previous
 -- one when printing. This allows AST fragments with a particular
@@ -533,6 +565,9 @@ data AnchorOperation = UnchangedAnchor
                      | MovedAnchor DeltaPos
         deriving (Data, Eq, Show)
 
+instance NFData AnchorOperation where
+  rnf UnchangedAnchor = ()
+  rnf (MovedAnchor a) = rnf a
 
 spanAsAnchor :: SrcSpan -> Anchor
 spanAsAnchor s  = Anchor (realSrcSpan s) UnchangedAnchor
@@ -556,6 +591,10 @@ data EpAnnComments = EpaComments
                         , followingComments :: ![LEpaComment] }
         deriving (Data, Eq)
 
+instance NFData EpAnnComments where
+  rnf (EpaComments a) = rnf a
+  rnf (EpaCommentsBalanced a b) = rnf a `seq` rnf b
+
 type LEpaComment = GenLocated Anchor EpaComment
 
 emptyComments :: EpAnnComments
@@ -574,6 +613,9 @@ emptyComments = EpaComments []
 data SrcSpanAnn' a = SrcSpanAnn { ann :: !a, locA :: !SrcSpan }
         deriving (Data, Eq)
 -- See Note [XRec and Anno in the AST]
+
+instance (NFData a) => NFData (SrcSpanAnn' a) where
+  rnf (SrcSpanAnn a b) = rnf a `seq` rnf b
 
 -- | We mostly use 'SrcSpanAnn\'' with an 'EpAnn\''
 type SrcAnn ann = SrcSpanAnn' (EpAnn ann)
@@ -640,6 +682,11 @@ data TrailingAnn
   | AddVbarAnn EpaLocation    -- ^ Trailing '|'
   deriving (Data, Eq)
 
+instance NFData TrailingAnn where
+  rnf (AddSemiAnn l) = rnf l
+  rnf (AddCommaAnn l) = rnf l
+  rnf (AddVbarAnn l) = rnf l
+
 instance Outputable TrailingAnn where
   ppr (AddSemiAnn ss)    = text "AddSemiAnn"    <+> ppr ss
   ppr (AddCommaAnn ss)   = text "AddCommaAnn"   <+> ppr ss
@@ -652,6 +699,10 @@ data AnnListItem
       lann_trailing  :: [TrailingAnn]
       }
   deriving (Data, Eq)
+
+instance NFData AnnListItem  where
+  rnf (AnnListItem xs) = rnf xs
+
 
 -- ---------------------------------------------------------------------
 -- Annotations for the context of a list of items
@@ -670,6 +721,9 @@ data AnnList
                                     -- list, such as '=>' for a
                                     -- context
       } deriving (Data,Eq)
+
+instance NFData AnnList where
+  rnf (AnnList a b c d e) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d `seq` rnf e
 
 -- ---------------------------------------------------------------------
 -- Annotations for parenthesised elements, such as tuples, lists
@@ -768,6 +822,15 @@ data NameAnn
       }
   deriving (Data, Eq)
 
+instance NFData NameAnn where
+  rnf (NameAnn a b c d e) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d `seq` rnf e
+  rnf (NameAnnCommas a b c d e) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d `seq` rnf e
+  rnf (NameAnnBars a b c d e) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d `seq` rnf e
+  rnf (NameAnnOnly a b c d) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d
+  rnf (NameAnnRArrow a b) = rnf a `seq` rnf b
+  rnf (NameAnnQuote a b c) = rnf a `seq` rnf b `seq` rnf c
+  rnf (NameAnnTrailing a) = rnf a
+
 -- | A 'NameAnn' can capture the locations of surrounding adornments,
 -- such as parens or backquotes. This data type identifies what
 -- particular pair are being used.
@@ -777,6 +840,9 @@ data NameAdornment
   | NameBackquotes -- ^ '`'
   | NameSquare -- ^ '[' ']'
   deriving (Eq, Ord, Data)
+
+instance NFData NameAdornment where
+  rnf = rwhnf
 
 -- ---------------------------------------------------------------------
 
@@ -788,6 +854,9 @@ data AnnPragma
       apr_close     :: AddEpAnn,
       apr_rest      :: [AddEpAnn]
       } deriving (Data,Eq)
+
+instance NFData AnnPragma where
+  rnf (AnnPragma a b c) = rnf a `seq` rnf b `seq` rnf c
 
 -- ---------------------------------------------------------------------
 -- | Captures the sort order of sub elements. This is needed when the

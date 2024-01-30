@@ -47,6 +47,7 @@ module GHC.Types.Name.Reader (
         GlobalRdrEnv, emptyGlobalRdrEnv, mkGlobalRdrEnv, plusGlobalRdrEnv,
         lookupGlobalRdrEnv, extendGlobalRdrEnv, greOccName, shadowNames,
         pprGlobalRdrEnv, globalRdrEnvElts,
+        forceGlobalRdrEnv,
         lookupGRE_RdrName, lookupGRE_RdrName', lookupGRE_Name,
         lookupGRE_GreName, lookupGRE_FieldLabel,
         lookupGRE_Name_OccName,
@@ -99,6 +100,8 @@ import Data.Data
 import Data.List( sortBy )
 import qualified Data.Semigroup as S
 import GHC.Data.Bag
+
+import Control.DeepSeq (NFData (..))
 
 {-
 ************************************************************************
@@ -166,6 +169,12 @@ data RdrName
         --
         -- Such a 'RdrName' can be created by using 'getRdrName' on a 'Name'
   deriving Data
+
+instance NFData RdrName where
+  rnf (Unqual occ) = rnf occ
+  rnf (Qual mod occ) = rnf mod `seq` rnf occ
+  rnf (Orig mod occ) = rnf mod `seq` rnf occ
+  rnf (Exact n) = rnf n
 
 {-
 ************************************************************************
@@ -810,6 +819,12 @@ emptyGlobalRdrEnv = emptyOccEnv
 
 globalRdrEnvElts :: GlobalRdrEnv -> [GlobalRdrElt]
 globalRdrEnvElts env = foldOccEnv (++) [] env
+
+-- | Drop all 'GREInfo' fields in a 'GlobalRdrEnv' in order to
+-- avoid space leaks.
+-- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
+forceGlobalRdrEnv :: GlobalRdrEnv -> GlobalRdrEnv
+forceGlobalRdrEnv rdrs = rdrs
 
 instance Outputable GlobalRdrElt where
   ppr gre = hang (ppr (greMangledName gre) <+> ppr (gre_par gre))

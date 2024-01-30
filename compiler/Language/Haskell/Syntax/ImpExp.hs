@@ -14,6 +14,8 @@ import Data.Maybe (Maybe)
 import Data.String (String)
 import Data.Int (Int)
 
+import Control.DeepSeq
+
 import GHC.Hs.Doc -- ROMES:TODO Discuss in #21592 whether this is parsed AST or base AST
 
 {-
@@ -41,12 +43,18 @@ data ImportDeclQualifiedStyle
   | NotQualified  -- ^ Not qualified.
   deriving (Eq, Data)
 
+instance NFData ImportDeclQualifiedStyle where
+  rnf = rwhnf
+
 -- | Indicates whether a module name is referring to a boot interface (hs-boot
 -- file) or regular module (hs file). We need to treat boot modules specially
 -- when building compilation graphs, since they break cycles. Regular source
 -- files and signature files are treated equivalently.
 data IsBootInterface = NotBoot | IsBoot
     deriving (Eq, Ord, Show, Data)
+
+instance NFData IsBootInterface where
+  rnf = rwhnf
 
 -- | Import Declaration
 --
@@ -85,6 +93,9 @@ data ImportDecl pass
 -- used, and therefore everything but what was listed should be imported
 data ImportListInterpretation = Exactly | EverythingBut
     deriving (Eq, Data)
+
+instance NFData ImportListInterpretation where
+  rnf = rwhnf
 
 -- | Located Import or Export
 type LIE pass = XRec pass (IE pass)
@@ -155,6 +166,10 @@ data IEWildcard
                    -- The @Int@ is in the range [0..n], where n is the length
                    -- of the list.
   deriving (Eq, Data)
+
+instance NFData IEWildcard where
+  rnf NoIEWildcard = ()
+  rnf (IEWildcard i) = rnf i
 
 -- | A name in an import or export specification which may have
 -- adornments. Used primarily for accurate pretty printing of

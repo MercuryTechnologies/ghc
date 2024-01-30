@@ -86,18 +86,15 @@ module GHC (
         ModuleInfo,
         getModuleInfo,
         modInfoTyThings,
-        modInfoTopLevelScope,
         modInfoExports,
         modInfoExportsWithSelectors,
         modInfoInstances,
         modInfoIsExportedName,
         modInfoLookupName,
         modInfoIface,
-        modInfoRdrEnv,
         modInfoSafe,
         lookupGlobalName,
         findGlobalAnns,
-        mkNamePprCtxForModule,
         ModIface, ModIface_(..),
         SafeHaskellMode(..),
 
@@ -1209,7 +1206,6 @@ typecheckModule pmod = do
          ModuleInfo {
            minf_type_env  = md_types details,
            minf_exports   = md_exports details,
-           minf_rdr_env   = Just (tcg_rdr_env tc_gbl_env),
            minf_instances = fixSafeInstances safe $ instEnvElts $ md_insts details,
            minf_iface     = Nothing,
            minf_safe      = safe,
@@ -1363,7 +1359,6 @@ getNamePprCtx = withSession $ \hsc_env -> do
 data ModuleInfo = ModuleInfo {
         minf_type_env  :: TypeEnv,
         minf_exports   :: [AvailInfo],
-        minf_rdr_env   :: Maybe GlobalRdrEnv,   -- Nothing for a compiled/package mod
         minf_instances :: [ClsInst],
         minf_iface     :: Maybe ModIface,
         minf_safe      :: SafeHaskellMode,
@@ -1389,11 +1384,10 @@ getPackageModuleInfo hsc_env mdl
             pte    = eps_PTE eps
             tys    = [ ty | name <- concatMap availNames avails,
                             Just ty <- [lookupTypeEnv pte name] ]
-        --
+
         return (Just (ModuleInfo {
                         minf_type_env  = mkTypeEnv tys,
                         minf_exports   = avails,
-                        minf_rdr_env   = Just $! availsToGlobalRdrEnv (moduleName mdl) avails,
                         minf_instances = error "getModuleInfo: instances for package module unimplemented",
                         minf_iface     = Just iface,
                         minf_safe      = getSafeMode $ mi_trust iface,
@@ -1422,7 +1416,7 @@ getHomeModuleInfo hsc_env mdl =
       return (Just (ModuleInfo {
                         minf_type_env  = md_types details,
                         minf_exports   = md_exports details,
-                        minf_rdr_env   = mi_globals $! hm_iface hmi,
+                         -- NB: already forced. See Note [Forcing GREInfo] in GHC.Types.GREInfo.
                         minf_instances = instEnvElts $ md_insts details,
                         minf_iface     = Just iface,
                         minf_safe      = getSafeMode $ mi_trust iface
@@ -1432,10 +1426,6 @@ getHomeModuleInfo hsc_env mdl =
 -- | The list of top-level entities defined in a module
 modInfoTyThings :: ModuleInfo -> [TyThing]
 modInfoTyThings minf = typeEnvElts (minf_type_env minf)
-
-modInfoTopLevelScope :: ModuleInfo -> Maybe [Name]
-modInfoTopLevelScope minf
-  = fmap (map greMangledName . globalRdrEnvElts) (minf_rdr_env minf)
 
 modInfoExports :: ModuleInfo -> [Name]
 modInfoExports minf = concatMap availNames $! minf_exports minf
@@ -1451,15 +1441,6 @@ modInfoInstances = minf_instances
 modInfoIsExportedName :: ModuleInfo -> Name -> Bool
 modInfoIsExportedName minf name = elemNameSet name (availsToNameSet (minf_exports minf))
 
-mkNamePprCtxForModule ::
-  GhcMonad m =>
-  ModuleInfo ->
-  m (Maybe NamePprCtx) -- XXX: returns a Maybe X
-mkNamePprCtxForModule minf = withSession $ \hsc_env -> do
-  let mk_name_ppr_ctx = mkNamePprCtx ptc (hsc_unit_env hsc_env)
-      ptc = initPromotionTickContext (hsc_dflags hsc_env)
-  return (fmap mk_name_ppr_ctx (minf_rdr_env minf))
-
 modInfoLookupName :: GhcMonad m =>
                      ModuleInfo -> Name
                   -> m (Maybe TyThing) -- XXX: returns a Maybe X
@@ -1470,9 +1451,6 @@ modInfoLookupName minf name = withSession $ \hsc_env -> do
 
 modInfoIface :: ModuleInfo -> Maybe ModIface
 modInfoIface = minf_iface
-
-modInfoRdrEnv :: ModuleInfo -> Maybe GlobalRdrEnv
-modInfoRdrEnv = minf_rdr_env
 
 -- | Retrieve module safe haskell mode
 modInfoSafe :: ModuleInfo -> SafeHaskellMode

@@ -27,6 +27,7 @@ import GHC.StgToCmm.Types (CmmCgInfos (..))
 
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
+import GHC.Tc.Gen.Export
 
 import GHC.Iface.Syntax
 import GHC.Iface.Recomp
@@ -114,9 +115,10 @@ mkPartialIface :: HscEnv
                -> CoreProgram
                -> ModDetails
                -> ModSummary
+               -> [LImportDecl GhcPs]
                -> ModGuts
                -> PartialModIface
-mkPartialIface hsc_env core_prog mod_details mod_summary
+mkPartialIface hsc_env core_prog mod_details mod_summary import_decls
   ModGuts{ mg_module       = this_mod
          , mg_hsc_src      = hsc_src
          , mg_usages       = usages
@@ -130,7 +132,7 @@ mkPartialIface hsc_env core_prog mod_details mod_summary
          , mg_trust_pkg    = self_trust
          , mg_docs         = docs
          }
-  = mkIface_ hsc_env this_mod core_prog hsc_src used_th deps rdr_env fix_env warns hpc_info self_trust
+  = mkIface_ hsc_env this_mod core_prog hsc_src used_th deps rdr_env import_decls fix_env warns hpc_info self_trust
              safe_mode usages docs mod_summary mod_details
 
 -- | Fully instantiate an interface. Adds fingerprints and potentially code
@@ -202,6 +204,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
   tc_result@TcGblEnv{ tcg_mod = this_mod,
                       tcg_src = hsc_src,
                       tcg_imports = imports,
+                      tcg_import_decls = import_decls,
                       tcg_rdr_env = rdr_env,
                       tcg_fix_env = fix_env,
                       tcg_merged = merged,
@@ -240,7 +243,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
 
           let partial_iface = mkIface_ hsc_env
                    this_mod (fromMaybe [] mb_program) hsc_src
-                   used_th deps rdr_env
+                   used_th deps rdr_env import_decls
                    fix_env warns hpc_info
                    (imp_trust_own_pkg imports) safe_mode usages
                    docs mod_summary
@@ -249,7 +252,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
           mkFullIface hsc_env partial_iface Nothing Nothing
 
 mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
-         -> Bool -> Dependencies -> GlobalRdrEnv
+         -> Bool -> Dependencies -> GlobalRdrEnv -> [LImportDecl GhcPs]
          -> NameEnv FixItem -> Warnings GhcRn -> HpcInfo
          -> Bool
          -> SafeHaskellMode
@@ -259,7 +262,7 @@ mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
          -> ModDetails
          -> PartialModIface
 mkIface_ hsc_env
-         this_mod core_prog hsc_src used_th deps rdr_env fix_env src_warns
+         this_mod core_prog hsc_src used_th deps rdr_env import_decls fix_env src_warns
          hpc_info pkg_trust_req safe_mode usages
          docs mod_summary
          ModDetails{  md_insts     = insts,
@@ -308,6 +311,7 @@ mkIface_ hsc_env
         trust_info  = setSafeMode safe_mode
         annotations = map mkIfaceAnnotation anns
         icomplete_matches = map mkIfaceCompleteMatch complete_matches
+        !rdrs = maybeGlobalRdrEnv rdr_env
 
     ModIface {
           mi_module      = this_mod,
@@ -330,7 +334,7 @@ mkIface_ hsc_env
           mi_fixities    = fixities,
           mi_warns       = warns,
           mi_anns        = annotations,
-          mi_globals     = maybeGlobalRdrEnv rdr_env,
+          mi_top_env     = rdrs,
           mi_used_th     = used_th,
           mi_decls       = decls,
           mi_extra_decls = extra_decls,
@@ -352,16 +356,20 @@ mkIface_ hsc_env
 
      dflags = hsc_dflags hsc_env
 
-     -- We only fill in mi_globals if the module was compiled to byte
+     -- We only fill in mi_top_env if the module was compiled to byte
      -- code.  Otherwise, the compiler may not have retained all the
      -- top-level bindings and they won't be in the TypeEnv (see
-     -- Desugar.addExportFlagsAndRules).  The mi_globals field is used
+     -- Desugar.addExportFlagsAndRules).  The mi_top_env field is used
      -- by GHCi to decide whether the module has its full top-level
      -- scope available. (#5534)
-     maybeGlobalRdrEnv :: GlobalRdrEnv -> Maybe GlobalRdrEnv
+     maybeGlobalRdrEnv :: GlobalRdrEnv -> Maybe IfaceTopEnv
      maybeGlobalRdrEnv rdr_env
-         | backendWantsGlobalBindings (backend dflags) = Just rdr_env
-         | otherwise                                  = Nothing
+        | backendWantsGlobalBindings (backend dflags)
+        = Just $! let !exports = mkIfaceExports $ all_rdr_exports rdr_env
+                  in IfaceTopEnv exports import_decls
+          -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
+        | otherwise
+        = Nothing
 
      ifFamInstTcName = ifFamInstFam
 

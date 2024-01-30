@@ -39,6 +39,8 @@ import Data.Data
 import GHC.Real ( Ratio(..) )
 import GHC.Types.SrcLoc
 
+import Control.DeepSeq (NFData (..))
+
 {-
 Note [Pragma source text]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -101,6 +103,10 @@ data SourceText
       -- deriving. The pretty printer will then make
       -- its own representation of the item.
    deriving (Data, Show, Eq )
+
+instance NFData SourceText where
+  rnf (SourceText s) = rnf s
+  rnf (NoSourceText) = ()
 
 instance Outputable SourceText where
   ppr (SourceText s) = text "SourceText" <+> text s
@@ -310,6 +316,9 @@ data StringLiteral = StringLiteral
 
 instance Eq StringLiteral where
   (StringLiteral _ a _) == (StringLiteral _ b _) = a == b
+
+instance NFData StringLiteral where
+  rnf (StringLiteral st fs tc) = rnf st `seq` rnf fs `seq` rnf tc
 
 instance Outputable StringLiteral where
   ppr sl = pprWithSourceText (sl_st sl) (ftext $ sl_fs sl)

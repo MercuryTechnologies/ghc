@@ -507,6 +507,7 @@ data TcGblEnv
 
           -- These three fields track unused bindings and imports
           -- See Note [Tracking unused binding and imports]
+        tcg_import_decls :: ![LImportDecl GhcPs],
         tcg_dus       :: DefUses,
         tcg_used_gres :: TcRef [GlobalRdrElt],
         tcg_keep      :: TcRef NameSet,

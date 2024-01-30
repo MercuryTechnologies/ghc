@@ -25,6 +25,8 @@ module Language.Haskell.Syntax.Extension where
 import Data.Type.Equality (type (~))
 #endif
 
+import Control.DeepSeq
+
 import Data.Data hiding ( Fixity )
 import Data.Kind (Type)
 
@@ -75,6 +77,9 @@ See also Note [IsPass] and Note [NoGhcTc] in GHC.Hs.Extension.
 -- that manipulate fields with that extension point as their type.
 data NoExtField = NoExtField
   deriving (Data,Eq,Ord)
+
+instance NFData NoExtField where
+  rnf = rwhnf
 
 -- | Used when constructing a term with an unused extension point.
 noExtField :: NoExtField

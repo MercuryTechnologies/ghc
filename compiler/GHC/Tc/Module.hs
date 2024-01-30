@@ -409,6 +409,7 @@ tcRnImports hsc_env import_decls
             gbl {
               tcg_rdr_env      = tcg_rdr_env gbl `plusGlobalRdrEnv` rdr_env,
               tcg_imports      = tcg_imports gbl `plusImportAvails` imports,
+              tcg_import_decls = map fst import_decls,
               tcg_rn_imports   = rn_imports,
               tcg_inst_env     = tcg_inst_env gbl `unionInstEnv` home_insts,
               tcg_fam_inst_env = extendFamInstEnvList (tcg_fam_inst_env gbl)

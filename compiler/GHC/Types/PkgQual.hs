@@ -9,12 +9,17 @@ import GHC.Unit.Types
 import GHC.Utils.Outputable
 
 import Data.Data
+import Control.DeepSeq
 
 -- | Package-qualifier as it was parsed
 data RawPkgQual
   = NoRawPkgQual             -- ^ No package qualifier
   | RawPkgQual StringLiteral -- ^ Raw package qualifier string.
   deriving (Data)
+
+instance NFData RawPkgQual where
+  rnf NoRawPkgQual = ()
+  rnf (RawPkgQual s) = rnf s
 
 -- | Package-qualifier after renaming
 --

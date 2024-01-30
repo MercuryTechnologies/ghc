@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -14,6 +15,7 @@ module GHC.Unit.Module.ModIface
    , IfaceExport
    , WhetherHasOrphans
    , WhetherHasFamInst
+   , IfaceTopEnv (..)
    , mi_boot
    , mi_fix
    , mi_semantic_module
@@ -205,8 +207,8 @@ data ModIface_ (phase :: ModIfacePhase)
                 -- combined with mi_decls allows us to restart code generation.
                 -- See Note [Interface Files with Core Definitions] and Note [Interface File with Core: Sharing RHSs]
 
-        mi_globals  :: !(Maybe GlobalRdrEnv),
-                -- ^ Binds all the things defined at the top level in
+        mi_top_env  :: !(Maybe IfaceTopEnv),
+                -- ^ Just enough information to reconstruct the top level environment in
                 -- the /original source/ code for this module. which
                 -- is NOT the same as mi_exports, nor mi_decls (which
                 -- may contains declarations for things not actually
@@ -262,6 +264,16 @@ data ModIface_ (phase :: ModIfacePhase)
         mi_src_hash :: !Fingerprint
                 -- ^ Hash of the .hs source, used for recompilation checking.
      }
+
+-- Enough information to reconstruct the top level environment for a module
+data IfaceTopEnv
+  = IfaceTopEnv
+  { ifaceTopExports :: ![IfaceExport] -- ^ all top level things in this module, including unexported stuff
+  , ifaceImports :: ![LImportDecl GhcPs]
+  }
+
+instance NFData IfaceTopEnv where
+  rnf (IfaceTopEnv a b) = rnf a `seq` rnf b
 
 {-
 Note [Strictness in ModIface]
@@ -455,7 +467,7 @@ instance Binary ModIface where
                  mi_warns       = warns,
                  mi_decls       = decls,
                  mi_extra_decls = extra_decls,
-                 mi_globals     = Nothing,
+                 mi_top_env     = Nothing,
                  mi_insts       = insts,
                  mi_fam_insts   = fam_insts,
                  mi_rules       = rules,
@@ -504,7 +516,7 @@ emptyPartialModIface mod
                mi_rules       = [],
                mi_decls       = [],
                mi_extra_decls = Nothing,
-               mi_globals     = Nothing,
+               mi_top_env     = Nothing,
                mi_hpc         = False,
                mi_trust       = noIfaceTrustInfo,
                mi_trust_pkg   = False,
@@ -549,12 +561,39 @@ emptyIfaceHashCache _occ = Nothing
 
 -- Take care, this instance only forces to the degree necessary to
 -- avoid major space leaks.
-instance (NFData (IfaceBackendExts (phase :: ModIfacePhase)), NFData (IfaceDeclExts (phase :: ModIfacePhase))) => NFData (ModIface_ phase) where
-  rnf (ModIface f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12
-                f13 f14 f15 f16 f17 f18 f19 f20 f21 f22 f23 f24) =
-    rnf f1 `seq` rnf f2 `seq` f3 `seq` f4 `seq` f5 `seq` f6 `seq` rnf f7 `seq` f8 `seq`
-    f9 `seq` rnf f10 `seq` rnf f11 `seq` rnf f12 `seq` f13 `seq` rnf f14 `seq` rnf f15 `seq` rnf f16 `seq`
-    rnf f17 `seq` f18 `seq` rnf f19 `seq` rnf f20 `seq` rnf f21 `seq` f22 `seq` f23 `seq` rnf f24
+instance ( NFData (IfaceBackendExts (phase :: ModIfacePhase))
+         , NFData (IfaceDeclExts (phase :: ModIfacePhase))
+         ) => NFData (ModIface_ phase) where
+  rnf (ModIface{ mi_module, mi_sig_of, mi_hsc_src, mi_deps, mi_usages
+               , mi_exports, mi_used_th, mi_fixities, mi_warns, mi_anns
+               , mi_decls, mi_extra_decls, mi_top_env, mi_insts
+               , mi_fam_insts, mi_rules, mi_hpc, mi_trust, mi_trust_pkg
+               , mi_complete_matches, mi_docs, mi_final_exts
+               , mi_ext_fields, mi_src_hash })
+    =     rnf mi_module
+    `seq` rnf mi_sig_of
+    `seq`     mi_hsc_src
+    `seq`     mi_deps
+    `seq`     mi_usages
+    `seq`     mi_exports
+    `seq` rnf mi_used_th
+    `seq`     mi_fixities
+    `seq` rnf mi_warns
+    `seq` rnf mi_anns
+    `seq` rnf mi_decls
+    `seq` rnf mi_extra_decls
+    `seq` rnf mi_top_env
+    `seq` rnf mi_insts
+    `seq` rnf mi_fam_insts
+    `seq` rnf mi_rules
+    `seq` rnf mi_hpc
+    `seq`     mi_trust
+    `seq` rnf mi_trust_pkg
+    `seq` rnf mi_complete_matches
+    `seq` rnf mi_docs
+    `seq`     mi_final_exts
+    `seq`     mi_ext_fields
+    `seq` rnf mi_src_hash
     `seq` ()
 
 

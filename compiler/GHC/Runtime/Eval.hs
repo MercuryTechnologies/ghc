@@ -1,6 +1,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE LambdaCase #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
@@ -25,6 +26,7 @@ module GHC.Runtime.Eval (
         setupBreakpoint,
         back, forward,
         setContext, getContext,
+        mkTopLevEnv,
         getNamesInScope,
         getRdrNamesInScope,
         moduleIsInterpreted,
@@ -53,6 +55,8 @@ import GHC.Driver.Env
 import GHC.Driver.Session
 import GHC.Driver.Ppr
 import GHC.Driver.Config
+
+import GHC.Rename.Names (gresFromAvails)
 
 import GHC.Runtime.Eval.Types
 import GHC.Runtime.Interpreter as GHCi
@@ -119,6 +123,9 @@ import Data.Dynamic
 import Data.Either
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.List (find,intercalate)
 import Data.List.NonEmpty (NonEmpty)
 import Control.Monad
@@ -812,9 +819,10 @@ findGlobalRdrEnv :: HscEnv -> [InteractiveImport]
 findGlobalRdrEnv hsc_env imports
   = do { idecls_env <- hscRnImportDecls hsc_env idecls
                     -- This call also loads any orphan modules
-       ; return $ case partitionEithers (map mkEnv imods) of
-           ([], imods_env) -> Right (foldr plusGlobalRdrEnv idecls_env imods_env)
-           (err : _, _)    -> Left err }
+       ; partitionWithM mkEnv imods >>= \case
+           (err : _, _)     -> return $ Left err
+           ([], imods_env)  -> return $ Right (foldr plusGlobalRdrEnv idecls_env imods_env)
+       }
   where
     idecls :: [LImportDecl GhcPs]
     idecls = [noLocA d | IIDecl d <- imports]
@@ -822,18 +830,35 @@ findGlobalRdrEnv hsc_env imports
     imods :: [ModuleName]
     imods = [m | IIModule m <- imports]
 
-    mkEnv mod = case mkTopLevEnv (hsc_HPT hsc_env) mod of
-      Left err -> Left (mod, err)
-      Right env -> Right env
+    modsums :: Map ModuleName ModSummary
+    modsums = flip Map.restrictKeys (Set.fromList imods)
+            $ Map.fromList [(ms_mod_name ms, ms)
+                           | ms <- mgModSummaries (hsc_mod_graph hsc_env)
+                           , isBootSummary ms == NotBoot
+                           ]
 
-mkTopLevEnv :: HomePackageTable -> ModuleName -> Either String GlobalRdrEnv
-mkTopLevEnv hpt modl
+    mkEnv mod = mkTopLevEnv hsc_env modsums mod >>= \case
+      Left err -> pure $ Left (mod, err)
+      Right env -> pure $ Right env
+
+mkTopLevEnv :: HscEnv -> Map ModuleName ModSummary -> ModuleName -> IO (Either String GlobalRdrEnv)
+mkTopLevEnv hsc_env summs modl
   = case lookupHpt hpt modl of
-      Nothing -> Left "not a home module"
+      Nothing -> pure $ Left "not a home module"
       Just details ->
-         case mi_globals (hm_iface details) of
-                Nothing  -> Left "not interpreted"
-                Just env -> Right env
+         case mi_top_env (hm_iface details) of
+                Nothing  -> pure $ Left "not interpreted"
+                Just (IfaceTopEnv exports imports) -> do
+                  case Map.lookup modl summs of
+                    Nothing -> pure $ Left "no ModSummary in graph"
+                    Just ms -> do
+                      let hsc_env' = hsc_env {hsc_dflags = ms_hspp_opts ms}
+                      imports_env <- hscRnImportDecls hsc_env' imports
+                      let exports_env = mkGlobalRdrEnv $ gresFromAvails Nothing exports
+                      -- pprTraceM "mkTopLevEnv" $ ppr (modl, imports, imports_env, exports, exports_env)
+                      pure $ Right $ plusGlobalRdrEnv imports_env exports_env
+  where
+    hpt = hsc_HPT hsc_env
 
 -- | Get the interactive evaluation context, consisting of a pair of the
 -- set of modules from which we take the full top-level scope, and the set
@@ -849,7 +874,7 @@ moduleIsInterpreted modl = withSession $ \h ->
  if notHomeModule (hsc_home_unit h) modl
         then return False
         else case lookupHpt (hsc_HPT h) (moduleName modl) of
-                Just details       -> return (isJust (mi_globals (hm_iface details)))
+                Just details       -> return (isJust (mi_top_env (hm_iface details)))
                 _not_a_home_module -> return False
 
 -- | Looks up an identifier in the current interactive context (for :info)

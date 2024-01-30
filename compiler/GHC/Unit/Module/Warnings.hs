@@ -32,6 +32,8 @@ import Language.Haskell.Syntax.Extension
 import Data.Data
 import GHC.Generics ( Generic )
 
+import Control.DeepSeq (NFData (..), rwhnf)
+
 -- | Warning Text
 --
 -- reason/explanation from a WARNING or DEPRECATED pragma
@@ -44,7 +46,12 @@ data WarningTxt pass
       [Located (WithHsDocIdentifiers StringLiteral pass)]
   deriving Generic
 
+instance NFData (IdP p) => NFData (WarningTxt p) where
+  rnf (WarningTxt t ns) = rnf t `seq` rnf ns
+  rnf (DeprecatedTxt t ns) = rnf t `seq` rnf ns
+
 deriving instance Eq (IdP pass) => Eq (WarningTxt pass)
+
 deriving instance (Data pass, Data (IdP pass)) => Data (WarningTxt pass)
 
 instance Outputable (WarningTxt pass) where
@@ -121,6 +128,11 @@ data Warnings pass
      --
      --        this is in contrast with fixity declarations, where we need to map
      --        a Name to its fixity declaration.
+
+instance NFData (IdP p) => NFData (Warnings p) where
+  rnf NoWarnings = rwhnf NoWarnings
+  rnf (WarnAll a) = rnf a
+  rnf (WarnSome xs) = rnf xs
 
 deriving instance Eq (IdP pass) => Eq (Warnings pass)
 

@@ -218,6 +218,9 @@ data RealSrcLoc
 newtype BufPos = BufPos { bufPos :: Int }
   deriving (Eq, Ord, Show, Data)
 
+instance NFData BufPos where
+  rnf (BufPos p) = rnf p
+
 -- | Source Location
 data SrcLoc
   = RealSrcLoc !RealSrcLoc !(Strict.Maybe BufPos)  -- See Note [Why Maybe BufPos]
@@ -366,10 +369,16 @@ data RealSrcSpan
         }
   deriving Eq
 
+instance NFData RealSrcSpan where
+  rnf = rwhnf -- already strict
+
 -- | StringBuffer Source Span
 data BufSpan =
   BufSpan { bufSpanStart, bufSpanEnd :: {-# UNPACK #-} !BufPos }
   deriving (Eq, Ord, Show, Data)
+
+instance NFData BufSpan where
+  rnf (BufSpan s e) = rnf s `seq` rnf e
 
 instance Semigroup BufSpan where
   BufSpan start1 end1 <> BufSpan start2 end2 =

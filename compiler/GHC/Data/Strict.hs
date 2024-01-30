@@ -21,9 +21,14 @@ import GHC.Prelude hiding (Maybe(..), Either(..))
 import Control.Applicative
 import Data.Semigroup
 import Data.Data
+import Control.DeepSeq (NFData (..))
 
 data Maybe a = Nothing | Just !a
   deriving (Eq, Ord, Show, Functor, Foldable, Traversable, Data)
+
+instance (NFData a) => NFData (Maybe a) where
+  rnf (Just a) = rnf a
+  rnf Nothing = ()
 
 fromMaybe :: a -> Maybe a -> a
 fromMaybe d Nothing = d

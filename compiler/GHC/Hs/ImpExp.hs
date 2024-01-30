@@ -34,6 +34,8 @@ import GHC.Hs.Extension
 import GHC.Types.Name
 import GHC.Types.PkgQual
 
+import Control.DeepSeq
+
 import Data.Data
 import Data.Maybe
 
@@ -90,7 +92,14 @@ data XImportDeclPass = XImportDeclPass
     }
     deriving (Data)
 
+instance NFData XImportDeclPass where
+  rnf (XImportDeclPass ann txt imp) = rnf ann `seq` rnf txt `seq` rnf imp
+
 type instance XXImportDecl  (GhcPass _) = DataConCantHappen
+
+instance NFData (ImportDecl GhcPs) where
+  rnf (ImportDecl ext name pkg src safe qual as il)
+    = rnf ext `seq` rnf name `seq` rnf pkg `seq` rnf src `seq` rnf safe `seq` rnf qual `seq` rnf as `seq` rnf il
 
 type instance Anno ModuleName = SrcSpanAnnA
 type instance Anno [LocatedA (IE (GhcPass p))] = SrcSpanAnnL
@@ -115,6 +124,12 @@ data EpAnnImportDecl = EpAnnImportDecl
   , importDeclAnnPackage   :: Maybe EpaLocation
   , importDeclAnnAs        :: Maybe EpaLocation
   } deriving (Data)
+
+-- instance NoAnn EpAnnImportDecl where
+--   noAnn = EpAnnImportDecl noAnn  Nothing  Nothing  Nothing  Nothing  Nothing
+
+instance NFData EpAnnImportDecl where
+  rnf (EpAnnImportDecl a b c d e f) = rnf a `seq` rnf b `seq` rnf c `seq` rnf d `seq` rnf e `seq` rnf f
 
 -- ---------------------------------------------------------------------
 
@@ -188,6 +203,11 @@ instance (OutputableBndrId p
 ************************************************************************
 -}
 
+instance NFData (IEWrappedName GhcPs) where
+  rnf (IEName x n) = rnf x `seq` rnf n
+  rnf (IEPattern x p) = rnf x `seq` rnf p
+  rnf (IEType x t) = rnf x `seq` rnf t
+
 type instance XIEName    (GhcPass _) = NoExtField
 type instance XIEPattern (GhcPass _) = EpaLocation
 type instance XIEType    (GhcPass _) = EpaLocation
@@ -217,6 +237,16 @@ type instance XIEGroup           (GhcPass _) = NoExtField
 type instance XIEDoc             (GhcPass _) = NoExtField
 type instance XIEDocNamed        (GhcPass _) = NoExtField
 type instance XXIE               (GhcPass _) = DataConCantHappen
+
+instance NFData (IE GhcPs) where
+  rnf (IEVar x n) = rnf x `seq` rnf n
+  rnf (IEThingAbs x n) = rnf x `seq` rnf n
+  rnf (IEThingAll x n) = rnf x `seq` rnf n
+  rnf (IEThingWith x n w ns) = rnf x `seq` rnf n `seq` rnf w `seq` rnf ns
+  rnf (IEModuleContents x mn) = rnf x `seq` rnf mn
+  rnf (IEGroup x i d) = rnf x `seq` rnf i `seq` rnf d
+  rnf (IEDoc x d) = rnf x `seq` rnf d
+  rnf (IEDocNamed x s) = rnf x `seq` rnf s
 
 type instance Anno (LocatedA (IE (GhcPass p))) = SrcSpanAnnA
 
