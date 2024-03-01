@@ -120,6 +120,7 @@ import GHC.Unit.Module.Graph
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.ModSummary
 import GHC.Unit.Home.ModInfo
+import GHC.Unit.Home.PackageTable
 
 import GHC.Tc.Module ( runTcInteractive, tcRnType, loadUnqualIfaces )
 import GHC.Tc.Solver (simplifyWantedsTcM)
@@ -128,7 +129,6 @@ import GHC.Tc.Utils.Instantiate (instDFunType)
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Zonk.Env ( ZonkFlexi (SkolemiseFlexi) )
 
-import GHC.Unit.Env
 import GHC.IfaceToCore
 
 import Control.Monad
@@ -141,6 +141,7 @@ import Data.List (find,intercalate)
 import Data.List.NonEmpty (NonEmpty)
 import System.Directory
 import Unsafe.Coerce ( unsafeCoerce )
+import qualified GHC.Unit.Home.Graph as HUG
 
 -- -----------------------------------------------------------------------------
 -- running a statement interactively
@@ -322,7 +323,7 @@ handleRunStatus :: GhcMonad m
                 -> BoundedList History
                 -> m ExecResult
 
-handleRunStatus step expr bindings final_ids status history
+handleRunStatus step expr bindings final_ids status history0
   | RunAndLogSteps <- step = tracing
   | otherwise              = not_tracing
  where
@@ -451,12 +452,13 @@ resumeExec canLogSpan step mbCnt
                 status <- liftIO $ GHCi.resumeStmt interp eval_opts fhv
                 let prevHistoryLst = fromListBL 50 hist
                     hist' = case mb_brkpt of
-                       Nothing -> prevHistoryLst
+                       Nothing -> pure prevHistoryLst
                        Just bi
-                         | not $ canLogSpan span -> prevHistoryLst
-                         | otherwise -> mkHistory hsc_env apStack bi `consBL`
-                                                        fromListBL 50 hist
-                handleRunStatus step expr bindings final_ids status hist'
+                         | not $ canLogSpan span -> pure prevHistoryLst
+                         | otherwise -> do
+                            hist1 <- liftIO (mkHistory hsc_env apStack bi)
+                            return $ hist1 `consBL` fromListBL 50 hist
+                handleRunStatus step expr bindings final_ids status =<< hist'
 
 setupBreakpoint :: GhcMonad m => HscEnv -> BreakpointId -> Int -> m ()   -- #19157
 setupBreakpoint hsc_env bi cnt = do
@@ -837,7 +839,7 @@ findGlobalRdrEnv hsc_env imports
 
 mkTopLevEnv :: HscEnv -> ModuleName -> IO (Either String GlobalRdrEnv)
 mkTopLevEnv hsc_env modl
-  = case lookupHpt hpt modl of
+  = lookupHpt hpt modl >>= \case
       Nothing -> pure $ Left "not a home module"
       Just details ->
          case mi_top_env (hm_iface details) of
@@ -873,9 +875,9 @@ moduleIsInterpreted :: GhcMonad m => Module -> m Bool
 moduleIsInterpreted modl = withSession $ \h ->
  if notHomeModule (hsc_home_unit h) modl
         then return False
-        else case lookupHpt (hsc_HPT h) (moduleName modl) of
-                Just details       -> return (isJust (mi_top_env (hm_iface details)))
-                _not_a_home_module -> return False
+        else liftIO (lookupHpt (hsc_HPT h) (moduleName modl)) >>= \case
+              Just details       -> return (isJust (mi_top_env (hm_iface details)))
+              _not_a_home_module -> return False
 
 -- | Looks up an identifier in the current interactive context (for :info)
 -- Filter the instances by the ones whose tycons (or classes resp)
@@ -1272,17 +1274,17 @@ showModule :: GhcMonad m => ModSummary -> m String
 showModule mod_summary =
     withSession $ \hsc_env -> do
         let dflags = hsc_dflags hsc_env
-        let interpreted =
-              case lookupHug (hsc_HUG hsc_env) (ms_unitid mod_summary) (ms_mod_name mod_summary) of
-               Nothing       -> panic "missing linkable"
-               Just mod_info -> isJust (homeModInfoByteCode mod_info)  && isNothing (homeModInfoObject mod_info)
+        interpreted <- liftIO $
+          HUG.lookupHug (hsc_HUG hsc_env) (ms_unitid mod_summary) (ms_mod_name mod_summary) >>= pure . \case
+            Nothing       -> panic "missing linkable"
+            Just mod_info -> isJust (homeModInfoByteCode mod_info)  && isNothing (homeModInfoObject mod_info)
         return (showSDoc dflags $ showModMsg dflags interpreted (ModuleNode [] mod_summary))
 
 moduleIsBootOrNotObjectLinkable :: GhcMonad m => ModSummary -> m Bool
-moduleIsBootOrNotObjectLinkable mod_summary = withSession $ \hsc_env ->
-  case lookupHug (hsc_HUG hsc_env) (ms_unitid mod_summary) (ms_mod_name mod_summary) of
-        Nothing       -> panic "missing linkable"
-        Just mod_info -> return . isNothing $ homeModInfoByteCode mod_info
+moduleIsBootOrNotObjectLinkable mod_summary = withSession $ \hsc_env -> liftIO $
+  HUG.lookupHug (hsc_HUG hsc_env) (ms_unitid mod_summary) (ms_mod_name mod_summary) >>= pure . \case
+    Nothing       -> panic "missing linkable"
+    Just mod_info -> isNothing $ homeModInfoByteCode mod_info
 
 ----------------------------------------------------------------------------
 -- RTTI primitives

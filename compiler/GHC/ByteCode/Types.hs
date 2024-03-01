@@ -55,7 +55,7 @@ import Language.Haskell.Syntax.Module.Name (ModuleName)
 -- Compiled Byte Code
 
 data CompiledByteCode = CompiledByteCode
-  { bc_bcos   :: [UnlinkedBCO]
+  { bc_bcos   :: FlatBag UnlinkedBCO
     -- ^ Bunch of interpretable bindings
 
   , bc_itbls  :: ItblEnv
@@ -80,7 +80,7 @@ newtype FFIInfo = FFIInfo (RemotePtr C_ffi_cif)
   deriving (Show, NFData)
 
 instance Outputable CompiledByteCode where
-  ppr CompiledByteCode{..} = ppr bc_bcos
+  ppr CompiledByteCode{..} = ppr $ elemsFlatBag bc_bcos
 
 -- Not a real NFData instance, because ModBreaks contains some things
 -- we can't rnf

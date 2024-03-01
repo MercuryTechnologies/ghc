@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, ViewPatterns #-}
+{-# LANGUAGE GADTs, ViewPatterns, LambdaCase #-}
 
 -- | The @FamInst@ type: family instance heads
 module GHC.Tc.Instance.Family (
@@ -34,9 +34,7 @@ import GHC.Tc.Utils.TcType
 import GHC.Unit.External
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
-import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.Deps
-import GHC.Unit.Home.ModInfo
 
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Name.Reader
@@ -294,11 +292,11 @@ checkFamInstConsistency directlyImpMods
        ; traceTc "checkFamInstConsistency" (ppr directlyImpMods)
        ; let { -- Fetch the iface of a given module.  Must succeed as
                -- all directly imported modules must already have been loaded.
-               modIface mod =
-                 case lookupIfaceByModule hug (eps_PIT eps) mod of
+               modIface mod = liftIO $
+                 lookupIfaceByModule hug (eps_PIT eps) mod >>= \case
                    Nothing    -> panicDoc "FamInst.checkFamInstConsistency"
-                                          (ppr mod $$ ppr hug)
-                   Just iface -> iface
+                                          (ppr mod $$ ppr (HUG.allUnits hug))
+                   Just iface -> pure iface
 
                -- Which family instance modules were checked for consistency
                -- when we compiled `mod`?
@@ -324,6 +322,8 @@ checkFamInstConsistency directlyImpMods
                                            | hpt <- unitEnv_hpts hug
                                            , hmi <- eltsHpt hpt ]
 
+             -- Sorting the list by size has the effect of performing a topological sort.
+             -- See Note [Order of type family consistency checks]
              }
 
        ; traceTc "init_consistent_set" (ppr debug_consistent_set)

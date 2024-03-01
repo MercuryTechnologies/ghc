@@ -93,6 +93,7 @@ import GHC.Utils.Fingerprint
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Home.ModInfo
+import GHC.Unit.Home.PackageTable
 import GHC.Unit.Env
 
 #if defined(HAVE_INTERNAL_INTERPRETER)
@@ -415,7 +416,7 @@ handleSeqHValueStatus interp unit_env eval_status =
       let bp = evalBreakpointToId (ue_hpt unit_env) <$> maybe_break
           sdocBpLoc = brackets . ppr . getSeqBpSpan
       putStrLn ("*** Ignoring breakpoint " ++
-            (showSDocUnsafe $ sdocBpLoc bp))
+            (showSDocUnsafe $ sbp))
       -- resume the seq (:force) processing in the iserv process
       withForeignRef resume_ctxt_fhv $ \hval -> do
         status <- interpCmd interp (ResumeSeq hval)

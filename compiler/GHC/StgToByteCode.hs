@@ -1,6 +1,7 @@
 
 {-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE FlexibleContexts           #-}
 
@@ -63,6 +64,7 @@ import GHC.StgToCmm.Closure ( NonVoid(..), fromNonVoid, idPrimRepU,
 import GHC.StgToCmm.Layout
 import GHC.Runtime.Heap.Layout hiding (WordOff, ByteOff, wordsToBytes)
 import GHC.Data.Bitmap
+import GHC.Data.FlatBag as FlatBag
 import GHC.Data.OrdList
 import GHC.Data.Maybe
 import GHC.Types.Name.Env (mkNameEnv)
@@ -76,7 +78,7 @@ import Control.Monad
 import Data.Char
 
 import GHC.Unit.Module
-import GHC.Unit.Home.ModInfo (lookupHpt)
+import GHC.Unit.Home.PackageTable (lookupHpt)
 
 import Data.Array
 import Data.Coerce (coerce)
@@ -121,14 +123,14 @@ byteCodeGen hsc_env this_mod binds tycs mb_modBreaks spt_entries
         (BcM_State{..}, proto_bcos) <-
            runBc hsc_env this_mod mb_modBreaks $ do
              let flattened_binds = concatMap flattenBind (reverse lifted_binds)
-             mapM schemeTopBind flattened_binds
+             FlatBag.fromList (fromIntegral $ length flattened_binds) <$> mapM schemeTopBind flattened_binds
 
         when (notNull ffis)
              (panic "GHC.StgToByteCode.byteCodeGen: missing final emitBc?")
 
         putDumpFileMaybe logger Opt_D_dump_BCOs
            "Proto-BCOs" FormatByteCode
-           (vcat (intersperse (char ' ') (map ppr proto_bcos)))
+           (vcat (intersperse (char ' ') (map ppr $ elemsFlatBag proto_bcos)))
 
         let mod_breaks = case modBreaks of
              Nothing -> Nothing
@@ -446,14 +448,14 @@ break_info ::
   Module ->
   Module ->
   Maybe ModBreaks ->
-  Maybe ModBreaks
+  BcM (Maybe ModBreaks)
 break_info hsc_env mod current_mod current_mod_breaks
   | mod == current_mod
-  = check_mod_ptr =<< current_mod_breaks
-  | Just hp <- lookupHpt (hsc_HPT hsc_env) (moduleName mod)
-  = check_mod_ptr (getModBreaks hp)
+  = pure $ check_mod_ptr =<< current_mod_breaks
   | otherwise
-  = Nothing
+  = ioToBc (lookupHpt (hsc_HPT hsc_env) (moduleName mod)) >>= \case
+      Just hp -> pure $ check_mod_ptr (getModBreaks hp)
+      Nothing -> pure Nothing
   where
     check_mod_ptr mb
       | mod_ptr <- modBreaks_module mb
