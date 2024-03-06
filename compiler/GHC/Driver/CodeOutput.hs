@@ -37,7 +37,7 @@ import GHC.Driver.LlvmConfigCache  (LlvmConfigCache)
 import GHC.Driver.Ppr
 import GHC.Driver.Backend
 
-import GHC.Data.OsPath
+import GHC.Data.OsPath hiding (createDirectoryIfMissing, takeDirectory)
 import qualified GHC.Data.ShortText as ST
 import GHC.Data.Stream           ( liftIO )
 import qualified GHC.Data.Stream as Stream
