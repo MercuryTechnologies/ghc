@@ -358,14 +358,14 @@ addModuleToFinder :: FinderCache -> Module -> ModLocation -> HscSource -> IO ()
 addModuleToFinder fc mod loc src_flavour = do
   let imod = toUnitId <$> mod
   unless (src_flavour == HsBootFile) $
-    addToFinderCache fc imod (InstalledFound loc)
+    addToFinderCache fc imod (InstalledFound (ensureNonBootLocation loc))
 
 -- This returns a module because it's more convenient for users
 addHomeModuleToFinder :: FinderCache -> HomeUnit -> ModuleName -> ModLocation -> HscSource -> IO Module
 addHomeModuleToFinder fc home_unit mod_name loc src_flavour = do
   let mod = mkHomeInstalledModule home_unit mod_name
   unless (src_flavour == HsBootFile) $
-    addToFinderCache fc mod (InstalledFound loc)
+    addToFinderCache fc mod (InstalledFound (ensureNonBootLocation loc))
   return (mkHomeModule home_unit mod_name)
 
 -- -----------------------------------------------------------------------------
