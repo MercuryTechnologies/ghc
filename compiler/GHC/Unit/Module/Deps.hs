@@ -38,6 +38,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Bifunctor
 
+import GHC.Data.FastString
+
 -- | Dependency information about ALL modules and packages below this one
 -- in the import hierarchy. This is the serialisable version of `ImportAvails`.
 --
@@ -275,13 +277,13 @@ data Usage
   -- | A file upon which the module depends, e.g. a CPP #include, or using TH's
   -- 'addDependentFile'
   | UsageFile {
-        usg_file_path  :: FilePath,
+        usg_file_path  :: FastString,
         -- ^ External file dependency. From a CPP #include or TH
         -- addDependentFile. Should be absolute.
         usg_file_hash  :: Fingerprint,
         -- ^ 'Fingerprint' of the file contents.
 
-        usg_file_label :: Maybe String
+        usg_file_label :: Maybe FastString
         -- ^ An optional string which is used in recompilation messages if
         -- file in question has changed.
 

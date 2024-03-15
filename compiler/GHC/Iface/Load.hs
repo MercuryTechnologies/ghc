@@ -110,6 +110,7 @@ import GHC.Unit.Finder
 import GHC.Unit.Env
 
 import GHC.Data.Maybe
+import GHC.Data.FastString
 
 import Control.Monad
 import Data.Map ( toList )
@@ -1179,7 +1180,7 @@ pprUsage usage@UsageHomeModule{}
         )
 pprUsage usage@UsageFile{}
   = hsep [text "addDependentFile",
-          doubleQuotes (text (usg_file_path usage)),
+          doubleQuotes (text (unpackFS (usg_file_path usage))),
           ppr (usg_file_hash usage)]
 pprUsage usage@UsageMergedRequirement{}
   = hsep [text "merged", ppr (usg_mod usage), ppr (usg_mod_hash usage)]

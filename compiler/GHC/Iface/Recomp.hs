@@ -765,13 +765,13 @@ checkModUsage fc UsageFile{ usg_file_path = file,
                             usg_file_label = mlabel } =
   liftIO $
     handleIO handler $ do
-      new_hash <- lookupFileCache fc file
+      new_hash <- lookupFileCache fc (unpackFS file)
       if (old_hash /= new_hash)
          then return recomp
          else return UpToDate
  where
-   reason = FileChanged file
-   recomp  = needsRecompileBecause $ fromMaybe reason $ fmap CustomReason mlabel
+   reason = FileChanged (unpackFS file)
+   recomp  = needsRecompileBecause $ fromMaybe reason $ fmap (CustomReason . unpackFS) mlabel
    handler = if debugIsOn
       then \e -> pprTrace "UsageFile" (text (show e)) $ return recomp
       else \_ -> return recomp -- if we can't find the file, just recompile, don't fail

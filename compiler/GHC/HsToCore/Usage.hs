@@ -47,6 +47,8 @@ import GHC.Unit.Finder
 import GHC.Types.Unique.DFM
 import GHC.Driver.Plugins
 
+import GHC.Data.FastString (fsLit)
+
 {- Note [Module self-dependency]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -86,7 +88,7 @@ mkUsageInfo uc plugins fc unit_env this_mod dir_imp_mods used_names dependent_fi
     let all_home_ids = ue_all_home_unit_ids unit_env
     mod_usages <- mk_mod_usage_info uc hu all_home_ids this_mod
                                        dir_imp_mods used_names
-    let usages = mod_usages ++ [ UsageFile { usg_file_path = f
+    let usages = mod_usages ++ [ UsageFile { usg_file_path = fsLit f
                                            , usg_file_hash = hash
                                            , usg_file_label = Nothing }
                                | (f, hash) <- zip dependent_files hashes ]
@@ -174,7 +176,7 @@ mkObjectUsage pit plugins fc hug th_links_needed th_pkgs_needed = do
 
     msg m = moduleNameString (moduleName m) ++ "[TH] changed"
 
-    fing mmsg fn = UsageFile fn <$> lookupFileCache fc fn <*> pure mmsg
+    fing mmsg fn = UsageFile (fsLit fn) <$> lookupFileCache fc fn <*> pure (fmap fsLit mmsg)
 
     unlinkedToUsage m ul =
       case nameOfObject_maybe ul of
