@@ -852,6 +852,7 @@ data GeneralFlag
    | Opt_BuildDynamicToo
    | Opt_WriteIfSimplifiedCore
    | Opt_UseBytecodeRatherThanObjects
+   | Opt_PackageDbBytecode
 
    -- safe haskell flags
    | Opt_DistrustAllPackages

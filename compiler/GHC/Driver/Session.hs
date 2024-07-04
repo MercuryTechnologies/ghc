@@ -2558,6 +2558,7 @@ fFlagsDeps = [
   flagSpec "byte-code-and-object-code"        Opt_ByteCodeAndObjectCode,
   flagSpec "prefer-byte-code"                 Opt_UseBytecodeRatherThanObjects,
   flagSpec "object-determinism"               Opt_ObjectDeterminism,
+  flagSpec "package-db-byte-code"             Opt_PackageDbBytecode,
   flagSpec' "compact-unwind"                  Opt_CompactUnwind
       (\turn_on -> updM (\dflags -> do
         unless (platformOS (targetPlatform dflags) == OSDarwin && turn_on)
