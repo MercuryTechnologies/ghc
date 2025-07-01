@@ -266,7 +266,7 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
                           --  libraries during runInjectRpaths phase.
                           --
                           --  See Note [Dynamic linking on macOS].
-                          then [ "-Wl,-dead_strip_dylibs", "-Wl,-headerpad,8000" ]
+                          then [ "-Wl,-dead_strip_dylibs", "-Wl,-headerpad,16000" ]
                           else [])
                     ))
 
