@@ -799,6 +799,11 @@ mkOneShotModLocation pipe_env dflags src_flavour mod_name = do
         location3 | Just fn <- dynohi = location2{ ml_dyn_hi_file_ospath = unsafeEncodeUtf fn }
                   | otherwise         = location2
 
+    -- Take -ohie into account if present
+    let ohie = outputHie dflags
+        location4 | Just fn <- ohie = location3{ ml_hie_file = fn }
+                  | otherwise       = location3
+
     -- Take -o into account if present
     -- Very like -ohi, but we must *only* do this if we aren't linking
     -- (If we're linking then the -o applies to the linked thing, not to
