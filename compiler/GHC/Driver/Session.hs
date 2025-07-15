@@ -148,7 +148,7 @@ module GHC.Driver.Session (
         initDynFlags,                   -- DynFlags -> IO DynFlags
         defaultFatalMessager,
         defaultFlushOut,
-        setOutputFile, setDynOutputFile, setOutputHi, setDynOutputHi,
+        setOutputFile, setDynOutputFile, setOutputHi, setDynOutputHi, setOutputHie,
         augmentByWorkingDirectory,
 
         getOpts,                        -- DynFlags -> (DynFlags -> [a]) -> [a]
@@ -613,6 +613,7 @@ setOutputFile    f d = d { outputFile_    = f}
 setDynOutputFile f d = d { dynOutputFile_ = f}
 setOutputHi      f d = d { outputHi       = f}
 setDynOutputHi   f d = d { dynOutputHi    = f}
+setOutputHie     f d = d { outputHie      = f}
 
 parseUnitInsts :: String -> Instantiations
 parseUnitInsts str = case filter ((=="").snd) (readP_to_S parse str) of
@@ -1186,6 +1187,8 @@ dynamic_flags_deps = [
         (hasArg (setOutputHi . Just ))
   , make_ord_flag defGhcFlag "dynohi"
         (hasArg (setDynOutputHi . Just ))
+  , make_ord_flag defGhcFlag "ohie"
+        (hasArg (setOutputHie . Just ))
   , make_ord_flag defGhcFlag "osuf"              (hasArg setObjectSuf)
   , make_ord_flag defGhcFlag "dynosuf"           (hasArg setDynObjectSuf)
   , make_ord_flag defGhcFlag "hcsuf"             (hasArg setHcSuf)

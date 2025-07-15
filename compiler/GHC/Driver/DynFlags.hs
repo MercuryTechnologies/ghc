@@ -281,6 +281,7 @@ data DynFlags = DynFlags {
   dynOutputFile_        :: Maybe String,
   outputHi              :: Maybe String,
   dynOutputHi           :: Maybe String,
+  outputHie             :: Maybe String,
   dynLibLoader          :: DynLibLoader,
 
   dynamicNow            :: !Bool, -- ^ Indicate if we are now generating dynamic output
@@ -610,6 +611,7 @@ defaultDynFlags mySettings =
         dynOutputFile_          = Nothing,
         outputHi                = Nothing,
         dynOutputHi             = Nothing,
+        outputHie               = Nothing,
         dynLibLoader            = SystemDependent,
         dumpPrefix              = "non-module.",
         dumpPrefixForce         = Nothing,
