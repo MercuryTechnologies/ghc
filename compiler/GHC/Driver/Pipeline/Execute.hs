@@ -790,6 +790,11 @@ mkOneShotModLocation pipe_env dflags src_flavour mod_name = do
         location4 | Just fn <- dynohi = location3{ ml_dyn_hi_file = fn }
                   | otherwise         = location3
 
+    -- Take -ohie into account if present
+    let ohie = outputHie dflags
+        location5 | Just fn <- ohie = location4{ ml_hie_file = fn }
+                  | otherwise       = location4
+
     -- Take -o into account if present
     -- Very like -ohi, but we must *only* do this if we aren't linking
     -- (If we're linking then the -o applies to the linked thing, not to
@@ -798,15 +803,15 @@ mkOneShotModLocation pipe_env dflags src_flavour mod_name = do
     -- above
     let expl_o_file = outputFile_ dflags
         expl_dyn_o_file  = dynOutputFile_ dflags
-        location5 | Just ofile <- expl_o_file
+        location6 | Just ofile <- expl_o_file
                   , let dyn_ofile = fromMaybe (ofile -<.> dynObjectSuf_ dflags) expl_dyn_o_file
                   , isNoLink (ghcLink dflags)
-                  = location4 { ml_obj_file = ofile
+                  = location5 { ml_obj_file = ofile
                               , ml_dyn_obj_file = dyn_ofile }
                   | Just dyn_ofile <- expl_dyn_o_file
-                  = location4 { ml_dyn_obj_file = dyn_ofile }
-                  | otherwise = location4
-    return location5
+                  = location5 { ml_dyn_obj_file = dyn_ofile }
+                  | otherwise = location5
+    return location6
     where
       fopts = initFinderOpts dflags
 
