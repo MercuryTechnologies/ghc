@@ -12,6 +12,8 @@ import GHC.Utils.Error
 import GHC.Utils.CliOption
 import GHC.SysTools.Process
 import GHC.Linker.Config
+import Data.List (partition)
+import qualified Data.Set as Set
 
 -- | Run the external linker
 runLink :: Logger -> TmpFs -> LinkerConfig -> [Option] -> IO ()
@@ -22,5 +24,12 @@ runLink logger tmpfs cfg args = traceSystoolCommand logger "linker" $ do
   -- Vista
   mb_env <- getGccEnv all_args
 
+  let (dedupable_args, other_args) = partition optionIsDeduplicatable all_args
+      deduped_args = (Set.toList $ Set.fromList dedupable_args) ++ other_args
+
   runSomethingResponseFile logger tmpfs (linkerTempDir cfg) (linkerFilter cfg)
-    "Linker" (linkerProgram cfg) all_args mb_env
+    "Linker" (linkerProgram cfg) deduped_args mb_env
+
+optionIsDeduplicatable :: Option -> Bool
+optionIsDeduplicatable (FileOption "L" _ ) = True
+optionIsDeduplicatable _ = False
