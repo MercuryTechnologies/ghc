@@ -84,6 +84,10 @@ import GHC.Unit.Module.ModIface
 import GHC.Unit.Module
 import qualified Data.Set as Set
 
+import GHC.Types.Unique.FM (ufmLength)
+import GHC.Types.Unique.Map (UniqMap(getUniqMap))
+import Debug.Trace (trace)
+
 data UnitEnv = UnitEnv
     { ue_eps :: {-# UNPACK #-} !ExternalUnitCache
         -- ^ Information about the currently loaded external packages.
@@ -157,7 +161,16 @@ ue_transitiveHomeDeps uid unit_env = Set.toList (loop Set.empty [uid])
 -- used to instantiate the home unit, and for every unit explicitly passed in
 -- the given list of UnitId.
 preloadUnitsInfo' :: UnitEnv -> [UnitId] -> MaybeErr UnitErr [UnitInfo]
-preloadUnitsInfo' unit_env ids0 = all_infos
+preloadUnitsInfo' unit_env ids0 =
+    trace
+      ("IWKIM: preloadUnitsInfo': " ++
+       "n(ids) = " ++ show (length ids) ++ ", " ++
+       "n(inst_ids) = " ++ show (length inst_ids) ++ ", " ++
+       "n(pkg_map) = " ++ show (ufmLength (getUniqMap pkg_map)) ++ ", " ++
+       "n(preload) = " ++ show (length preload) ++ ", " ++
+       "n(all_infos) = " ++ (case all_infos of {Succeeded xs -> show (length xs); _ -> "0"})
+      )
+      all_infos
   where
     unit_state = ue_units unit_env
     ids      = ids0 ++ inst_ids

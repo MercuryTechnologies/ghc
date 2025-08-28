@@ -28,6 +28,10 @@ import GHC.Utils.TmpFs
 import Control.Monad (when)
 import System.FilePath
 
+import GHC.Driver.Ppr (showPprUnsafe)
+import GHC.Unit.Info (unitPackageNameString)
+import System.IO (hPutStrLn, stderr)
+
 linkDynLib :: Logger -> TmpFs -> DynFlags -> UnitEnv -> [String] -> [UnitId] -> IO ()
 linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
  = do
@@ -49,7 +53,11 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
         verbFlags = getVerbFlags dflags
         o_file = outputFile_ dflags
 
+    hPutStrLn stderr "IWKIM: linkDynLib"
+    -- mapM_ (hPutStrLn stderr) dep_packages
+    hPutStrLn stderr $ "n(dep_packages) = " ++ show (length dep_packages)
     pkgs_with_rts <- mayThrowUnitErr (preloadUnitsInfo' unit_env dep_packages)
+    hPutStrLn stderr $ "n(pkgs_with_rts) = " ++ show (length pkgs_with_rts)
 
     let pkg_lib_paths = collectLibraryDirs (ways dflags) pkgs_with_rts
     let pkg_lib_path_opts = concatMap get_pkg_lib_path_opts pkg_lib_paths
@@ -85,7 +93,7 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
          | OSMinGW32 <- os         = pkgs_with_rts
          | gopt Opt_LinkRts dflags = pkgs_with_rts
          | otherwise               = pkgs_without_rts
-        pkg_link_opts = package_hs_libs ++ extra_libs ++ other_flags
+        (pkg_link_opts, package_hs_libs') = (package_hs_libs ++ extra_libs ++ other_flags, package_hs_libs)
           where
             namever = ghcNameVersion dflags
             ways_   = ways dflags
@@ -173,6 +181,8 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
             instName <- case dylibInstallName dflags of
                 Just n -> return n
                 Nothing -> return $ "@rpath" `combine` (takeFileName output_fn)
+            --mapM_ (hPutStrLn stderr . unitPackageNameString) pkgs
+            -- mapM_ (hPutStrLn stderr) package_hs_libs'            
             runLink logger tmpfs linker_config (
                     map Option verbFlags
                  ++ [ Option "-dynamiclib"

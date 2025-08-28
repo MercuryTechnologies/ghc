@@ -149,6 +149,8 @@ import GHC.Iface.Errors.Types
 import qualified GHC.Data.Word64Set as W
 import GHC.Data.Graph.Directed.Reachability
 
+import System.IO (hPutStrLn, stderr)
+
 -- -----------------------------------------------------------------------------
 -- Loading the program
 
@@ -2844,6 +2846,7 @@ executeLinkNode hug kn uid deps = do
     let hsc_env' = setHUG hug hsc_env
         msg' = (\messager -> \recomp -> messager hsc_env kn recomp (LinkNode deps uid)) <$> env_messager
 
+    liftIO $ hPutStrLn stderr "IWKIM: in executeLinkNode"    
     linkresult <- liftIO $ withAbstractSem compile_sem $ do
                             link (ghcLink dflags)
                                 (hsc_logger hsc_env')

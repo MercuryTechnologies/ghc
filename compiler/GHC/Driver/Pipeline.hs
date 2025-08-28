@@ -122,6 +122,8 @@ import Data.Time        ( getCurrentTime )
 import GHC.Iface.Recomp
 import GHC.Types.Unique.DSet
 
+import System.IO (hPutStrLn, stderr)
+
 -- Simpler type synonym for actions in the pipeline monad
 type P m = TPipelineClass TPhase m
 
@@ -362,7 +364,8 @@ link :: GhcLink                 -- ^ interactive or batch
 -- exports main, i.e., we have good reason to believe that linking
 -- will succeed.
 
-link ghcLink logger tmpfs fc hooks dflags unit_env batch_attempt_linking mHscMessage hpt =
+link ghcLink logger tmpfs fc hooks dflags unit_env batch_attempt_linking mHscMessage hpt = do
+  hPutStrLn stderr "IWKIM: in link"
   case linkHook hooks of
       Nothing -> case ghcLink of
         NoLink        -> return Succeeded

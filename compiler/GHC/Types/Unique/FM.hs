@@ -27,6 +27,7 @@ of arguments of combining function.
 {-# OPTIONS_GHC -Wall #-}
 
 module GHC.Types.Unique.FM (
+        ufmLength,
         -- * Unique-keyed mappings
         UniqFM,           -- abstract type
         NonDetUniqFM(..), -- wrapper for opting into nondeterminism
@@ -111,6 +112,9 @@ newtype UniqFM key ele = UFM (M.Word64Map ele)
   -- Nondeterministic Foldable and Traversable instances are accessible through
   -- use of the 'NonDetUniqFM' wrapper.
   -- See Note [Deterministic UniqFM] in GHC.Types.Unique.DFM to learn about determinism.
+
+ufmLength :: UniqFM key elt -> Int
+ufmLength (UFM m) = length m
 
 emptyUFM :: UniqFM key elt
 emptyUFM = UFM M.empty

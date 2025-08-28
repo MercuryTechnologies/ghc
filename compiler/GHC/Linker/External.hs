@@ -13,6 +13,9 @@ import GHC.Utils.CliOption
 import GHC.SysTools.Process
 import GHC.Linker.Config
 
+import GHC.Driver.Ppr (showPprUnsafe)
+import System.IO (hPutStrLn, stderr)
+
 -- | Run the external linker
 runLink :: Logger -> TmpFs -> LinkerConfig -> [Option] -> IO ()
 runLink logger tmpfs cfg args = traceSystoolCommand logger "linker" $ do
@@ -21,6 +24,9 @@ runLink logger tmpfs cfg args = traceSystoolCommand logger "linker" $ do
   -- on Windows, mangle environment variables to account for a bug in Windows
   -- Vista
   mb_env <- getGccEnv all_args
+
+  hPutStrLn stderr "IWKIM: in runLink"
+  mapM_ (hPutStrLn stderr . showOpt) args
 
   runSomethingResponseFile logger tmpfs (linkerTempDir cfg) (linkerFilter cfg)
     "Linker" (linkerProgram cfg) all_args mb_env
