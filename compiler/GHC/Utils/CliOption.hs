@@ -20,7 +20,7 @@ data Option
                       -- transformed (e.g., "/out=")
               String  -- the filepath/filename portion
  | Option     String
- deriving ( Eq )
+ deriving ( Eq, Show )
 
 showOpt :: Option -> String
 showOpt (FileOption pre f) = pre ++ f
