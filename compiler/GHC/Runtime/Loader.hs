@@ -343,7 +343,8 @@ lookupRdrNameInModuleForPlugins :: HasDebugCallStack
 lookupRdrNameInModuleForPlugins hsc_env mod_name rdr_name = do
     let dflags     = hsc_dflags hsc_env
     -- First find the unit the module resides in by searching exposed units and home modules
-    found_module <- findPluginModule hsc_env mod_name
+    query <- hscUnitIndexQuery hsc_env
+    found_module <- findPluginModule hsc_env query mod_name
     case found_module of
         Found _ mod -> do
             -- Find the exports of the module

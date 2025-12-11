@@ -129,12 +129,13 @@ initMulti unitArgsFiles lintDynFlagsAndSrcs = do
 
   (initial_home_graph, mainUnitId) <- liftIO $ createUnitEnvFromFlags unitDflags
   let home_units = HUG.allUnits initial_home_graph
+      ue_index = hscUnitIndex hsc_env
 
   home_unit_graph <- forM initial_home_graph $ \homeUnitEnv -> do
     let cached_unit_dbs = homeUnitEnv_unit_dbs homeUnitEnv
         hue_flags = homeUnitEnv_dflags homeUnitEnv
         dflags = homeUnitEnv_dflags homeUnitEnv
-    (dbs,unit_state,home_unit,mconstants) <- liftIO $ State.initUnits logger hue_flags cached_unit_dbs home_units
+    (dbs,unit_state,home_unit,mconstants) <- liftIO $ State.initUnits logger hue_flags ue_index cached_unit_dbs home_units
 
     updated_dflags <- liftIO $ updatePlatformConstants dflags mconstants
     emptyHpt <- liftIO $ emptyHomePackageTable

@@ -767,8 +767,10 @@ installInteractiveHomeUnits = do
       S.insert interactiveSessionUnitId $
       hsc_all_home_unit_ids hsc_env
 
-  ghciPromptUnit  <- setupHomeUnitFor logger dflagsPrompt  all_unit_ids cached_unit_dbs
-  ghciSessionUnit <- setupHomeUnitFor logger dflagsSession all_unit_ids cached_unit_dbs
+    ue_index = hscUnitIndex hsc_env
+
+  ghciPromptUnit  <- setupHomeUnitFor logger dflagsPrompt  ue_index all_unit_ids cached_unit_dbs
+  ghciSessionUnit <- setupHomeUnitFor logger dflagsSession ue_index all_unit_ids cached_unit_dbs
   let
     -- Setup up the HUG, install the interactive home units
     withInteractiveUnits =
@@ -790,10 +792,10 @@ installInteractiveHomeUnits = do
 
   pure ()
   where
-    setupHomeUnitFor :: GHC.GhcMonad m => Logger -> DynFlags -> S.Set UnitId -> [UnitDatabase UnitId] -> m HomeUnitEnv
-    setupHomeUnitFor logger dflags all_home_units cached_unit_dbs = do
+    setupHomeUnitFor :: GHC.GhcMonad m => Logger -> DynFlags -> UnitIndex -> S.Set UnitId -> [UnitDatabase UnitId] -> m HomeUnitEnv
+    setupHomeUnitFor logger dflags ue_index all_home_units cached_unit_dbs = do
       (dbs,unit_state,home_unit,_mconstants) <-
-        liftIO $ initUnits logger dflags (Just cached_unit_dbs) all_home_units
+        liftIO $ initUnits logger dflags ue_index (Just cached_unit_dbs) all_home_units
       hpt <- liftIO emptyHomePackageTable
       pure (HUG.mkHomeUnitEnv unit_state (Just dbs) dflags hpt (Just home_unit))
 
@@ -4075,19 +4077,21 @@ completeBreakpoint = wrapCompleter spaces $ \w -> do          -- #3000
 
 completeModule = wrapIdentCompleterMod $ \w -> do
   hsc_env <- GHC.getSession
-  let pkg_mods = allVisibleModules (hsc_units hsc_env)
+  query <- liftIO $ hscUnitIndexQuery hsc_env
+  let pkg_mods = allVisibleModules (hsc_units hsc_env) query
   loaded_mods <- liftM (map GHC.moduleNodeInfoModuleName) getLoadedModules
   return $ filter (w `isPrefixOf`)
         $ map (showPpr (hsc_dflags hsc_env)) $ loaded_mods ++ pkg_mods
 
 completeSetModule = wrapIdentCompleterWithModifier "+-" $ \m w -> do
   hsc_env <- GHC.getSession
+  query <- liftIO $ hscUnitIndexQuery hsc_env
   modules <- case m of
     Just '-' -> do
       imports <- GHC.getContext
       return $ map iiModuleName imports
     _ -> do
-      let pkg_mods = allVisibleModules (hsc_units hsc_env)
+      let pkg_mods = allVisibleModules (hsc_units hsc_env) query
       loaded_mods <- liftM (map GHC.moduleNodeInfoModuleName) getLoadedModules
       return $ loaded_mods ++ pkg_mods
   return $ filter (w `isPrefixOf`) $ map (showPpr (hsc_dflags hsc_env)) modules
@@ -4155,8 +4159,8 @@ wrapIdentCompleterWithModifier modifChars fun = completeWordWithPrev Nothing wor
 
 -- | Return a list of visible module names for autocompletion.
 -- (NB: exposed != visible)
-allVisibleModules :: UnitState -> [ModuleName]
-allVisibleModules unit_state = listVisibleModuleNames unit_state
+allVisibleModules :: UnitState -> UnitIndexQuery -> [ModuleName]
+allVisibleModules us query = listVisibleModuleNames us query
 
 completeExpression = completeQuotedWord (Just '\\') "\"" listFiles
                         completeIdentifier
@@ -4970,4 +4974,3 @@ clearCaches = discardActiveBreakPoints
               >> discardInterfaceCache
               >> disableUnusedPackages
               >> clearHPTs
-

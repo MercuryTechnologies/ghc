@@ -256,6 +256,7 @@ downsweepThunk hsc_env mod_summary = unsafeInterleaveIO $ do
 downsweepInteractiveImports :: HscEnv -> InteractiveContext -> IO ModuleGraph
 downsweepInteractiveImports hsc_env ic = unsafeInterleaveIO $ do
   debugTraceMsg (hsc_logger hsc_env) 3 $ (text "Computing Interactive Module Graph thunk...")
+  query <- hscUnitIndexQuery hsc_env
   let imps = ic_imports (hsc_IC hsc_env)
 
   let interactive_mn = icInteractiveModule ic
@@ -269,7 +270,7 @@ downsweepInteractiveImports hsc_env ic = unsafeInterleaveIO $ do
   -- :load. Any home package modules need to already be in here.
   let cached_nodes = Map.fromList [ (mkNodeKey n, n) | n <- mg_mss (hsc_mod_graph hsc_env) ]
 
-  (module_edges, graph) <- loopFromInteractive hsc_env (map mkEdge imps) cached_nodes
+  (module_edges, graph) <- loopFromInteractive hsc_env (map (mkEdge query) imps) cached_nodes
   let interactive_node = ModuleNode module_edges node_type
 
   let all_nodes  = M.elems graph
@@ -277,9 +278,9 @@ downsweepInteractiveImports hsc_env ic = unsafeInterleaveIO $ do
 
   where
  --
-    mkEdge :: InteractiveImport -> Either ModuleNodeEdge (UnitId, ImportLevel, PkgQual, GenWithIsBoot (Located ModuleName))
+    mkEdge :: UnitIndexQuery -> InteractiveImport -> Either ModuleNodeEdge (UnitId, ImportLevel, PkgQual, GenWithIsBoot (Located ModuleName))
     -- A simple edge to a module from the same home unit
-    mkEdge (IIModule n) =
+    mkEdge _ (IIModule n) =
       let
         mod_node_key = ModNodeKeyWithUid
           { mnkModuleName = GWIB (moduleName n) NotBoot
@@ -292,11 +293,11 @@ downsweepInteractiveImports hsc_env ic = unsafeInterleaveIO $ do
           ModuleNodeEdge NormalLevel (NodeKey_Module mod_node_key)
       in Left mod_node_edge
     -- A complete import statement
-    mkEdge (IIDecl i) =
+    mkEdge query (IIDecl i) =
       let lvl = convImportLevel (ideclLevelSpec i)
           wanted_mod = unLoc (ideclName i)
           is_boot = ideclSource i
-          mb_pkg = renameRawPkgQual (hsc_unit_env hsc_env) (unLoc $ ideclName i) (ideclPkgQual i)
+          mb_pkg = renameRawPkgQual (hsc_unit_env hsc_env) query (unLoc $ ideclName i) (ideclPkgQual i)
           unitId = homeUnitId $ hsc_home_unit hsc_env
       in Right (unitId, lvl, mb_pkg, GWIB (noLoc wanted_mod) is_boot)
 
@@ -1546,7 +1547,8 @@ getPreprocessedImports hsc_env src_fn mb_phase maybe_buf = do
           mimps <- getImports popts imp_prelude pi_hspp_buf pi_hspp_fn src_fn
           let mopts = map unLoc $ snd $ getOptions popts (supportedLanguagePragmas pi_local_dflags) pi_hspp_buf src_fn
           pure $ ((, mopts) <$>) $ first (mkMessages . fmap mkDriverPsHeaderMessage . getMessages) mimps
-  let rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env)
+  query <- liftIO $ hscUnitIndexQuery hsc_env
+  let rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env) query
   let rn_imps = fmap (\(sp, pk, lmn@(L _ mn)) -> (sp, rn_pkg_qual mn pk, lmn))
   let pi_srcimps = pi_srcimps'
   let pi_theimps = rn_imps pi_theimps'

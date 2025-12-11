@@ -635,11 +635,12 @@ checkMergedSignatures hsc_env mod_summary self_recomp = do
 checkDependencies :: HscEnv -> ModSummary -> ModIface -> IfG RecompileRequired
 checkDependencies hsc_env summary iface
  = do
+    query <- liftIO $ hscUnitIndexQuery hsc_env
     res_normal <- classify_import (findImportedModule hsc_env)
                                   ([(st, p, m) | (st, p, m) <- (ms_textual_imps summary)]
                                   ++
                                   [(NormalLevel, NoPkgQual, m) | m <- ms_srcimps summary ])
-    res_plugin <- classify_import (\mod _ -> findPluginModule hsc_env mod)
+    res_plugin <- classify_import (\mod _ -> findPluginModule hsc_env query mod)
                     [(st, p, m) | (st, p, m) <- (ms_plugin_imps summary) ]
     case sequence (res_normal ++ res_plugin) of
       Left recomp -> return $ NeedsRecompile recomp
