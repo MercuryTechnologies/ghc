@@ -413,7 +413,7 @@ filterTyLit f (TLM { tlm_number = tn, tlm_string = ts, tlm_char = tc })
 
 mpTyLit :: (a -> Maybe b) -> TyLitMap a -> TyLitMap b
 mpTyLit f (TLM { tlm_number = tn, tlm_string = ts, tlm_char = tc })
-  = TLM { tlm_number = Map.mapMaybe f tn, tlm_string = mapMaybeUFM f ts, tlm_char = Map.mapMaybe f tc }
+  = TLM { tlm_number = Map.mapMaybe f tn, tlm_string = mapMaybeUDFM f ts, tlm_char = Map.mapMaybe f tc }
 
 -------------------------------------------------
 -- | @TypeMap a@ is a map from 'Type' to @a@.  If you are a client, this
