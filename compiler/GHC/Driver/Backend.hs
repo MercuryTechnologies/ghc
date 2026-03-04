@@ -705,7 +705,7 @@ backendSupportsHpc (Named NCG)         = True
 backendSupportsHpc (Named LLVM)        = True
 backendSupportsHpc (Named ViaC)        = True
 backendSupportsHpc (Named JavaScript)  = False
-backendSupportsHpc (Named Interpreter) = False
+backendSupportsHpc (Named Interpreter) = True
 backendSupportsHpc (Named NoBackend)   = True
 
 -- | This flag says whether the back end supports foreign

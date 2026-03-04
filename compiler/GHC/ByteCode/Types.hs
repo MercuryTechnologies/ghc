@@ -21,6 +21,7 @@ module GHC.ByteCode.Types
   , CgBreakInfo(..)
   , ModBreaks (..), BreakIndex, emptyModBreaks
   , CCostCentre
+  , HpcTickInfo(..)
   , FlatBag, sizeFlatBag, fromSizedSeq, elemsFlatBag
   ) where
 
@@ -49,6 +50,7 @@ import qualified GHC.Exts.Heap as Heap
 import GHC.Stack.CCS
 import GHC.Cmm.Expr ( GlobalRegSet, emptyRegSet, regSetToList )
 import GHC.Iface.Syntax
+import GHC.Unit.Module (Module)
 import Language.Haskell.Syntax.Module.Name (ModuleName)
 
 -- -----------------------------------------------------------------------------
@@ -74,7 +76,22 @@ data CompiledByteCode = CompiledByteCode
     -- ^ Static pointer table entries which should be loaded along with the
     -- BCOs. See Note [Grand plan for static forms] in
     -- "GHC.Iface.Tidy.StaticPtrTable".
+
+  , bc_hpc_info :: !(Maybe HpcTickInfo)
+    -- ^ HPC tick information for this module, if compiled with -fhpc.
+    -- Used by the loader to allocate and register HPC tick arrays.
   }
+
+-- | HPC tick information for a bytecode module
+data HpcTickInfo = HpcTickInfo
+  { hpcTickInfoModule    :: !Module
+  , hpcTickInfoTickCount :: !Int
+  , hpcTickInfoHash      :: !Int
+  }
+
+instance NFData HpcTickInfo where
+  rnf (HpcTickInfo m c h) = m `seq` rnf c `seq` rnf h
+
                 -- ToDo: we're not tracking strings that we malloc'd
 newtype FFIInfo = FFIInfo (RemotePtr C_ffi_cif)
   deriving (Show, NFData)
@@ -90,6 +107,7 @@ seqCompiledByteCode CompiledByteCode{..} =
   seqEltsNameEnv rnf bc_itbls `seq`
   rnf bc_ffis `seq`
   seqEltsNameEnv rnf bc_strs `seq`
+  rnf bc_hpc_info `seq`
   rnf (fmap seqModBreaks bc_breaks)
 
 newtype ByteOff = ByteOff Int
@@ -187,6 +205,8 @@ data BCOPtr
   | BCOPtrBCO    !UnlinkedBCO
   | BCOPtrBreakArray (ForeignRef BreakArray)
     -- ^ a pointer to a breakpoint's module's BreakArray in GHCi's memory
+  | BCOPtrHpcTickArray !Module
+    -- ^ Converted to the HPC tick array pointer at link-time
 
 instance NFData BCOPtr where
   rnf (BCOPtrBCO bco) = rnf bco

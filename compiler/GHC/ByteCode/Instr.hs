@@ -20,6 +20,7 @@ import GHC.StgToCmm.Layout     ( ArgRep(..) )
 import GHC.Utils.Outputable
 import GHC.Types.Name
 import GHC.Types.Literal
+import GHC.Unit.Module
 import GHC.Core.DataCon
 import GHC.Builtin.PrimOps
 import GHC.Runtime.Heap.Layout ( StgWord )
@@ -209,6 +210,9 @@ data BCInstr
    | BRK_FUN          (ForeignRef BreakArray) !Word16 (RemotePtr ModuleName)
                       (RemotePtr CostCentre)
 
+   -- HPC ticks
+   | BCI_HPC_TICK     !Module !Int  -- module, tick index
+
 -- -----------------------------------------------------------------------------
 -- Printing bytecode instructions
 
@@ -360,6 +364,7 @@ instance Outputable BCInstr where
    ppr (RETURN_TUPLE)        = text "RETURN_TUPLE"
    ppr (BRK_FUN _ index _ _) = text "BRK_FUN" <+> text "<breakarray>"
                                <+> ppr index <+> text "<module>" <+> text "<cc>"
+   ppr (BCI_HPC_TICK mod ix) = text "BCI_HPC_TICK" <+> ppr mod <+> ppr ix
 
 
 
@@ -457,6 +462,7 @@ bciStackUse CCALL{}               = 0
 bciStackUse PRIMCALL{}            = 1 -- pushes stg_primcall
 bciStackUse SWIZZLE{}             = 0
 bciStackUse BRK_FUN{}             = 0
+bciStackUse BCI_HPC_TICK{}        = 0
 
 -- These insns actually reduce stack use, but we need the high-tide level,
 -- so can't use this info.  Not that it matters much.

@@ -96,9 +96,10 @@ assembleBCOs
   -> [TyCon]
   -> AddrEnv
   -> Maybe ModBreaks
+  -> Maybe HpcTickInfo
   -> [SptEntry]
   -> IO CompiledByteCode
-assembleBCOs interp profile proto_bcos tycons top_strs modbreaks spt_entries = do
+assembleBCOs interp profile proto_bcos tycons top_strs modbreaks hpc_info spt_entries = do
   -- TODO: the profile should be bundled with the interpreter: the rts ways are
   -- fixed for an interpreter
   itblenv <- mkITbls interp profile tycons
@@ -110,6 +111,7 @@ assembleBCOs interp profile proto_bcos tycons top_strs modbreaks spt_entries = d
     , bc_ffis = concatMap protoBCOFFIs proto_bcos
     , bc_strs = top_strs
     , bc_breaks = modbreaks
+    , bc_hpc_info = hpc_info
     , bc_spt_entries = spt_entries
     }
 
@@ -522,6 +524,9 @@ assembleI platform i = case i of
                                  np <- addr cc
                                  emit bci_BRK_FUN [Op p1, SmallOp index,
                                                    Op m, Op np]
+  BCI_HPC_TICK tick_mod tick_ix -> do
+                                 p1 <- ptr (BCOPtrHpcTickArray tick_mod)
+                                 emit bci_HPC_TICK [Op p1, wOp (fromIntegral tick_ix)]
 
   where
     literal (LitLabel fs (Just sz) _)

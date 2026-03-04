@@ -46,8 +46,10 @@ import Language.Haskell.Syntax.Module.Name
 
 -- Standard libraries
 import Data.Array.Unboxed
+import Data.Word (Word64)
 import Foreign.Ptr
 import GHC.Exts
+import GHC.Unit.Module.Env (ModuleEnv, lookupModuleEnv)
 
 {-
   Linking interpretables into something we can run
@@ -57,15 +59,16 @@ linkBCO
   :: Interp
   -> PkgsLoaded
   -> LinkerEnv
+  -> ModuleEnv (Ptr Word64)  -- ^ HPC tick arrays
   -> NameEnv Int
   -> UnlinkedBCO
   -> IO ResolvedBCO
-linkBCO interp pkgs_loaded le bco_ix
+linkBCO interp pkgs_loaded le hpc_tickarrays bco_ix
            (UnlinkedBCO _ arity insns bitmap lits0 ptrs0) = do
   -- fromIntegral Word -> Word64 should be a no op if Word is Word64
   -- otherwise it will result in a cast to longlong on 32bit systems.
   (lits :: [Word]) <- mapM (fmap fromIntegral . lookupLiteral interp pkgs_loaded le) (elemsFlatBag lits0)
-  ptrs <- mapM (resolvePtr interp pkgs_loaded le bco_ix) (elemsFlatBag ptrs0)
+  ptrs <- mapM (resolvePtr interp pkgs_loaded le hpc_tickarrays bco_ix) (elemsFlatBag ptrs0)
   let lits' = listArray (0 :: Int, fromIntegral (sizeFlatBag lits0)-1) lits
   return (ResolvedBCO isLittleEndian arity
               insns
@@ -142,10 +145,11 @@ resolvePtr
   :: Interp
   -> PkgsLoaded
   -> LinkerEnv
+  -> ModuleEnv (Ptr Word64)  -- ^ HPC tick arrays
   -> NameEnv Int
   -> BCOPtr
   -> IO ResolvedBCOPtr
-resolvePtr interp pkgs_loaded le bco_ix ptr = case ptr of
+resolvePtr interp pkgs_loaded le hpc_tickarrays bco_ix ptr = case ptr of
   BCOPtrName nm
     | Just ix <- lookupNameEnv bco_ix nm
     -> return (ResolvedBCORef ix) -- ref to another BCO in this group
@@ -166,10 +170,15 @@ resolvePtr interp pkgs_loaded le bco_ix ptr = case ptr of
     -> ResolvedBCOStaticPtr <$> lookupPrimOp interp pkgs_loaded op
 
   BCOPtrBCO bco
-    -> ResolvedBCOPtrBCO <$> linkBCO interp pkgs_loaded le bco_ix bco
+    -> ResolvedBCOPtrBCO <$> linkBCO interp pkgs_loaded le hpc_tickarrays bco_ix bco
 
   BCOPtrBreakArray breakarray
     -> withForeignRef breakarray $ \ba -> return (ResolvedBCOPtrBreakArray ba)
+
+  BCOPtrHpcTickArray hpc_mod
+    -> case lookupModuleEnv hpc_tickarrays hpc_mod of
+         Just ptr -> return (ResolvedBCOStaticPtr (toRemotePtr (castPtr ptr)))
+         Nothing  -> pprPanic "GHC.ByteCode.Linker: no HPC tick array for module" (ppr hpc_mod)
 
 -- | Look up the address of a Haskell symbol in the currently
 -- loaded units.

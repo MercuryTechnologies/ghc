@@ -157,6 +157,7 @@ import GHC.Hs.Stats         ( ppSourceStats )
 import GHC.HsToCore
 
 import GHC.StgToByteCode    ( byteCodeGen )
+import GHC.Types.HpcInfo
 import GHC.StgToJS          ( stgToJS )
 import GHC.StgToJS.Ids
 import GHC.StgToJS.Types
@@ -1132,7 +1133,7 @@ compileWholeCoreBindings hsc_env type_env wcb = do
     gen_bytecode core_binds stubs foreign_files = do
       let cgi_guts = CgInteractiveGuts wcb_module core_binds
                       (typeEnvTyCons type_env) stubs foreign_files
-                      Nothing []
+                      emptyHpcInfo Nothing []
       trace_if logger (text "Generating ByteCode for" <+> ppr wcb_module)
       generateByteCode hsc_env cgi_guts wcb_mod_location
 
@@ -2106,13 +2107,14 @@ data CgInteractiveGuts = CgInteractiveGuts { cgi_module :: Module
                                            , cgi_tycons :: [TyCon]
                                            , cgi_foreign :: ForeignStubs
                                            , cgi_foreign_files :: [(ForeignSrcLang, FilePath)]
+                                           , cgi_hpc_info :: HpcInfo
                                            , cgi_modBreaks ::  Maybe ModBreaks
                                            , cgi_spt_entries :: [SptEntry]
                                            }
 
 mkCgInteractiveGuts :: CgGuts -> CgInteractiveGuts
-mkCgInteractiveGuts CgGuts{cg_module, cg_binds, cg_tycons, cg_foreign, cg_foreign_files, cg_modBreaks, cg_spt_entries}
-  = CgInteractiveGuts cg_module cg_binds cg_tycons cg_foreign cg_foreign_files cg_modBreaks cg_spt_entries
+mkCgInteractiveGuts CgGuts{cg_module, cg_binds, cg_tycons, cg_foreign, cg_foreign_files, cg_hpc_info, cg_modBreaks, cg_spt_entries}
+  = CgInteractiveGuts cg_module cg_binds cg_tycons cg_foreign cg_foreign_files cg_hpc_info cg_modBreaks cg_spt_entries
 
 hscInteractive :: HscEnv
                -> CgInteractiveGuts
@@ -2128,6 +2130,7 @@ hscInteractive hsc_env cgguts location = do
                cgi_binds    = core_binds,
                cgi_tycons   = tycons,
                cgi_foreign  = foreign_stubs,
+               cgi_hpc_info = hpc_info,
                cgi_modBreaks = mod_breaks,
                cgi_spt_entries = spt_entries } = cgguts
 
@@ -2155,7 +2158,7 @@ hscInteractive hsc_env cgguts location = do
     let (stg_binds,_stg_deps) = unzip stg_binds_with_deps
 
     -----------------  Generate byte code ------------------
-    comp_bc <- byteCodeGen hsc_env this_mod stg_binds data_tycons mod_breaks spt_entries
+    comp_bc <- byteCodeGen hsc_env this_mod stg_binds data_tycons hpc_info mod_breaks spt_entries
 
     ------------------ Create f-x-dynamic C-side stuff -----
     (_istub_h_exists, istub_c_exists)
@@ -2800,6 +2803,7 @@ hscCompileCoreExpr' hsc_env srcspan ds_expr = do
                 this_mod
                 stg_binds
                 []
+                emptyHpcInfo
                 Nothing -- modbreaks
                 [] -- spt entries
 
