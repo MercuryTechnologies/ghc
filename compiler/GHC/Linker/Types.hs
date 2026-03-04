@@ -69,6 +69,8 @@ import GHC.Unit.Module.WholeCoreBindings
 import Data.Maybe (mapMaybe)
 import Data.List.NonEmpty (NonEmpty, nonEmpty)
 import qualified Data.List.NonEmpty as NE
+import Data.Word (Word64)
+import Foreign.Ptr (Ptr)
 
 
 {- **********************************************************************
@@ -152,6 +154,9 @@ data LoaderState = LoaderState
     , pkgs_loaded :: !PkgsLoaded
         -- ^ The currently-loaded packages; always object code
         -- haskell libraries, system libraries, transitive dependencies
+
+    , hpc_tickarrays :: !(ModuleEnv (Ptr Word64))
+        -- ^ HPC tick arrays for bytecode modules, keyed by module
 
     , temp_sos :: ![(FilePath, String)]
         -- ^ We need to remember the name of previous temporary DLL/.so

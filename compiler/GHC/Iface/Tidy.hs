@@ -401,6 +401,7 @@ tidyProgram opts (ModGuts { mg_module           = mod
                           , mg_deps             = deps
                           , mg_foreign          = foreign_stubs
                           , mg_foreign_files    = foreign_files
+                          , mg_hpc_info         = hpc_info
                           , mg_modBreaks        = modBreaks
                           , mg_boot_exports     = boot_exports
                           }) = do
@@ -473,6 +474,7 @@ tidyProgram opts (ModGuts { mg_module           = mod
                  , cg_foreign       = all_foreign_stubs
                  , cg_foreign_files = foreign_files
                  , cg_dep_pkgs      = dep_direct_pkgs deps
+                 , cg_hpc_info      = hpc_info
                  , cg_modBreaks     = modBreaks
                  , cg_spt_entries   = spt_entries
                  }

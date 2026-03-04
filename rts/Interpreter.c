@@ -2019,6 +2019,14 @@ run_BCO:
             goto nextInsn;
         }
 
+        case bci_HPC_TICK: {
+            W_ arg_tickarray = BCO_GET_LARGE_ARG;
+            W_ tick_index    = BCO_GET_LARGE_ARG;
+            StgWord64 *tixArr = (StgWord64*) BCO_PTR(arg_tickarray);
+            tixArr[tick_index]++;
+            goto nextInsn;
+        }
+
         case bci_PRIMCALL: {
             Sp_subW(1);
             SpW(0) = (W_)&stg_primcall_info;

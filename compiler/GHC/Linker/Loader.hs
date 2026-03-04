@@ -116,6 +116,12 @@ import System.Win32.Info (getSystemDirectory)
 
 import GHC.Utils.Exception
 import GHC.Unit.Home.Graph (lookupHug, unitEnv_foldWithKey)
+import Foreign.Ptr (Ptr)
+import Foreign.Marshal.Array (mallocArray)
+import Foreign.Marshal.Utils (fillBytes)
+import Foreign.Storable (sizeOf)
+import Foreign.C.String (CString, withCString)
+import Data.Word (Word32, Word64)
 
 -- Note [Linkers and loaders]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -173,6 +179,7 @@ emptyLoaderState = LoaderState
    , pkgs_loaded = init_pkgs
    , bcos_loaded = emptyModuleEnv
    , objs_loaded = emptyModuleEnv
+   , hpc_tickarrays = emptyModuleEnv
    , temp_sos = []
    }
   -- Packages that don't need loading, because the compiler
@@ -622,7 +629,7 @@ loadExpr interp hsc_env span root_ul_bco = do
         -- Load the necessary packages and linkables
         let le = linker_env pls
             bco_ix = mkNameEnv [(unlinkedBCOName root_ul_bco, 0)]
-        resolved <- linkBCO interp (pkgs_loaded pls) le bco_ix root_ul_bco
+        resolved <- linkBCO interp (pkgs_loaded pls) le (hpc_tickarrays pls) bco_ix root_ul_bco
         [root_hvref] <- createBCOs interp [resolved]
         fhv <- mkFinalizedHValue interp root_hvref
         return (pls, fhv)
@@ -713,7 +720,7 @@ loadDecls interp hsc_env span linkable = do
                        , addr_env = foldl' (\acc cbc -> plusNameEnv acc (bc_strs cbc)) (addr_env le) cbcs }
 
           -- Link the necessary packages and linkables
-          new_bindings <- linkSomeBCOs interp (pkgs_loaded pls) le2 cbcs
+          new_bindings <- linkSomeBCOs interp (pkgs_loaded pls) le2 (hpc_tickarrays pls) cbcs
           nms_fhvs <- makeForeignNamedHValueRefs interp new_bindings
           let ce2  = extendClosureEnv (closure_env le2) nms_fhvs
               !pls2 = pls { linker_env = le2 { closure_env = ce2 } }
@@ -932,7 +939,10 @@ dynLinkBCOs interp pls bcos = do
             ae2 = foldr plusNameEnv (addr_env le1) (map bc_strs cbcs)
             le2 = le1 { itbl_env = ie2, addr_env = ae2 }
 
-        names_and_refs <- linkSomeBCOs interp (pkgs_loaded pls) le2 cbcs
+        -- Allocate HPC tick arrays for modules compiled with -fhpc
+        he2 <- allocateHpcTickArrays (hpc_tickarrays pls1) (mapMaybe bc_hpc_info cbcs)
+
+        names_and_refs <- linkSomeBCOs interp (pkgs_loaded pls) le2 he2 cbcs
 
         -- We only want to add the external ones to the ClosureEnv
         let (to_add, to_drop) = partition (isExternalName.fst) names_and_refs
@@ -943,19 +953,21 @@ dynLinkBCOs interp pls bcos = do
         new_binds <- makeForeignNamedHValueRefs interp to_add
 
         let ce2 = extendClosureEnv (closure_env le2) new_binds
-        return $! pls1 { linker_env = le2 { closure_env = ce2 } }
+        return $! pls1 { linker_env = le2 { closure_env = ce2 }
+                       , hpc_tickarrays = he2 }
 
 -- Link a bunch of BCOs and return references to their values
 linkSomeBCOs :: Interp
              -> PkgsLoaded
              -> LinkerEnv
+             -> ModuleEnv (Ptr Word64)  -- ^ HPC tick arrays
              -> [CompiledByteCode]
              -> IO [(Name,HValueRef)]
                         -- The returned HValueRefs are associated 1-1 with
                         -- the incoming unlinked BCOs.  Each gives the
                         -- value of the corresponding unlinked BCO
 
-linkSomeBCOs interp pkgs_loaded le mods = foldr fun do_link mods []
+linkSomeBCOs interp pkgs_loaded le hpc_tickarrays mods = foldr fun do_link mods []
  where
   fun CompiledByteCode{..} inner accum =
     inner (Foldable.toList bc_bcos : accum)
@@ -965,7 +977,7 @@ linkSomeBCOs interp pkgs_loaded le mods = foldr fun do_link mods []
     let flat = [ bco | bcos <- mods, bco <- bcos ]
         names = map unlinkedBCOName flat
         bco_ix = mkNameEnv (zip names [0..])
-    resolved <- sequence [ linkBCO interp pkgs_loaded le bco_ix bco | bco <- flat ]
+    resolved <- sequence [ linkBCO interp pkgs_loaded le hpc_tickarrays bco_ix bco | bco <- flat ]
     hvrefs <- createBCOs interp resolved
     return (zip names hvrefs)
 
@@ -1632,3 +1644,26 @@ maybePutStr logger s = maybePutSDoc logger (text s)
 
 maybePutStrLn :: Logger -> String -> IO ()
 maybePutStrLn logger s = maybePutSDoc logger (text s <> text "\n")
+
+-- | Allocate and register HPC tick arrays for bytecode modules compiled with -fhpc.
+allocateHpcTickArrays ::
+  ModuleEnv (Ptr Word64) ->
+  [HpcTickInfo] ->
+  IO (ModuleEnv (Ptr Word64))
+allocateHpcTickArrays =
+  foldM $ \env (HpcTickInfo hpc_mod tick_count hash_no) -> do
+    if not $ elemModuleEnv hpc_mod env then do
+      tick_arr <- mallocArray tick_count
+      fillBytes tick_arr 0 (tick_count * sizeOf (0 :: Word64))
+      let mod_name = moduleNameString (moduleName hpc_mod)
+      withCString mod_name $ \c_mod_name ->
+        c_hs_hpc_module c_mod_name
+          (fromIntegral tick_count)
+          (fromIntegral hash_no)
+          tick_arr
+      evaluate $ extendModuleEnv env hpc_mod tick_arr
+    else
+      return env
+
+foreign import ccall "hs_hpc_module"
+  c_hs_hpc_module :: CString -> Word32 -> Word32 -> Ptr Word64 -> IO ()
