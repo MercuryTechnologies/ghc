@@ -120,7 +120,7 @@ import Foreign.Ptr (Ptr)
 import Foreign.Marshal.Array (mallocArray)
 import Foreign.Marshal.Utils (fillBytes)
 import Foreign.Storable (sizeOf)
-import Foreign.C.String (CString, withCString)
+import Foreign.C.String (CString, newCString)
 import Data.Word (Word32, Word64)
 
 -- Note [Linkers and loaders]
@@ -719,11 +719,15 @@ loadDecls interp hsc_env span linkable = do
               le2 = le { itbl_env = foldl' (\acc cbc -> plusNameEnv acc (bc_itbls cbc)) (itbl_env le) cbcs
                        , addr_env = foldl' (\acc cbc -> plusNameEnv acc (bc_strs cbc)) (addr_env le) cbcs }
 
+          -- Allocate HPC tick arrays for modules compiled with -fhpc
+          he2 <- allocateHpcTickArrays (hpc_tickarrays pls) (mapMaybe bc_hpc_info cbcs)
+
           -- Link the necessary packages and linkables
-          new_bindings <- linkSomeBCOs interp (pkgs_loaded pls) le2 (hpc_tickarrays pls) cbcs
+          new_bindings <- linkSomeBCOs interp (pkgs_loaded pls) le2 he2 cbcs
           nms_fhvs <- makeForeignNamedHValueRefs interp new_bindings
           let ce2  = extendClosureEnv (closure_env le2) nms_fhvs
-              !pls2 = pls { linker_env = le2 { closure_env = ce2 } }
+              !pls2 = pls { linker_env = le2 { closure_env = ce2 }
+                          , hpc_tickarrays = he2 }
           return (pls2, (nms_fhvs, links_needed, units_needed))
   where
     cbcs = linkableBCOs linkable
@@ -1656,11 +1660,14 @@ allocateHpcTickArrays =
       tick_arr <- mallocArray tick_count
       fillBytes tick_arr 0 (tick_count * sizeOf (0 :: Word64))
       let mod_name = moduleNameString (moduleName hpc_mod)
-      withCString mod_name $ \c_mod_name ->
-        c_hs_hpc_module c_mod_name
-          (fromIntegral tick_count)
-          (fromIntegral hash_no)
-          tick_arr
+      -- Use newCString (not withCString) because hs_hpc_module stores
+      -- the pointer without copying the string (see rts/Hpc.c).
+      -- In native code, this is a string literal with static lifetime.
+      c_mod_name <- newCString mod_name
+      c_hs_hpc_module c_mod_name
+        (fromIntegral tick_count)
+        (fromIntegral hash_no)
+        tick_arr
       evaluate $ extendModuleEnv env hpc_mod tick_arr
     else
       return env
