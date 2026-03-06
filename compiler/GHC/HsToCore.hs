@@ -192,7 +192,12 @@ deSugar hsc_env
                           ; (ds_fords, foreign_prs) <- dsForeigns fords
                           ; ds_rules <- mapMaybeM dsRule rules
                           ; let hpc_init
-                                  | gopt Opt_Hpc dflags = hpcInitCode (targetPlatform $ hsc_dflags hsc_env) mod ds_hpc_info
+                                  -- Don't generate the HPC C stub for the bytecode
+                                  -- backend; it registers tick arrays itself via
+                                  -- allocateHpcTickArrays in the loader.
+                                  | gopt Opt_Hpc dflags
+                                  , backendWritesFiles bcknd
+                                  = hpcInitCode (targetPlatform $ hsc_dflags hsc_env) mod ds_hpc_info
                                   | otherwise = mempty
                           ; return ( ds_ev_binds
                                    , foreign_prs `appOL` core_prs `appOL` spec_prs
