@@ -37,7 +37,7 @@ import GHC.HsToCore.Binds
 import GHC.HsToCore.Foreign.Decl
 import GHC.HsToCore.Ticks
 import GHC.HsToCore.Breakpoints
-import GHC.HsToCore.Coverage
+import GHC.HsToCore.Coverage (writeMixEntries)
 import GHC.HsToCore.Docs
 
 import GHC.Tc.Types
@@ -191,18 +191,13 @@ deSugar hsc_env
                           ; (spec_prs, spec_rules) <- dsImpSpecs imp_specs
                           ; (ds_fords, foreign_prs) <- dsForeigns fords
                           ; ds_rules <- mapMaybeM dsRule rules
-                          ; let hpc_init
-                                  -- Don't generate the HPC C stub for the bytecode
-                                  -- backend; it registers tick arrays itself via
-                                  -- allocateHpcTickArrays in the loader.
-                                  | gopt Opt_Hpc dflags
-                                  , backendWritesFiles bcknd
-                                  = hpcInitCode (targetPlatform $ hsc_dflags hsc_env) mod ds_hpc_info
-                                  | otherwise = mempty
+                          -- HPC init code is now generated as Cmm in
+                          -- GHC.StgToCmm.Hpc.initHpc.
+                          -- See Note [HPC init via Cmm] in GHC.StgToCmm.Hpc.
                           ; return ( ds_ev_binds
                                    , foreign_prs `appOL` core_prs `appOL` spec_prs
                                    , spec_rules ++ ds_rules
-                                   , ds_fords `appendStubC` hpc_init) } }
+                                   , ds_fords) } }
 
         ; case mb_res of {
            Nothing -> return (msgs, Nothing) ;

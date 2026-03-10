@@ -16,6 +16,7 @@ import GHC.Prelude as Prelude
 
 import GHC.Cmm.UniqueRenamer
 import GHC.StgToCmm.Prof (initCostCentres, ldvEnter)
+import GHC.StgToCmm.Hpc (initHpc)
 import GHC.StgToCmm.Monad
 import GHC.StgToCmm.Env
 import GHC.StgToCmm.Bind
@@ -279,6 +280,7 @@ mkModuleInit
 
 mkModuleInit cost_centre_info
   = do  { initCostCentres cost_centre_info
+        ; initHpc
         }
 
 

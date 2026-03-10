@@ -30,5 +30,9 @@ void hs_hpc_module (char *modName,
 
 HpcModuleInfo * hs_hpc_rootModule (void);
 
+// Trivial return function used as tail-call target from Cmm-generated
+// HPC module initializers.  See Note [HPC init via Cmm] in GHC.StgToCmm.Hpc.
+void hs_hpc_return (void);
+
 void startupHpc(void);
 void exitHpc(void);

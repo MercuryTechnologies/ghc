@@ -317,6 +317,16 @@ hs_hpc_module(char *modName,
   }
 }
 
+// Trivial function used as a tail-call target from Cmm-generated
+// HPC module initializers.  When the NCG generates a CmmCall to this
+// label, it emits a JMP instruction.  Since this function is a normal
+// C function, its RET returns to the original caller (the dynamic
+// linker / .init_array machinery).
+void
+hs_hpc_return(void)
+{
+}
+
 static void
 writeTix(FILE *f) {
   HpcModuleInfo *tmpModule;

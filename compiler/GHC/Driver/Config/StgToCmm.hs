@@ -17,9 +17,10 @@ import GHC.Platform.Profile
 import GHC.Utils.Error
 import GHC.Unit.Module
 import GHC.Utils.Outputable
+import GHC.Types.HpcInfo
 
-initStgToCmmConfig :: DynFlags -> Module -> StgToCmmConfig
-initStgToCmmConfig dflags mod = StgToCmmConfig
+initStgToCmmConfig :: DynFlags -> Module -> HpcInfo -> StgToCmmConfig
+initStgToCmmConfig dflags mod hpc_info = StgToCmmConfig
   -- settings
   { stgToCmmProfile       = profile
   , stgToCmmThisModule    = mod
@@ -83,6 +84,7 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
   , stgToCmmAvx2          = isAvx2Enabled                  dflags
   , stgToCmmAvx512f       = isAvx512fEnabled               dflags
   , stgToCmmTickyAP       = gopt Opt_Ticky_AP dflags
+  , stgToCmmHpcInfo       = hpc_info
   } where profile  = targetProfile dflags
           platform = profilePlatform profile
           bk_end  = backend dflags
