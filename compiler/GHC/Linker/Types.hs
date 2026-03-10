@@ -51,7 +51,7 @@ where
 import GHC.Prelude
 import GHC.Unit                ( UnitId, Module )
 import GHC.ByteCode.Types      ( ItblEnv, AddrEnv, CompiledByteCode )
-import GHCi.RemoteTypes        ( ForeignHValue, RemotePtr )
+import GHCi.RemoteTypes        ( ForeignHValue, ForeignRef, RemotePtr )
 import GHCi.Message            ( LoadedDLL )
 
 import GHC.Types.Name.Env      ( NameEnv, emptyNameEnv, extendNameEnvList, filterNameEnv )
@@ -69,8 +69,7 @@ import GHC.Unit.Module.WholeCoreBindings
 import Data.Maybe (mapMaybe)
 import Data.List.NonEmpty (NonEmpty, nonEmpty)
 import qualified Data.List.NonEmpty as NE
-import Data.Word (Word64)
-import Foreign.Ptr (Ptr)
+import GHCi.BreakArray (BreakArray)
 
 
 {- **********************************************************************
@@ -155,8 +154,10 @@ data LoaderState = LoaderState
         -- ^ The currently-loaded packages; always object code
         -- haskell libraries, system libraries, transitive dependencies
 
-    , hpc_tickarrays :: !(ModuleEnv (Ptr Word64))
-        -- ^ HPC tick arrays for bytecode modules, keyed by module
+    , hpc_tickarrays :: !(ModuleEnv (ForeignRef BreakArray))
+        -- ^ HPC tick arrays for bytecode modules, keyed by module.
+        -- Stored as BreakArray (MutableByteArray#) so the GC can
+        -- properly manage pointers stored in BCO ptrs arrays.
 
     , temp_sos :: ![(FilePath, String)]
         -- ^ We need to remember the name of previous temporary DLL/.so

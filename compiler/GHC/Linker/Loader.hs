@@ -1,6 +1,8 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE UnboxedTuples #-}
 
 --
 --  (c) The University of Glasgow 2002-2006
@@ -116,12 +118,12 @@ import System.Win32.Info (getSystemDirectory)
 
 import GHC.Utils.Exception
 import GHC.Unit.Home.Graph (lookupHug, unitEnv_foldWithKey)
-import Foreign.Ptr (Ptr)
-import Foreign.Marshal.Array (mallocArray)
+import GHCi.BreakArray (BreakArray(BA))
 import Foreign.Marshal.Utils (fillBytes)
-import Foreign.Storable (sizeOf)
 import Foreign.C.String (CString, newCString)
 import Data.Word (Word32, Word64)
+import GHC.Exts (Int(I#), Ptr(Ptr), mutableByteArrayContents#, newPinnedByteArray#)
+import GHC.IO (IO(IO))
 
 -- Note [Linkers and loaders]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -944,7 +946,8 @@ dynLinkBCOs interp pls bcos = do
             le2 = le1 { itbl_env = ie2, addr_env = ae2 }
 
         -- Allocate HPC tick arrays for modules compiled with -fhpc
-        he2 <- allocateHpcTickArrays (hpc_tickarrays pls1) (mapMaybe bc_hpc_info cbcs)
+        let hpc_infos = mapMaybe bc_hpc_info cbcs
+        he2 <- allocateHpcTickArrays (hpc_tickarrays pls1) hpc_infos
 
         names_and_refs <- linkSomeBCOs interp (pkgs_loaded pls) le2 he2 cbcs
 
@@ -964,7 +967,7 @@ dynLinkBCOs interp pls bcos = do
 linkSomeBCOs :: Interp
              -> PkgsLoaded
              -> LinkerEnv
-             -> ModuleEnv (Ptr Word64)  -- ^ HPC tick arrays
+             -> ModuleEnv (ForeignRef BreakArray)  -- ^ HPC tick arrays
              -> [CompiledByteCode]
              -> IO [(Name,HValueRef)]
                         -- The returned HValueRefs are associated 1-1 with
@@ -1650,15 +1653,26 @@ maybePutStrLn :: Logger -> String -> IO ()
 maybePutStrLn logger s = maybePutSDoc logger (text s <> text "\n")
 
 -- | Allocate and register HPC tick arrays for bytecode modules compiled with -fhpc.
+--
+-- The tick arrays are allocated as pinned 'MutableByteArray#' (wrapped in
+-- 'BreakArray') rather than via 'malloc', because the array pointer is stored
+-- in the BCO ptrs array which is scanned by the GC. A malloc'd pointer could
+-- fall in an address range that 'HEAP_ALLOCED_GC' considers as heap, causing
+-- the GC to crash when trying to evacuate it. A pinned 'MutableByteArray#' is
+-- a proper GC-managed object that the GC handles correctly.
 allocateHpcTickArrays ::
-  ModuleEnv (Ptr Word64) ->
+  ModuleEnv (ForeignRef BreakArray) ->
   [HpcTickInfo] ->
-  IO (ModuleEnv (Ptr Word64))
+  IO (ModuleEnv (ForeignRef BreakArray))
 allocateHpcTickArrays =
   foldM $ \env (HpcTickInfo hpc_mod tick_count hash_no) -> do
     if not $ elemModuleEnv hpc_mod env then do
-      tick_arr <- mallocArray tick_count
-      fillBytes tick_arr 0 (tick_count * sizeOf (0 :: Word64))
+      -- Allocate a pinned MutableByteArray# for the tick array.
+      -- Must be pinned so the address is stable for hs_hpc_module.
+      let byte_count = tick_count * 8  -- Word64 = 8 bytes
+      ba@(BA mba) <- newPinnedBreakArray byte_count
+      let tick_arr = Ptr (mutableByteArrayContents# mba) :: Ptr Word64
+      fillBytes tick_arr 0 byte_count
       let mod_name = moduleNameString (moduleName hpc_mod)
       -- Use newCString (not withCString) because hs_hpc_module stores
       -- the pointer without copying the string (see rts/Hpc.c).
@@ -1668,9 +1682,16 @@ allocateHpcTickArrays =
         (fromIntegral tick_count)
         (fromIntegral hash_no)
         tick_arr
-      evaluate $ extendModuleEnv env hpc_mod tick_arr
+      rref <- mkRemoteRef ba
+      ref <- mkForeignRef rref (freeRemoteRef rref)
+      evaluate $ extendModuleEnv env hpc_mod ref
     else
       return env
+  where
+    -- Allocate a pinned byte array wrapped as BreakArray.
+    newPinnedBreakArray :: Int -> IO BreakArray
+    newPinnedBreakArray (I# n) = IO $ \s ->
+      case newPinnedByteArray# n s of (# s', mba #) -> (# s', BA mba #)
 
 foreign import ccall "hs_hpc_module"
   c_hs_hpc_module :: CString -> Word32 -> Word32 -> Ptr Word64 -> IO ()

@@ -158,6 +158,7 @@ import GHC.HsToCore
 
 import GHC.StgToByteCode    ( byteCodeGen )
 import GHC.Types.HpcInfo
+import GHC.Types.Tickish ( GenTickish(..) )
 import GHC.StgToJS          ( stgToJS )
 import GHC.StgToJS.Ids
 import GHC.StgToJS.Types
@@ -1131,15 +1132,51 @@ compileWholeCoreBindings hsc_env type_env wcb = do
       (tmpDir (hsc_dflags hsc_env)) wcb_foreign
 
     gen_bytecode core_binds stubs foreign_files = do
-      let cgi_guts = CgInteractiveGuts wcb_module core_binds
+      let hpc_info = hpcInfoFromCore wcb_module core_binds
+          cgi_guts = CgInteractiveGuts wcb_module core_binds
                       (typeEnvTyCons type_env) stubs foreign_files
-                      (emptyHpcInfo False) Nothing []
+                      hpc_info Nothing []
       trace_if logger (text "Generating ByteCode for" <+> ppr wcb_module)
       generateByteCode hsc_env cgi_guts wcb_mod_location
 
     WholeCoreBindings {wcb_module, wcb_mod_location, wcb_foreign} = wcb
 
     logger = hsc_logger hsc_env
+
+-- | Derive 'HpcInfo' by counting HPC tick indices in Core bindings.
+--
+-- When bytecode is compiled from interface Core bindings (the
+-- 'WholeCoreBindings' / lazy bytecode path), the original 'HpcInfo'
+-- is not available. We reconstruct the tick count by finding the
+-- maximum 'HpcTick' index in the Core.
+--
+-- The hash is set to 0 because it is only needed for consistency
+-- checking in 'hs_hpc_module' (which only matters when the same
+-- module is registered twice), and during compilation for TH
+-- evaluation only the bytecode path registers, not the C stub.
+hpcInfoFromCore :: Module -> [CoreBind] -> HpcInfo
+hpcInfoFromCore this_mod binds =
+  case maxTickIndex of
+    Nothing -> emptyHpcInfo False
+    Just n  -> HpcInfo (n + 1) 0
+  where
+    maxTickIndex = go_binds binds Nothing
+
+    go_binds [] acc = acc
+    go_binds (b:bs) acc = go_binds bs $! go_bind b acc
+
+    go_bind (NonRec _ rhs) acc = go_expr rhs acc
+    go_bind (Rec pairs) acc = foldl' (\a (_, rhs) -> go_expr rhs a) acc pairs
+
+    go_expr (Tick (HpcTick mod idx) e) acc
+      | mod == this_mod = go_expr e (Just $! maybe idx (max idx) acc)
+    go_expr (Tick _ e) acc = go_expr e acc
+    go_expr (App f a) acc = go_expr a $! go_expr f acc
+    go_expr (Lam _ e) acc = go_expr e acc
+    go_expr (Let b e) acc = go_expr e $! go_bind b acc
+    go_expr (Case e _ _ alts) acc = foldl' (\a (Alt _ _ rhs) -> go_expr rhs a) (go_expr e acc) alts
+    go_expr (Cast e _) acc = go_expr e acc
+    go_expr _ acc = acc
 
 {-
 Note [ModDetails and --make mode]

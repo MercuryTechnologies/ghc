@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP                   #-}
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE MagicHash             #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -19,6 +20,7 @@ where
 import GHC.Prelude
 
 import GHC.Runtime.Interpreter
+import GHC.Runtime.Interpreter.Types (InterpInstance(..))
 import GHC.ByteCode.Types
 import GHCi.RemoteTypes
 import GHCi.ResolvedBCO
@@ -46,10 +48,19 @@ import Language.Haskell.Syntax.Module.Name
 
 -- Standard libraries
 import Data.Array.Unboxed
-import Data.Word (Word64)
 import Foreign.Ptr
 import GHC.Exts
+import GHCi.BreakArray (BreakArray)
 import GHC.Unit.Module.Env (ModuleEnv, lookupModuleEnv)
+
+-- | Check if the interpreter is an external process (iserv/JS).
+-- In that case, local pointers are not valid in the interpreter's address space.
+isExternalInterp :: Interp -> Bool
+isExternalInterp interp = case interpInstance interp of
+  ExternalInterp {} -> True
+#if defined(HAVE_INTERNAL_INTERPRETER)
+  InternalInterp    -> False
+#endif
 
 {-
   Linking interpretables into something we can run
@@ -59,7 +70,7 @@ linkBCO
   :: Interp
   -> PkgsLoaded
   -> LinkerEnv
-  -> ModuleEnv (Ptr Word64)  -- ^ HPC tick arrays
+  -> ModuleEnv (ForeignRef BreakArray)  -- ^ HPC tick arrays
   -> NameEnv Int
   -> UnlinkedBCO
   -> IO ResolvedBCO
@@ -145,7 +156,7 @@ resolvePtr
   :: Interp
   -> PkgsLoaded
   -> LinkerEnv
-  -> ModuleEnv (Ptr Word64)  -- ^ HPC tick arrays
+  -> ModuleEnv (ForeignRef BreakArray)  -- ^ HPC tick arrays
   -> NameEnv Int
   -> BCOPtr
   -> IO ResolvedBCOPtr
@@ -177,8 +188,17 @@ resolvePtr interp pkgs_loaded le hpc_tickarrays bco_ix ptr = case ptr of
 
   BCOPtrHpcTickArray hpc_mod
     -> case lookupModuleEnv hpc_tickarrays hpc_mod of
-         Just ptr -> return (ResolvedBCOStaticPtr (toRemotePtr (castPtr ptr)))
-         Nothing  -> pprPanic "GHC.ByteCode.Linker: no HPC tick array for module" (ppr hpc_mod)
+            Just ref
+              -- For external interpreter, the tick array is in the compiler's
+              -- address space, not the interpreter's. Pass a null pointer so
+              -- bci_HPC_TICK safely skips the increment.
+              | isExternalInterp interp -> return (ResolvedBCOStaticPtr (toRemotePtr nullPtr))
+              -- Store as BreakArray (MutableByteArray#) in the BCO ptrs array.
+              -- This ensures the GC can properly handle the pointer, unlike a
+              -- raw malloc'd Ptr which could crash the GC if HEAP_ALLOCED_GC
+              -- misidentifies it as a heap pointer.
+              | otherwise -> withForeignRef ref $ \ba -> return (ResolvedBCOPtrBreakArray ba)
+            Nothing  -> return (ResolvedBCOStaticPtr (toRemotePtr nullPtr))
 
 -- | Look up the address of a Haskell symbol in the currently
 -- loaded units.
