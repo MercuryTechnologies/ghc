@@ -39,7 +39,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc
 
-import Data.List (sortOn, sortBy, nub)
+import Data.List (sortOn, sortBy)
 import Data.List.NonEmpty (nonEmpty)
 import qualified Data.List.NonEmpty as NE
 import Data.Foldable (toList)
@@ -480,22 +480,23 @@ mergeChains :: [CfgEdge] -> [BlockChain]
             -> (BlockChain)
 mergeChains edges chains
     = runST $ do
+        supply <- newPointSupply
         let addChain m0 chain = do
-                ref <- fresh chain
+                ref <- fresh supply chain
                 return $ chainFoldl (\m' b -> mapInsert b ref m') m0 chain
         chainMap' <- foldM (\m0 c -> addChain m0 c) mapEmpty chains
-        merge edges chainMap'
+        merge supply edges chainMap'
     where
         -- We keep a map from ALL blocks to their respective chain (sigh)
         -- This is required since when looking at an edge we need to find
         -- the associated chains quickly.
         -- We use a union-find data structure to do this efficiently.
 
-        merge :: forall s. [CfgEdge] -> LabelMap (Point s BlockChain) -> ST s BlockChain
-        merge [] chains = do
-            chains' <- mapM find =<< (nub <$> (mapM repr $ mapElems chains)) :: ST s [BlockChain]
+        merge :: forall s. PointSupply s -> [CfgEdge] -> LabelMap (Point s BlockChain) -> ST s BlockChain
+        merge _supply [] chains = do
+            chains' <- mapM find =<< (ordNub <$> mapM repr (mapElems chains)) :: ST s [BlockChain]
             return $ foldl' chainConcat (Partial.head chains') (Partial.tail chains')
-        merge ((CfgEdge from to _):edges) chains
+        merge supply ((CfgEdge from to _):edges) chains
         --   | pprTrace "merge" (ppr (from,to) <> ppr chains) False
         --   = undefined
           = do
@@ -503,14 +504,13 @@ mergeChains edges chains
             unless same $ do
               cRight <- find cTo
               cLeft <- find cFrom
-              new_point <- fresh (chainConcat cLeft cRight)
+              new_point <- fresh supply (chainConcat cLeft cRight)
               union cTo new_point
               union cFrom new_point
-            merge edges chains
+            merge supply edges chains
           where
             cFrom = expectJust "mergeChains:chainMap:from" $ mapLookup from chains
             cTo = expectJust "mergeChains:chainMap:to"   $ mapLookup to   chains
-
 
 -- See Note [Chain based CFG serialization] for the general idea.
 -- This creates and fuses chains at the same time for performance reasons.

@@ -42,7 +42,6 @@ import Control.Monad.Trans.Writer
 import Control.Monad
 
 import qualified Data.Semigroup as Semigroup
-import Data.List ( nub )
 import Data.Maybe ( catMaybes )
 
 type Atomic = Maybe MemoryOrdering
@@ -2084,7 +2083,7 @@ funPrologue live cmmBlocks = do
       getAssignedRegs (CmmUnsafeForeignCall _ rs _) = map CmmLocal rs
       getAssignedRegs _                  = []
       getRegsBlock (_, body, _)          = concatMap getAssignedRegs $ blockToList body
-      assignedRegs = nub $ concatMap (getRegsBlock . blockSplit) cmmBlocks
+      assignedRegs = ordNub $ concatMap (getRegsBlock . blockSplit) cmmBlocks
       isLive r     = r `elem` alwaysLive || r `elem` live
 
   platform <- getPlatform

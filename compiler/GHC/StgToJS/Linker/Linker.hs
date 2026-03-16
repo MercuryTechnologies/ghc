@@ -101,7 +101,8 @@ import qualified Data.ByteString          as BS
 import Data.Function            (on)
 import qualified Data.IntSet              as IS
 import Data.IORef
-import Data.List  ( nub, intercalate, groupBy, intersperse, sortBy)
+import Data.List  ( intercalate, groupBy, intersperse, sortBy)
+import GHC.Utils.Misc (ordNub)
 import Data.Map.Strict          (Map)
 import qualified Data.Map.Strict          as M
 import Data.Maybe
@@ -436,14 +437,14 @@ computeLinkDependencies cfg unit_env link_spec finder_opts finder_cache ar_cache
   (objs_block_info, objs_required_blocks) <- loadObjBlockInfo hs_objs
 
   let obj_roots = S.fromList . filter obj_is_root $ concatMap (M.keys . bi_exports . lbi_info) (M.elems objs_block_info)
-      obj_units = map moduleUnitId $ nub (M.keys objs_block_info)
+      obj_units = map moduleUnitId $ ordNub (M.keys objs_block_info)
 
   let (rts_wired_units, rts_wired_functions) = rtsDeps
 
   -- all the units we want to link together, without their dependencies
   let root_units = filter (/= ue_currentUnit unit_env)
                    $ filter (/= interactiveUnitId)
-                   $ nub
+                   $ ordNub
                    $ rts_wired_units ++ reverse obj_units ++ reverse units
 
   -- all the units we want to link together, including their dependencies,
@@ -1130,7 +1131,7 @@ linkModules mods = (compact_mods, meta)
 
     -- common up statics: different bindings may reference the same statics, we
     -- filter them here to initialize them once
-    statics = nubStaticInfo (concatMap mc_statics mods)
+    statics = ordNubStaticInfo (concatMap mc_statics mods)
 
     infos   = concatMap mc_closures mods
     debug   = False -- TODO: this could be enabled in a debug build.
@@ -1143,8 +1144,8 @@ linkModules mods = (compact_mods, meta)
             ]
 
 -- | Only keep a single StaticInfo with a given name
-nubStaticInfo :: [StaticInfo] -> [StaticInfo]
-nubStaticInfo = go emptyUniqSet
+ordNubStaticInfo :: [StaticInfo] -> [StaticInfo]
+ordNubStaticInfo = go emptyUniqSet
   where
     go us = \case
       []     -> []

@@ -18,7 +18,8 @@ module GHC.Data.BooleanFormula (
 
 import GHC.Prelude hiding ( init, last )
 
-import Data.List ( nub, intersperse )
+import Data.List ( intersperse )
+import GHC.Utils.Misc ( ordNubOn )
 import Data.List.NonEmpty ( NonEmpty (..), init, last )
 import Data.Data
 
@@ -39,6 +40,23 @@ data BooleanFormula a = Var a | And [LBooleanFormula a] | Or [LBooleanFormula a]
                       | Parens (LBooleanFormula a)
   deriving (Eq, Data, Functor, Foldable, Traversable)
 
+-- | Structural comparison ignoring source locations.
+-- Needed for 'ordNubOn' in 'mkAnd'/'mkOr'. We compare only the
+-- formula structure (via 'unLoc') so we don't need 'Ord' on the
+-- annotation types (which would require 'Ord' on 'FastString').
+instance Ord a => Ord (BooleanFormula a) where
+  compare (Var a)    (Var b)    = compare a b
+  compare (And as)   (And bs)   = compare (map unLoc as) (map unLoc bs)
+  compare (Or as)    (Or bs)    = compare (map unLoc as) (map unLoc bs)
+  compare (Parens a) (Parens b) = compare (unLoc a) (unLoc b)
+  compare a          b          = compare (conIdx a) (conIdx b)
+    where
+      conIdx :: BooleanFormula x -> Int
+      conIdx Var{}    = 0
+      conIdx And{}    = 1
+      conIdx Or{}     = 2
+      conIdx Parens{} = 3
+
 mkVar :: a -> BooleanFormula a
 mkVar = Var
 
@@ -52,8 +70,8 @@ mkBool False = mkFalse
 mkBool True  = mkTrue
 
 -- Make a conjunction, and try to simplify
-mkAnd :: Eq a => [LBooleanFormula a] -> BooleanFormula a
-mkAnd = maybe mkFalse (mkAnd' . nub) . concatMapM fromAnd
+mkAnd :: Ord a => [LBooleanFormula a] -> BooleanFormula a
+mkAnd = maybe mkFalse (mkAnd' . ordNubOn unLoc) . concatMapM fromAnd
   where
   -- See Note [Simplification of BooleanFormulas]
   fromAnd :: LBooleanFormula a -> Maybe [LBooleanFormula a]
@@ -66,8 +84,8 @@ mkAnd = maybe mkFalse (mkAnd' . nub) . concatMapM fromAnd
   mkAnd' [x] = unLoc x
   mkAnd' xs = And xs
 
-mkOr :: Eq a => [LBooleanFormula a] -> BooleanFormula a
-mkOr = maybe mkTrue (mkOr' . nub) . concatMapM fromOr
+mkOr :: Ord a => [LBooleanFormula a] -> BooleanFormula a
+mkOr = maybe mkTrue (mkOr' . ordNubOn unLoc) . concatMapM fromOr
   where
   -- See Note [Simplification of BooleanFormulas]
   fromOr (L _ (Or xs)) = Just xs
@@ -131,7 +149,7 @@ eval f (Parens x) = eval f (unLoc x)
 
 -- Simplify a boolean formula.
 -- The argument function should give the truth of the atoms, or Nothing if undecided.
-simplify :: Eq a => (a -> Maybe Bool) -> BooleanFormula a -> BooleanFormula a
+simplify :: Ord a => (a -> Maybe Bool) -> BooleanFormula a -> BooleanFormula a
 simplify f (Var a) = case f a of
   Nothing -> Var a
   Just b  -> mkBool b
@@ -142,7 +160,7 @@ simplify f (Parens x) = simplify f (unLoc x)
 -- Test if a boolean formula is satisfied when the given values are assigned to the atoms
 -- if it is, returns Nothing
 -- if it is not, return (Just remainder)
-isUnsatisfied :: Eq a => (a -> Bool) -> BooleanFormula a -> Maybe (BooleanFormula a)
+isUnsatisfied :: Ord a => (a -> Bool) -> BooleanFormula a -> Maybe (BooleanFormula a)
 isUnsatisfied f bf
     | isTrue bf' = Nothing
     | otherwise  = Just bf'

@@ -27,7 +27,8 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Platform
 
-import Data.List (nub, (\\), intersect)
+import Data.List ((\\), intersect)
+import GHC.Utils.Misc (ordNub)
 import Data.Maybe
 import Data.IntSet              (IntSet)
 import qualified Data.IntSet    as IntSet
@@ -191,8 +192,8 @@ regSpill_instr platform regSlotMap (LiveInstr instr (Just _)) = do
 
   -- sometimes a register is listed as being read more than once,
   --      nub this so we don't end up inserting two lots of spill code.
-  let rsRead_             = nub rlRead
-  let rsWritten_          = nub rlWritten
+  let rsRead_             = ordNub rlRead
+  let rsWritten_          = ordNub rlWritten
 
   -- if a reg is modified, it appears in both lists, want to undo this..
   let rsRead              = rsRead_    \\ rsWritten_

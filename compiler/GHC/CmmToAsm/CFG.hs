@@ -80,7 +80,7 @@ import GHC.Utils.Panic
 --import GHC.Data.OrdList
 --import GHC.Cmm.DebugBlock.Trace
 
-import Data.List (sort, nub, partition)
+import Data.List (sort, partition)
 import Data.STRef.Strict
 import Control.Monad.ST
 
@@ -305,10 +305,11 @@ shortcutWeightMap cuts cfg
       -- A -> C and B -> C directly.
       normalised_cuts_st :: forall s . ST s (LabelMap (Maybe BlockId))
       normalised_cuts_st = do
-        (null :: Point s (Maybe BlockId)) <- fresh Nothing
+        supply <- newPointSupply
+        (null :: Point s (Maybe BlockId)) <- fresh supply Nothing
         let cuts_list = mapToList cuts
         -- Create a unification variable for each of the nodes in a rewrite
-        cuts_vars <- traverse (\p -> (p,) <$> fresh (Just p)) (concatMap (\(a, b) -> [a] ++ maybe [] (:[]) b) cuts_list)
+        cuts_vars <- traverse (\p -> (p,) <$> fresh supply (Just p)) (concatMap (\(a, b) -> [a] ++ maybe [] (:[]) b) cuts_list)
         let cuts_map = mapFromList cuts_vars :: LabelMap (Point s (Maybe BlockId))
         -- Then unify according to the rewrites in the cuts map
         mapM_ (\(from, to) -> expectJust "shortcutWeightMap" (mapLookup from cuts_map)
@@ -898,7 +899,7 @@ loopInfo cfg root = LoopInfo  { liBackEdges = backEdges
     -- Block b is part of n loop bodies => loop nest level of n
     loopCounts =
       let bodies = map (first snd) loopBodies -- [(Header, Body)]
-          loopCount n = length $ nub . map fst . filter (setMember n . snd) $ bodies
+          loopCount n = length $ ordNub . map fst . filter (setMember n . snd) $ bodies
       in  map (\n -> (n, loopCount n)) $ nodes :: [(BlockId, Int)]
 
     toWord64Set :: LabelSet -> Word64Set

@@ -7,7 +7,7 @@ module GHC.Cmm.CallConv (
 ) where
 
 import GHC.Prelude
-import Data.List (nub)
+import GHC.Utils.Misc (ordNub)
 
 import GHC.Cmm.Expr
 import GHC.Runtime.Heap.Layout
@@ -340,4 +340,4 @@ realArgRegsCover platform
 
 allArgRegsCover :: Platform -> [GlobalReg]
 allArgRegsCover platform =
-  nub (VanillaReg 1 : realArgRegsCover platform)
+  ordNub (VanillaReg 1 : realArgRegsCover platform)

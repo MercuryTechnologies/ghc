@@ -51,7 +51,8 @@ import GHC.Utils.Panic
 import GHC.Platform
 import GHC.Cmm.Dataflow.Label
 
-import Data.List (nub, foldl1', find)
+import Data.List (foldl1', find)
+import GHC.Utils.Misc (ordNub)
 import Data.Maybe
 import Data.IntSet              (IntSet)
 import qualified Data.IntSet    as IntSet
@@ -215,7 +216,7 @@ cleanForward platform blockId assoc acc (li : instrs)
         -- Writing to a reg changes its value.
         | LiveInstr instr _     <- li
         , RU _ written          <- regUsageOfInstr platform instr
-        = let assoc'    = foldr delAssoc assoc (map SReg $ nub written)
+        = let assoc'    = foldr delAssoc assoc (map SReg $ ordNub written)
           in  cleanForward platform blockId assoc' (li : acc) instrs
 
 

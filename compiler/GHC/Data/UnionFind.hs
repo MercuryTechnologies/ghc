@@ -8,16 +8,23 @@ import Control.Monad
 
 -- | A variable which can be unified; alternately, this can be thought
 -- of as an equivalence class with a distinguished representative.
-newtype Point s a = Point (STRef s (Link s a))
-    deriving (Eq)
+data Point s a = Point
+    {-# UNPACK #-} !Int          -- ^ unique identity for Ord
+    {-# UNPACK #-} !(STRef s (Link s a))
+
+instance Eq (Point s a) where
+    Point _ r1 == Point _ r2 = r1 == r2
+
+instance Ord (Point s a) where
+    compare (Point i1 _) (Point i2 _) = compare i1 i2
 
 -- | Mutable write to a 'Point'
 writePoint :: Point s a -> Link s a -> ST s ()
-writePoint (Point v) = writeSTRef v
+writePoint (Point _ v) = writeSTRef v
 
 -- | Read the current value of 'Point'.
 readPoint :: Point s a -> ST s (Link s a)
-readPoint (Point v) = readSTRef v
+readPoint (Point _ v) = readSTRef v
 
 -- | The internal data structure for a 'Point', which either records
 -- the representative element of an equivalence class, or a link to
@@ -27,12 +34,21 @@ data Link s a
     = Info {-# UNPACK #-} !(STRef s Int) {-# UNPACK #-} !(STRef s a)
     | Link {-# UNPACK #-} !(Point s a)
 
+-- | A supply of unique 'Int' identifiers for 'Point' values.
+newtype PointSupply s = PointSupply (STRef s Int)
+
+-- | Create a new 'PointSupply'.
+newPointSupply :: ST s (PointSupply s)
+newPointSupply = PointSupply <$> newSTRef 0
+
 -- | Create a fresh equivalence class with one element.
-fresh :: a -> ST s (Point s a)
-fresh desc = do
+fresh :: PointSupply s -> a -> ST s (Point s a)
+fresh (PointSupply counter) desc = do
+    i <- readSTRef counter
+    writeSTRef counter (i + 1)
     weight <- newSTRef 1
     descriptor <- newSTRef desc
-    Point `fmap` newSTRef (Info weight descriptor)
+    Point i <$> newSTRef (Info weight descriptor)
 
 -- | Flatten any chains of links, returning a 'Point'
 -- which points directly to the canonical representation.

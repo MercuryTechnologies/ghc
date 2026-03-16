@@ -238,7 +238,7 @@ import GHC.Utils.Panic
 
 import Data.IORef ( IORef )
 import Data.List.NonEmpty( NonEmpty(..) )
-import Data.List ( partition, nub, (\\) )
+import Data.List ( partition, (\\) )
 
 {-
 ************************************************************************
@@ -2218,7 +2218,7 @@ noMoreTyVars :: [TyVar]  -- Free vars (with repetitions) of the constraint C
              -> [TyVar]  -- TyVars that appear more often in C than H;
                          --   no repetitions in this list
 noMoreTyVars tvs head_tvs
-  = nub (tvs \\ head_tvs)  -- The (\\) is list difference; e.g.
+  = ordNub (tvs \\ head_tvs)  -- The (\\) is list difference; e.g.
                            --   [a,b,a,a] \\ [a,a] = [b,a]
                            -- So we are counting repetitions
 

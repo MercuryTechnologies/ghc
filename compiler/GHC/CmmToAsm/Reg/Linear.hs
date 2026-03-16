@@ -135,7 +135,8 @@ import GHC.Utils.Panic
 import GHC.Platform
 
 import Data.Maybe
-import Data.List (partition, nub)
+import Data.List (partition)
+import GHC.Utils.Misc (ordNub)
 import Control.Monad
 
 -- -----------------------------------------------------------------------------
@@ -505,7 +506,7 @@ genRaInsn block_live new_instrs block_id instr r_dying w_dying = do
     -- we don't need to do anything with real registers that are
     -- only read by this instr.  (the list is typically ~2 elements,
     -- so using nub isn't a problem).
-    let virt_read       = nub [ vr      | (RegVirtual vr) <- read ] :: [VirtualReg]
+    let virt_read       = ordNub [ vr      | (RegVirtual vr) <- read ] :: [VirtualReg]
 
 --     do
 --         let real_read       = nub [ rr      | (RegReal rr) <- read]
