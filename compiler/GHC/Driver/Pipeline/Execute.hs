@@ -83,6 +83,11 @@ import GHC.StgToJS.Linker.Linker (embedJsFile)
 
 import Language.Haskell.Syntax.Module.Name
 import GHC.Unit.Home.ModInfo
+import GHC.Unit.Module.WholeCoreBindings
+import GHC.Linker.Types (Linkable(..), LinkablePart(..))
+import GHC.Iface.Load (readIface)
+import qualified Data.List.NonEmpty as NE
+import Data.Time.Clock (getCurrentTime)
 import GHC.Runtime.Loader (initializePlugins)
 
 newtype HookedUse a = HookedUse { runHookedUse :: (Hooks, PhaseHook) -> IO a }
@@ -603,13 +608,45 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
               -- In interpreted mode the regular codeGen backend is not run so we
               -- generate a interface without codeGen info.
             do
-              final_iface <- mkFullIface hsc_env partial_iface Nothing Nothing NoStubs []
+              let (iface_stubs, iface_files)
+                    | gopt Opt_WriteIfSimplifiedCore dflags = (cg_foreign cgguts, cg_foreign_files cgguts)
+                    | otherwise = (NoStubs, [])
+              final_iface <- mkFullIface hsc_env partial_iface Nothing Nothing iface_stubs iface_files
               hscMaybeWriteIface logger dflags True final_iface mb_old_iface_hash location
-              -- extra_decl is not used any more after writing the interface in the interpreter mode
-              -- since byte-code is already generated.
-              let final_iface' = set_mi_extra_decls Nothing final_iface
-              bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
-              return ([], final_iface', emptyHomeModInfoLinkable { homeMod_bytecode = Just bc } , panic "interpreter")
+
+              case mi_extra_decls final_iface of
+                Just _extra_decls | gopt Opt_WriteIfSimplifiedCore dflags -> do
+                  -- When -fwrite-if-simplified-core is enabled, defer BCO generation.
+                  -- We've already written the .hi file with Core bindings (line above).
+                  -- Rather than keeping the in-memory extra_decls (which shares heap
+                  -- objects with the compilation pipeline and prevents GC), we clear
+                  -- the iface and re-read the Core from the .hi file on demand.
+                  -- This matches the warm-load path and avoids peak residency bloat.
+                  let !final_iface' = set_mi_extra_decls Nothing final_iface
+                      this_mod = mkHomeModule (hsc_home_unit hsc_env) mod_name
+                      hi_path = ml_hi_file mod_location
+                  -- Re-read the iface from disk to get a fresh copy of extra_decls
+                  -- that doesn't retain any compilation pipeline state.
+                  read_result <- liftIO $ readIface dflags (hsc_NC hsc_env) (mi_module final_iface) hi_path
+                  bco_time <- liftIO getCurrentTime
+                  case read_result of
+                    Succeeded disk_iface
+                      | Just disk_extra_decls <- mi_extra_decls disk_iface -> do
+                        let !wcb = WholeCoreBindings disk_extra_decls this_mod mod_location
+                                     (mi_foreign disk_iface)
+                            bc = Linkable bco_time this_mod (NE.singleton (CoreBindings wcb))
+                        return ([], final_iface', emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }, panic "interpreter")
+                    _ -> do
+                      -- Fallback: .hi file unreadable or missing extra_decls.
+                      -- Generate BCOs eagerly.
+                      bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
+                      return ([], final_iface', emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }, panic "interpreter")
+
+                _ -> do
+                  -- No simplified Core available: generate BCOs eagerly as before.
+                  let final_iface' = set_mi_extra_decls Nothing final_iface
+                  bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
+                  return ([], final_iface', emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }, panic "interpreter")
 
 
 runUnlitPhase :: HscEnv -> FilePath -> FilePath -> IO FilePath

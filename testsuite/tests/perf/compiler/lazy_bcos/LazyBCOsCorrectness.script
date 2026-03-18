@@ -1,0 +1,21 @@
+-- Test that modules compiled with -fwrite-if-simplified-core
+-- can be loaded and evaluated correctly in GHCi.
+-- After the initial load (which compiles from source), a :reload
+-- should use the lazy CoreBindings path. Evaluation must still work.
+
+-- Initial load: compiles all modules from source
+:l TopMod.hs
+-- Evaluate to verify bytecode works
+topF 10
+topG 10
+
+-- Now reload: should use .hi files with CoreBindings (lazy BCOs)
+:r
+-- Evaluate again: should still work, forcing lazy BCO generation
+topF 10
+topG 10
+
+-- Test that we can also evaluate intermediate modules
+:l M050.hs
+f050 10
+g050 10
