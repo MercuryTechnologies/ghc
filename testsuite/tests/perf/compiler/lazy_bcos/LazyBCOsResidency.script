@@ -1,0 +1,9 @@
+-- Benchmark: Load 200 modules and measure peak residency.
+-- With lazy BCO generation, peak memory should be significantly lower
+-- because bytecode is only generated for modules whose code is actually
+-- evaluated, not for every module in the dependency chain.
+--
+-- This script loads all modules but only evaluates the top-level one.
+-- The 199 intermediate modules should NOT have BCOs generated.
+:l TopMod.hs
+topF 42

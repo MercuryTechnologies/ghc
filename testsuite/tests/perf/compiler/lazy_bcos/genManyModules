@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Generate N modules with non-trivial definitions.
+# Each module imports the previous one to form a chain.
+# This simulates a real project where loading many modules
+# should not require holding all BCOs in memory.
+N=${1:-200}
+
+echo "module M001 where" > M001.hs
+echo "f001 :: Int -> Int" >> M001.hs
+echo "f001 x = x + 1" >> M001.hs
+echo "data D001 = D001A | D001B Int String" >> M001.hs
+
+for i in $(seq -w 2 $N); do
+  prev=$(printf "%03d" $((10#$i - 1)))
+  cat > M${i}.hs <<EOF
+module M${i} where
+import M${prev}
+f${i} :: Int -> Int
+f${i} x = f${prev} x + ${i}
+data D${i} = D${i}A | D${i}B Int String
+g${i} :: Int -> String
+g${i} n = show (f${i} n) ++ " from M${i}"
+EOF
+done
+
+# Top-level module that imports the last one
+cat > TopMod.hs <<EOF
+module TopMod where
+import M$(printf "%03d" $N)
+topF :: Int -> Int
+topF = f$(printf "%03d" $N)
+topG :: Int -> String
+topG = g$(printf "%03d" $N)
+EOF

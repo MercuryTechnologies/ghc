@@ -83,6 +83,10 @@ import GHC.StgToJS.Linker.Linker (embedJsFile)
 
 import Language.Haskell.Syntax.Module.Name
 import GHC.Unit.Home.ModInfo
+import GHC.Unit.Module.WholeCoreBindings
+import GHC.Linker.Types (Linkable(..), LinkablePart(..))
+import qualified Data.List.NonEmpty as NE
+import Data.Time.Clock (getCurrentTime)
 import GHC.Runtime.Loader (initializePlugins)
 
 newtype HookedUse a = HookedUse { runHookedUse :: (Hooks, PhaseHook) -> IO a }
@@ -603,13 +607,35 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
               -- In interpreted mode the regular codeGen backend is not run so we
               -- generate a interface without codeGen info.
             do
-              final_iface <- mkFullIface hsc_env partial_iface Nothing Nothing NoStubs []
+              let (iface_stubs, iface_files)
+                    | gopt Opt_WriteIfSimplifiedCore dflags = (cg_foreign cgguts, cg_foreign_files cgguts)
+                    | otherwise = (NoStubs, [])
+              final_iface <- mkFullIface hsc_env partial_iface Nothing Nothing iface_stubs iface_files
               hscMaybeWriteIface logger dflags True final_iface mb_old_iface_hash location
-              -- extra_decl is not used any more after writing the interface in the interpreter mode
-              -- since byte-code is already generated.
-              let final_iface' = set_mi_extra_decls Nothing final_iface
-              bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
-              return ([], final_iface', emptyHomeModInfoLinkable { homeMod_bytecode = Just bc } , panic "interpreter")
+
+              case mi_extra_decls final_iface of
+                Just extra_decls | gopt Opt_WriteIfSimplifiedCore dflags -> do
+                  -- When -fwrite-if-simplified-core is enabled, defer BCO generation.
+                  -- The .hi file contains Core bindings, so we create a CoreBindings
+                  -- linkable that will be lazily compiled to BCOs on demand by
+                  -- initWholeCoreBindings in the caller (compileOne').
+                  -- This avoids holding all BCOs in memory for modules whose code
+                  -- is never evaluated.
+                  let this_mod = mkHomeModule (hsc_home_unit hsc_env) mod_name
+                  bco_time <- liftIO getCurrentTime
+                  let !wcb = WholeCoreBindings extra_decls this_mod mod_location
+                               (mi_foreign final_iface)
+                      bc = Linkable bco_time this_mod (NE.singleton (CoreBindings wcb))
+                      -- Clear extra_decls from the iface so the caller doesn't
+                      -- retain a second copy.
+                      !final_iface' = set_mi_extra_decls Nothing final_iface
+                  return ([], final_iface', emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }, panic "interpreter")
+
+                _ -> do
+                  -- No simplified Core available: generate BCOs eagerly as before.
+                  let final_iface' = set_mi_extra_decls Nothing final_iface
+                  bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
+                  return ([], final_iface', emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }, panic "interpreter")
 
 
 runUnlitPhase :: HscEnv -> FilePath -> FilePath -> IO FilePath
