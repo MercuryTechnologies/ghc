@@ -92,7 +92,9 @@ gen_Generic_binds :: GenericKind -> SrcSpan -> DerivInstTys
                   -> TcM (LHsBinds GhcPs, [LSig GhcPs])
 gen_Generic_binds gk loc dit = do
   dflags <- getDynFlags
-  return $ mkBindsRep dflags gk loc dit
+  if gopt Opt_DsGenericCheap dflags
+    then return $ mkBindsRepCheap gk loc dit
+    else return $ mkBindsRep dflags gk loc dit
 
 {-
 ************************************************************************
@@ -355,6 +357,24 @@ gk2gkDC Gen1 dc tc_args = Gen1_DC $ assert (isTyVarTy last_dc_inst_univ)
     last_dc_inst_univ = assert (not (null dc_inst_univs)) $
                         Partial.last dc_inst_univs
 
+
+-- Cheap stub bindings for benchmarking: from = error "stub"; to = error "stub"
+-- This lets us measure how much time the typechecker spends on the actual
+-- from/to implementations vs. the Rep type family instance.
+mkBindsRepCheap :: GenericKind -> SrcSpan -> DerivInstTys -> (LHsBinds GhcPs, [LSig GhcPs])
+mkBindsRepCheap gk loc _dit = (binds, [])
+  where
+    loc' = noAnnSrcSpan loc
+    (from01_RDR, to01_RDR) = case gk of
+                                Gen0 -> (from_RDR,  to_RDR)
+                                Gen1 -> (from1_RDR, to1_RDR)
+    stub_rhs = nlHsVar error_RDR
+               `nlHsApp` nlHsLit (mkHsString "generic stub")
+    from_eqn = mkHsCaseAlt x_Pat stub_rhs
+    to_eqn   = mkHsCaseAlt x_Pat stub_rhs
+    binds = unitBag (mkRdrFunBind (L loc' from01_RDR) [from_eqn])
+            `unionBags`
+            unitBag (mkRdrFunBind (L loc' to01_RDR) [to_eqn])
 
 -- Bindings for the Generic instance
 mkBindsRep :: DynFlags -> GenericKind -> SrcSpan -> DerivInstTys -> (LHsBinds GhcPs, [LSig GhcPs])

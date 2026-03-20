@@ -2478,6 +2478,7 @@ fFlagsDeps = [
   flagSpec "specialise-incoherents"           Opt_SpecialiseIncoherents,
   flagSpec "inline-generics"                  Opt_InlineGenerics,
   flagSpec "inline-generics-aggressively"     Opt_InlineGenericsAggressively,
+  flagSpec "ds-generic-cheap"                  Opt_DsGenericCheap,
   flagSpec "static-argument-transformation"   Opt_StaticArgumentTransformation,
   flagSpec "strictness"                       Opt_Strictness,
   flagSpec "use-rpaths"                       Opt_RPath,
