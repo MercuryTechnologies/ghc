@@ -3,6 +3,7 @@ name: Build and Test GHC
 on:
   pull_request:
     branches:
+      - ghc-9.10.3-base
       - mercury-ghc9103
       - mercury-ghc9103-no-mega
 
