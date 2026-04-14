@@ -10,7 +10,7 @@ on:
 jobs:
   build-and-test:
     name: Build GHC and run testsuite
-    runs-on: ubuntu-latest-16-core-64-gb-memory
+    runs-on: ubuntu-latest-16-cores
     timeout-minutes: 120
 
     steps:
