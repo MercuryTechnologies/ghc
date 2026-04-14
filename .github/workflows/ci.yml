@@ -20,7 +20,7 @@ jobs:
           submodules: recursive
 
       - name: Install Nix
-        uses: samueldr/lix-gha-installer-action@main
+        uses: samueldr/lix-gha-installer-action@latest
 
       - name: Cache Nix store
         uses: actions/cache@v4
