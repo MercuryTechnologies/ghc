@@ -416,7 +416,7 @@ handleSeqHValueStatus interp unit_env eval_status =
       let bp = evalBreakpointToId (ue_hpt unit_env) <$> maybe_break
           sdocBpLoc = brackets . ppr . getSeqBpSpan
       putStrLn ("*** Ignoring breakpoint " ++
-            (showSDocUnsafe $ sbp))
+            (showSDocUnsafe $ sdocBpLoc bp))
       -- resume the seq (:force) processing in the iserv process
       withForeignRef resume_ctxt_fhv $ \hval -> do
         status <- interpCmd interp (ResumeSeq hval)
