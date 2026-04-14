@@ -396,31 +396,33 @@ schemeER_wrk d p (StgTick (Breakpoint tick_ty tick_no fvs tick_mod) rhs) = do
     -- if we're not generating ModBreaks for this module for some reason, we
     -- can't store breakpoint occurrence information.
     Nothing -> pure code
-    Just current_mod_breaks -> case break_info hsc_env tick_mod current_mod mb_current_mod_breaks of
-      Nothing -> pure code
-      Just ModBreaks {modBreaks_flags = breaks, modBreaks_module = tick_mod_ptr, modBreaks_ccs = cc_arr} -> do
-        platform <- profilePlatform <$> getProfile
-        let idOffSets = getVarOffSets platform d p fvs
-            ty_vars   = tyCoVarsOfTypesWellScoped (tick_ty:map idType fvs)
-            toWord :: Maybe (Id, WordOff) -> Maybe (Id, Word)
-            toWord = fmap (\(i, wo) -> (i, fromIntegral wo))
-            breakInfo  = dehydrateCgBreakInfo ty_vars (map toWord idOffSets) tick_ty
+    Just current_mod_breaks -> do
+      mb_break <- break_info hsc_env tick_mod current_mod mb_current_mod_breaks
+      case mb_break of
+        Nothing -> pure code
+        Just ModBreaks {modBreaks_flags = breaks, modBreaks_module = tick_mod_ptr, modBreaks_ccs = cc_arr} -> do
+          platform <- profilePlatform <$> getProfile
+          let idOffSets = getVarOffSets platform d p fvs
+              ty_vars   = tyCoVarsOfTypesWellScoped (tick_ty:map idType fvs)
+              toWord :: Maybe (Id, WordOff) -> Maybe (Id, Word)
+              toWord = fmap (\(i, wo) -> (i, fromIntegral wo))
+              breakInfo  = dehydrateCgBreakInfo ty_vars (map toWord idOffSets) tick_ty
 
-        let info_mod_ptr = modBreaks_module current_mod_breaks
-        infox <- newBreakInfo breakInfo
+          let info_mod_ptr = modBreaks_module current_mod_breaks
+          infox <- newBreakInfo breakInfo
 
-        let cc | Just interp <- hsc_interp hsc_env
-              , interpreterProfiled interp
-              = cc_arr ! tick_no
-              | otherwise = toRemotePtr nullPtr
+          let cc | Just interp <- hsc_interp hsc_env
+                , interpreterProfiled interp
+                = cc_arr ! tick_no
+                | otherwise = toRemotePtr nullPtr
 
-        let -- cast that checks that round-tripping through Word16 doesn't change the value
-            toW16 x = let r = fromIntegral x :: Word16
-                      in if fromIntegral r == x
-                        then r
-                        else pprPanic "schemeER_wrk: breakpoint tick/info index too large!" (ppr x)
-            breakInstr = BRK_FUN breaks tick_mod_ptr (toW16 tick_no) info_mod_ptr (toW16 infox) cc
-        return $ breakInstr `consOL` code
+          let -- cast that checks that round-tripping through Word16 doesn't change the value
+              toW16 x = let r = fromIntegral x :: Word16
+                        in if fromIntegral r == x
+                          then r
+                          else pprPanic "schemeER_wrk: breakpoint tick/info index too large!" (ppr x)
+              breakInstr = BRK_FUN breaks tick_mod_ptr (toW16 tick_no) info_mod_ptr (toW16 infox) cc
+          return $ breakInstr `consOL` code
 schemeER_wrk d p rhs = schemeE d 0 p rhs
 
 -- | Determine the GHCi-allocated 'BreakArray' and module pointer for the module
