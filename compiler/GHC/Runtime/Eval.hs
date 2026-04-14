@@ -335,6 +335,7 @@ handleRunStatus step expr bindings final_ids status history0
        let dflags = hsc_dflags hsc_env
        ibi <- liftIO $ evalBreakpointToId (hsc_HPT hsc_env) eval_break
        hmi <- liftIO $ expectJust "handleRunStatus" <$> lookupHpt (hsc_HPT hsc_env) (moduleName (ibi_tick_mod ibi))
+       let
            breaks = getModBreaks hmi
 
        b <- liftIO $
