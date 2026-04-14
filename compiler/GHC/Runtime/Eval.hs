@@ -333,8 +333,8 @@ handleRunStatus step expr bindings final_ids status history0
        hsc_env <- getSession
        let interp = hscInterp hsc_env
        let dflags = hsc_dflags hsc_env
-       let ibi = evalBreakpointToId (hsc_HPT hsc_env) eval_break
-       let hmi = expectJust "handleRunStatus" $ lookupHpt (hsc_HPT hsc_env) (moduleName (ibi_tick_mod ibi))
+       ibi <- liftIO $ evalBreakpointToId (hsc_HPT hsc_env) eval_break
+       hmi <- liftIO $ expectJust "handleRunStatus" <$> lookupHpt (hsc_HPT hsc_env) (moduleName (ibi_tick_mod ibi))
            breaks = getModBreaks hmi
 
        b <- liftIO $
@@ -363,7 +363,7 @@ handleRunStatus step expr bindings final_ids status history0
          let interp = hscInterp hsc_env
          resume_ctxt_fhv <- liftIO $ mkFinalizedHValue interp resume_ctxt
          apStack_fhv <- liftIO $ mkFinalizedHValue interp apStack_ref
-         let ibi = evalBreakpointToId (hsc_HPT hsc_env) <$> maybe_break
+         ibi <- liftIO $ mapM (evalBreakpointToId (hsc_HPT hsc_env)) maybe_break
          (hsc_env1, names, span, decl) <- liftIO $
            bindLocalsAtBreakpoint hsc_env apStack_fhv ibi
          let
