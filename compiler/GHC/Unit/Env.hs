@@ -46,6 +46,7 @@ module GHC.Unit.Env
     -- * Unit Env helper functions
     , ue_currentHomeUnitEnv
     , ue_hpt
+    , unitEnv_hpts
     , ue_setActiveUnit
     , ue_currentUnit
     , ue_findHomeUnitEnv
@@ -132,6 +133,7 @@ import GHC.Types.Annotations
 import GHC.Types.CompleteMatch
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
+import qualified Data.Map as Map
 
 --------------------------------------------------------------------------------
 -- The hard queries
@@ -469,3 +471,7 @@ in order to allow users to offset their own relative paths.
 ue_units :: HasDebugCallStack => UnitEnv -> UnitState
 ue_units = ue_homeUnitState
 
+
+-- | Get all 'HomePackageTable's from a 'HomeUnitGraph'.
+unitEnv_hpts :: HUG.HomeUnitGraph -> [HomePackageTable]
+unitEnv_hpts hug = map HUG.homeUnitEnv_hpt (Map.elems (HUG.unitEnv_graph hug))

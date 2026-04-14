@@ -55,7 +55,7 @@ import qualified Data.List.NonEmpty as NE
 import Data.Function ( on )
 
 import qualified GHC.LanguageExtensions  as LangExt
-import GHC.Unit.Env (unitEnv_hpts)
+import qualified GHC.Unit.Home.Graph as HUG
 import Data.List (sortOn)
 
 {- Note [The type family instance consistency story]
@@ -315,17 +315,9 @@ checkFamInstConsistency directlyImpMods
              -- See Note [Order of type family consistency checks]
              ; init_consistent_set = reverse (sortOn (length . modConsistent) directlyImpMods)
 
-             ; hmiModule     = mi_module . hm_iface
-             ; hmiFamInstEnv = extendFamInstEnvList emptyFamInstEnv
-                               . md_fam_insts . hm_details
-             ; hpt_fam_insts = mkModuleEnv [ (hmiModule hmi, hmiFamInstEnv hmi)
-                                           | hpt <- unitEnv_hpts hug
-                                           , hmi <- eltsHpt hpt ]
-
-             -- Sorting the list by size has the effect of performing a topological sort.
-             -- See Note [Order of type family consistency checks]
              }
 
+       ; hpt_fam_insts <- liftIO $ HUG.allFamInstances hug
        ; traceTc "init_consistent_set" (ppr debug_consistent_set)
        ; checkMany hpt_fam_insts modConsistent init_consistent_set
        }
