@@ -86,14 +86,12 @@ module GHC (
         ModuleInfo,
         getModuleInfo,
         modInfoTyThings,
-        modInfoTopLevelScope,
         modInfoExports,
         modInfoExportsWithSelectors,
         modInfoInstances,
         modInfoIsExportedName,
         modInfoLookupName,
         modInfoIface,
-        modInfoRdrEnv,
         modInfoSafe,
         lookupGlobalName,
         findGlobalAnns,
@@ -344,7 +342,7 @@ import GHC.Builtin.Types.Prim ( alphaTyVars )
 import GHC.Data.StringBuffer
 import GHC.Data.FastString
 import qualified GHC.LanguageExtensions as LangExt
-import GHC.Rename.Names (renamePkgQual, renameRawPkgQual, gresFromAvails)
+import GHC.Rename.Names (gresFromAvails, hscRenamePkgQual, hscRenameRawPkgQual)
 
 import GHC.Tc.Utils.Monad    ( finalSafeMode, fixSafeInstances, initIfaceTcRn )
 import GHC.Tc.Types
@@ -628,7 +626,8 @@ setUnitDynFlagsNoCheck uid dflags1 = do
 
   let old_hue = ue_findHomeUnitEnv uid (hsc_unit_env hsc_env)
   let cached_unit_dbs = homeUnitEnv_unit_dbs old_hue
-  (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags1 cached_unit_dbs (hsc_all_home_unit_ids hsc_env)
+  index <- hscUnitIndex <$> getSession
+  (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags1 index cached_unit_dbs (hsc_all_home_unit_ids hsc_env)
   updated_dflags <- liftIO $ updatePlatformConstants dflags1 mconstants
 
   let upd hue =
@@ -763,6 +762,7 @@ setProgramDynFlags_ invalidate_needed dflags = do
     then do
         -- additionally, set checked dflags so we don't lose fixes
         old_unit_env <- ue_setFlags dflags0 . hsc_unit_env <$> getSession
+        ue_index <- hscUnitIndex <$> getSession
 
         home_unit_graph <- forM (ue_home_unit_graph old_unit_env) $ \homeUnitEnv -> do
           let cached_unit_dbs = homeUnitEnv_unit_dbs homeUnitEnv
@@ -770,7 +770,7 @@ setProgramDynFlags_ invalidate_needed dflags = do
               old_hpt = homeUnitEnv_hpt homeUnitEnv
               home_units = unitEnv_keys (ue_home_unit_graph old_unit_env)
 
-          (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags cached_unit_dbs home_units
+          (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags ue_index cached_unit_dbs home_units
 
           updated_dflags <- liftIO $ updatePlatformConstants dflags0 mconstants
           pure HomeUnitEnv
@@ -788,6 +788,7 @@ setProgramDynFlags_ invalidate_needed dflags = do
               , ue_home_unit_graph = home_unit_graph
               , ue_current_unit    = ue_currentUnit old_unit_env
               , ue_eps             = ue_eps old_unit_env
+              , ue_index
               }
         modifySession $ \h -> hscSetFlags dflags1 h{ hsc_unit_env = unit_env }
     else modifySession (hscSetFlags dflags0)
@@ -1226,9 +1227,6 @@ typecheckModule pmod = do
    details <- makeSimpleDetails lcl_logger tc_gbl_env
    safe    <- finalSafeMode lcl_dflags tc_gbl_env
 
-   let !rdr_env = forceGlobalRdrEnv $ tcg_rdr_env tc_gbl_env
-   -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
-
    return $
      TypecheckedModule {
        tm_internals_          = (tc_gbl_env, details),
@@ -1239,7 +1237,6 @@ typecheckModule pmod = do
          ModuleInfo {
            minf_type_env  = md_types details,
            minf_exports   = md_exports details,
-           minf_rdr_env   = Just rdr_env,
            minf_instances = fixSafeInstances safe $ instEnvElts $ md_insts details,
            minf_iface     = Nothing,
            minf_safe      = safe,
@@ -1386,13 +1383,13 @@ getInsts = withSession $ \hsc_env ->
 
 getNamePprCtx :: GhcMonad m => m NamePprCtx
 getNamePprCtx = withSession $ \hsc_env -> do
-  return $ icNamePprCtx (hsc_unit_env hsc_env) (hsc_IC hsc_env)
+  query <- liftIO $ hscUnitIndexQuery hsc_env
+  return $ icNamePprCtx (hsc_unit_env hsc_env) query (hsc_IC hsc_env)
 
 -- | Container for information about a 'Module'.
 data ModuleInfo = ModuleInfo {
         minf_type_env  :: TypeEnv,
         minf_exports   :: [AvailInfo],
-        minf_rdr_env   :: Maybe IfGlobalRdrEnv, -- Nothing for a compiled/package mod
         minf_instances :: [ClsInst],
         minf_iface     :: Maybe ModIface,
         minf_safe      :: SafeHaskellMode,
@@ -1419,13 +1416,9 @@ getPackageModuleInfo hsc_env mdl
             tys    = [ ty | name <- concatMap availNames avails,
                             Just ty <- [lookupTypeEnv pte name] ]
 
-        let !rdr_env = availsToGlobalRdrEnv hsc_env mdl avails
-        -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
-
         return (Just (ModuleInfo {
                         minf_type_env  = mkTypeEnv tys,
                         minf_exports   = avails,
-                        minf_rdr_env   = Just rdr_env,
                         minf_instances = error "getModuleInfo: instances for package module unimplemented",
                         minf_iface     = Just iface,
                         minf_safe      = getSafeMode $ mi_trust iface,
@@ -1442,7 +1435,7 @@ availsToGlobalRdrEnv hsc_env mod avails
       -- all the specified modules into the global interactive module
     imp_spec = ImpSpec { is_decl = decl, is_item = ImpAll}
     decl = ImpDeclSpec { is_mod = mod, is_as = moduleName mod,
-                         is_qual = False,
+                         is_qual = False, is_isboot = NotBoot, is_pkg_qual = NoPkgQual,
                          is_dloc = srcLocSpan interactiveSrcLoc }
 
 getHomeModuleInfo :: HscEnv -> Module -> IO (Maybe ModuleInfo)
@@ -1455,7 +1448,6 @@ getHomeModuleInfo hsc_env mdl =
       return (Just (ModuleInfo {
                         minf_type_env  = md_types details,
                         minf_exports   = md_exports details,
-                        minf_rdr_env   = mi_globals $ hm_iface hmi,
                          -- NB: already forced. See Note [Forcing GREInfo] in GHC.Types.GREInfo.
                         minf_instances = instEnvElts $ md_insts details,
                         minf_iface     = Just iface,
@@ -1466,12 +1458,6 @@ getHomeModuleInfo hsc_env mdl =
 -- | The list of top-level entities defined in a module
 modInfoTyThings :: ModuleInfo -> [TyThing]
 modInfoTyThings minf = typeEnvElts (minf_type_env minf)
-
-modInfoTopLevelScope :: ModuleInfo -> Maybe [Name]
-modInfoTopLevelScope minf
-  = fmap (map greName . globalRdrEnvElts) (minf_rdr_env minf)
-  -- NB: no need to force this again.
-  -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
 
 modInfoExports :: ModuleInfo -> [Name]
 modInfoExports minf = concatMap availNames $! minf_exports minf
@@ -1489,12 +1475,14 @@ modInfoIsExportedName minf name = elemNameSet name (availsToNameSet (minf_export
 
 mkNamePprCtxForModule ::
   GhcMonad m =>
+  Module     ->
   ModuleInfo ->
-  m (Maybe NamePprCtx) -- XXX: returns a Maybe X
-mkNamePprCtxForModule minf = withSession $ \hsc_env -> do
-  let mk_name_ppr_ctx = mkNamePprCtx ptc (hsc_unit_env hsc_env)
+  m NamePprCtx
+mkNamePprCtxForModule mod minf = withSession $ \hsc_env -> do
+  query <- liftIO $ hscUnitIndexQuery hsc_env
+  let name_ppr_ctx = mkNamePprCtx ptc (hsc_unit_env hsc_env) query (availsToGlobalRdrEnv hsc_env mod (minf_exports minf))
       ptc = initPromotionTickContext (hsc_dflags hsc_env)
-  return (fmap mk_name_ppr_ctx (minf_rdr_env minf))
+  return name_ppr_ctx
 
 modInfoLookupName :: GhcMonad m =>
                      ModuleInfo -> Name
@@ -1506,9 +1494,6 @@ modInfoLookupName minf name = withSession $ \hsc_env -> do
 
 modInfoIface :: ModuleInfo -> Maybe ModIface
 modInfoIface = minf_iface
-
-modInfoRdrEnv :: ModuleInfo -> Maybe IfGlobalRdrEnv
-modInfoRdrEnv = minf_rdr_env
 
 -- | Retrieve module safe haskell mode
 modInfoSafe :: ModuleInfo -> SafeHaskellMode
@@ -1733,10 +1718,10 @@ modNotLoadedError dflags m loc = throwGhcExceptionIO $ CmdLineError $ showSDoc d
    parens (text (expectJust "modNotLoadedError" (ml_hs_file loc)))
 
 renamePkgQualM :: GhcMonad m => ModuleName -> Maybe FastString -> m PkgQual
-renamePkgQualM mn p = withSession $ \hsc_env -> pure (renamePkgQual (hsc_unit_env hsc_env) mn p)
+renamePkgQualM mn p = withSession $ \hsc_env -> hscRenamePkgQual hsc_env mn p
 
 renameRawPkgQualM :: GhcMonad m => ModuleName -> RawPkgQual -> m PkgQual
-renameRawPkgQualM mn p = withSession $ \hsc_env -> pure (renameRawPkgQual (hsc_unit_env hsc_env) mn p)
+renameRawPkgQualM mn p = withSession $ \hsc_env -> hscRenameRawPkgQual hsc_env mn p
 
 -- | Like 'findModule', but differs slightly when the module refers to
 -- a source file, and the file has not been loaded via 'load'.  In
@@ -1760,7 +1745,8 @@ lookupQualifiedModule NoPkgQual mod_name = withSession $ \hsc_env -> do
       let units  = hsc_units hsc_env
       let dflags = hsc_dflags hsc_env
       let fopts  = initFinderOpts dflags
-      res <- findExposedPackageModule fc fopts units mod_name NoPkgQual
+      query <- hscUnitIndexQuery hsc_env
+      res <- findExposedPackageModule fc fopts units query mod_name NoPkgQual
       case res of
         Found _ m -> return m
         err       -> throwOneError $ noModError hsc_env noSrcSpan mod_name err

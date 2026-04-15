@@ -266,9 +266,11 @@ tcRnModuleTcRnM hsc_env mod_sum
         ; when (notNull prel_imports) $ do
             addDiagnostic TcRnImplicitImportOfPrelude
 
+        ; query <- liftIO $ hscUnitIndexQuery hsc_env
+
         ; -- TODO This is a little skeevy; maybe handle a bit more directly
           let { simplifyImport (L _ idecl) =
-                  ( renameRawPkgQual (hsc_unit_env hsc_env) (unLoc $ ideclName idecl) (ideclPkgQual idecl)
+                  ( renameRawPkgQual (hsc_unit_env hsc_env) query (unLoc $ ideclName idecl) (ideclPkgQual idecl)
                   , reLoc $ ideclName idecl)
               }
         ; raw_sig_imports <- liftIO
@@ -373,7 +375,7 @@ tcRnModuleTcRnM hsc_env mod_sum
 
 tcRnImports :: HscEnv -> [(LImportDecl GhcPs, SDoc)] -> TcM TcGblEnv
 tcRnImports hsc_env import_decls
-  = do  { (rn_imports, rdr_env, imports, hpc_info) <- rnImports import_decls ;
+  = do  { (rn_imports, imp_user_spec, rdr_env, imports, hpc_info) <- rnImports import_decls ;
 
         ; this_mod <- getModule
         ; gbl_env <- getGblEnv
@@ -402,6 +404,7 @@ tcRnImports hsc_env import_decls
             gbl {
               tcg_rdr_env      = tcg_rdr_env gbl `plusGlobalRdrEnv` rdr_env,
               tcg_imports      = tcg_imports gbl `plusImportAvails` imports,
+              tcg_import_decls = imp_user_spec,
               tcg_rn_imports   = rn_imports,
               tcg_inst_env     = tcg_inst_env gbl `unionInstEnv` home_insts,
               tcg_fam_inst_env = extendFamInstEnvList (tcg_fam_inst_env gbl)
@@ -2001,11 +2004,13 @@ runTcInteractive hsc_env thing_inside
                                  (loadSrcInterface (text "runTcInteractive") m
                                                    NotBoot mb_pkg)
 
+
        ; !orphs <- fmap (force . concat) . forM (ic_imports icxt) $ \i ->
             case i of                   -- force above: see #15111
                 IIModule n -> getOrphans n NoPkgQual
-                IIDecl i   -> getOrphans (unLoc (ideclName i))
-                                         (renameRawPkgQual (hsc_unit_env hsc_env) (unLoc $ ideclName i) (ideclPkgQual i))
+                IIDecl i -> do
+                  qual <- hscRenameRawPkgQual hsc_env (unLoc $ ideclName i) (ideclPkgQual i)
+                  getOrphans (unLoc (ideclName i)) qual
 
        ; let imports = emptyImportAvails { imp_orphs = orphs }
 

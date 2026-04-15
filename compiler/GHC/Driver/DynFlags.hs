@@ -96,6 +96,7 @@ import GHC.Core.Unfold
 import GHC.Data.Bool
 import GHC.Data.EnumSet (EnumSet)
 import GHC.Data.Maybe
+import GHC.Data.OsPath (OsPath)
 import GHC.Builtin.Names ( mAIN_NAME )
 import GHC.Driver.Backend
 import GHC.Driver.Flags
@@ -329,6 +330,7 @@ data DynFlags = DynFlags {
   depIncludeCppDeps     :: Bool,
   depExcludeMods        :: [ModuleName],
   depSuffixes           :: [String],
+  depJSON               :: !(Maybe FilePath),
 
   --  Package flags
   packageDBFlags        :: [PackageDBFlag],
@@ -649,6 +651,7 @@ defaultDynFlags mySettings =
         depIncludeCppDeps = False,
         depExcludeMods    = [],
         depSuffixes       = [],
+        depJSON           = Nothing,
         -- end of ghc -M values
         ghcVersionFile = Nothing,
         haddockOptions = Nothing,
@@ -946,7 +949,7 @@ setDynamicNow dflags0 =
 data PkgDbRef
   = GlobalPkgDb
   | UserPkgDb
-  | PkgDbPath FilePath
+  | PkgDbPath OsPath
   deriving Eq
 
 -- | Used to differentiate the scope an include needs to apply to.

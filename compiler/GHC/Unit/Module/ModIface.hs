@@ -15,6 +15,8 @@ module GHC.Unit.Module.ModIface
    , IfaceExport
    , WhetherHasOrphans
    , WhetherHasFamInst
+   , IfaceTopEnv (..)
+   , IfaceImport(..)
    , mi_boot
    , mi_fix
    , mi_semantic_module
@@ -39,25 +41,27 @@ import GHC.Iface.Ext.Fields
 import GHC.Unit
 import GHC.Unit.Module.Deps
 import GHC.Unit.Module.Warnings
+import GHC.Unit.Module.WholeCoreBindings (IfaceForeign (..), emptyIfaceForeign)
 
 import GHC.Types.Avail
 import GHC.Types.Fixity
 import GHC.Types.Fixity.Env
 import GHC.Types.HpcInfo
 import GHC.Types.Name
-import GHC.Types.Name.Reader
 import GHC.Types.SafeHaskell
 import GHC.Types.SourceFile
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.FM
 
 import GHC.Data.Maybe
+import qualified GHC.Data.Strict as Strict
 
 import GHC.Utils.Fingerprint
 import GHC.Utils.Binary
 
 import Control.DeepSeq
 import Control.Exception
+import GHC.Types.Name.Reader (IfGlobalRdrEnv)
 
 {- Note [Interface file stages]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -208,8 +212,8 @@ data ModIface_ (phase :: ModIfacePhase)
                 -- combined with mi_decls allows us to restart code generation.
                 -- See Note [Interface Files with Core Definitions] and Note [Interface File with Core: Sharing RHSs]
 
-        mi_globals  :: !(Maybe IfGlobalRdrEnv),
-                -- ^ Binds all the things defined at the top level in
+        mi_top_env  :: !(Maybe IfaceTopEnv),
+                -- ^ Just enough information to reconstruct the top level environment in
                 -- the /original source/ code for this module. which
                 -- is NOT the same as mi_exports, nor mi_decls (which
                 -- may contains declarations for things not actually
@@ -222,6 +226,10 @@ data ModIface_ (phase :: ModIfacePhase)
                 --
                 -- Strictly speaking this field should live in the
                 -- 'HomeModInfo', but that leads to more plumbing.
+
+        mi_foreign :: !IfaceForeign,
+                -- ^ Foreign stubs and files to supplement 'mi_extra_decls_'.
+                -- See Note [Foreign stubs and TH bytecode linking]
 
                 -- Instance declarations and rules
         mi_insts       :: [IfaceClsInst],     -- ^ Sorted class instance
@@ -265,6 +273,16 @@ data ModIface_ (phase :: ModIfacePhase)
         mi_src_hash :: !Fingerprint
                 -- ^ Hash of the .hs source, used for recompilation checking.
      }
+
+-- Enough information to reconstruct the top level environment for a module
+data IfaceTopEnv
+  = IfaceTopEnv
+  { ifaceTopExports :: !IfGlobalRdrEnv -- ^ all top level things in this module, including unexported stuff
+  , ifaceImports :: ![IfaceImport]    -- ^ all the imports in this module
+  }
+
+instance NFData IfaceTopEnv where
+  rnf (IfaceTopEnv a b) = rnf a `seq` rnf b
 
 {-
 Note [Strictness in ModIface]
@@ -358,6 +376,7 @@ instance Binary ModIface where
                  mi_anns      = anns,
                  mi_decls     = decls,
                  mi_extra_decls = extra_decls,
+                 mi_foreign   = foreign_,
                  mi_insts     = insts,
                  mi_fam_insts = fam_insts,
                  mi_rules     = rules,
@@ -402,6 +421,7 @@ instance Binary ModIface where
         lazyPut bh anns
         put_ bh decls
         put_ bh extra_decls
+        put_ bh foreign_
         put_ bh insts
         put_ bh fam_insts
         lazyPut bh rules
@@ -434,6 +454,7 @@ instance Binary ModIface where
         anns        <- {-# SCC "bin_anns" #-} lazyGet bh
         decls       <- {-# SCC "bin_tycldecls" #-} get bh
         extra_decls <- get bh
+        foreign_    <- get bh
         insts       <- {-# SCC "bin_insts" #-} get bh
         fam_insts   <- {-# SCC "bin_fam_insts" #-} get bh
         rules       <- {-# SCC "bin_rules" #-} lazyGet bh
@@ -458,7 +479,8 @@ instance Binary ModIface where
                  mi_warns       = warns,
                  mi_decls       = decls,
                  mi_extra_decls = extra_decls,
-                 mi_globals     = Nothing,
+                 mi_foreign     = foreign_,
+                 mi_top_env     = Nothing,
                  mi_insts       = insts,
                  mi_fam_insts   = fam_insts,
                  mi_rules       = rules,
@@ -508,7 +530,8 @@ emptyPartialModIface mod
                mi_rules       = [],
                mi_decls       = [],
                mi_extra_decls = Nothing,
-               mi_globals     = Nothing,
+               mi_foreign     = emptyIfaceForeign,
+               mi_top_env     = Nothing,
                mi_hpc         = False,
                mi_trust       = noIfaceTrustInfo,
                mi_trust_pkg   = False,
@@ -559,7 +582,7 @@ instance ( NFData (IfaceBackendExts (phase :: ModIfacePhase))
          ) => NFData (ModIface_ phase) where
   rnf (ModIface{ mi_module, mi_sig_of, mi_hsc_src, mi_deps, mi_usages
                , mi_exports, mi_used_th, mi_fixities, mi_warns, mi_anns
-               , mi_decls, mi_extra_decls, mi_globals, mi_insts
+               , mi_decls, mi_extra_decls, mi_foreign, mi_top_env, mi_insts
                , mi_fam_insts, mi_rules, mi_hpc, mi_trust, mi_trust_pkg
                , mi_complete_matches, mi_docs, mi_final_exts
                , mi_ext_fields, mi_src_hash })
@@ -575,7 +598,8 @@ instance ( NFData (IfaceBackendExts (phase :: ModIfacePhase))
     `seq` rnf mi_anns
     `seq` rnf mi_decls
     `seq` rnf mi_extra_decls
-    `seq` rnf mi_globals
+    `seq` rnf mi_foreign
+    `seq` rnf mi_top_env
     `seq` rnf mi_insts
     `seq` rnf mi_fam_insts
     `seq` rnf mi_rules

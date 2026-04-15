@@ -36,6 +36,7 @@ module GHC.Unit.Finder (
     lookupFileCache
   ) where
 
+import GHC.Driver.Env (hsc_mod_graph)
 import GHC.Prelude
 
 import GHC.Platform.Ways
@@ -49,7 +50,6 @@ import GHC.Unit.Home
 import GHC.Unit.State
 import GHC.Unit.Finder.Types
 
-import GHC.Data.Maybe    ( expectJust )
 import qualified GHC.Data.ShortText as ST
 
 import GHC.Utils.Misc
@@ -63,13 +63,16 @@ import GHC.Fingerprint
 import Data.IORef
 import System.Directory
 import System.FilePath
+import Control.Applicative ((<|>))
 import Control.Monad
 import Data.Time
 import qualified Data.Map as M
 import GHC.Driver.Env
-    ( hsc_home_unit_maybe, HscEnv(hsc_FC, hsc_dflags, hsc_unit_env) )
+    ( hsc_home_unit_maybe, HscEnv(hsc_FC, hsc_dflags, hsc_unit_env, hsc_mod_graph), hscUnitIndexQuery )
 import GHC.Driver.Config.Finder
+import GHC.Unit.Module.Graph (mgHomeModuleMap, ModuleNameHomeMap)
 import qualified Data.Set as Set
+import qualified Data.List.NonEmpty as NE
 
 type FileExt = String   -- Filename extension
 type BaseName = String  -- Basename of file
@@ -87,6 +90,20 @@ type BaseName = String  -- Basename of file
 -- -----------------------------------------------------------------------------
 -- The finder's cache
 
+{-
+[Note: Monotonic addToFinderCache]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+addToFinderCache is only used by functions that return the cached value
+if there is one, or by functions that always write an InstalledFound value.
+Without multithreading it is then safe to always directly write the value
+without checking the previously cached value.
+
+However, with multithreading, it is possible that another function has
+written a value into cache between the lookup and the addToFinderCache call.
+in this case we should check to not overwrite an InstalledFound with an
+InstalledNotFound.
+-}
 
 initFinderCache :: IO FinderCache
 initFinderCache = FinderCache <$> newIORef emptyInstalledModuleEnv
@@ -96,32 +113,37 @@ initFinderCache = FinderCache <$> newIORef emptyInstalledModuleEnv
 -- assumed to not move around during a session; also flush the file hash
 -- cache
 flushFinderCaches :: FinderCache -> UnitEnv -> IO ()
-flushFinderCaches (FinderCache ref file_ref) ue = do
-  atomicModifyIORef' ref $ \fm -> (filterInstalledModuleEnv is_ext fm, ())
-  atomicModifyIORef' file_ref $ \_ -> (M.empty, ())
+flushFinderCaches (FinderCache mod_cache file_cache) ue = do
+  atomicModifyIORef' mod_cache $ \fm -> (filterInstalledModuleEnv is_ext fm, ())
+  atomicModifyIORef' file_cache $ \_ -> (M.empty, ())
  where
   is_ext mod _ = not (isUnitEnvInstalledModule ue mod)
 
 addToFinderCache :: FinderCache -> InstalledModule -> InstalledFindResult -> IO ()
-addToFinderCache (FinderCache ref _) key val =
-  atomicModifyIORef' ref $ \c -> (extendInstalledModuleEnv c key val, ())
+addToFinderCache (FinderCache mod_cache _) key val =
+  atomicModifyIORef' mod_cache $ \c ->
+    case (lookupInstalledModuleEnv c key, val) of
+      -- Don't overwrite an InstalledFound with an InstalledNotFound
+      -- See [Note Monotonic addToFinderCache]
+      (Just InstalledFound{}, InstalledNotFound{}) -> (c, ())
+      _ -> (extendInstalledModuleEnv c key val, ())
+
+lookupFinderCache :: FinderCache -> InstalledModule -> IO (Maybe InstalledFindResult)
+lookupFinderCache (FinderCache mod_cache _) key = do
+   c <- readIORef mod_cache
+   return $! lookupInstalledModuleEnv c key
 
 removeFromFinderCache :: FinderCache -> InstalledModule -> IO ()
 removeFromFinderCache (FinderCache ref _) key =
   atomicModifyIORef' ref $ \c -> (delInstalledModuleEnv c key, ())
 
-lookupFinderCache :: FinderCache -> InstalledModule -> IO (Maybe InstalledFindResult)
-lookupFinderCache (FinderCache ref _) key = do
-   c <- readIORef ref
-   return $! lookupInstalledModuleEnv c key
-
 lookupFileCache :: FinderCache -> FilePath -> IO Fingerprint
-lookupFileCache (FinderCache _ ref) key = do
-   c <- readIORef ref
+lookupFileCache (FinderCache _ file_cache) key = do
+   c <- readIORef file_cache
    case M.lookup key c of
      Nothing -> do
        hash <- getFileHash key
-       atomicModifyIORef' ref $ \c -> (M.insert key hash c, ())
+       atomicModifyIORef' file_cache $ \c -> (M.insert key hash c, ())
        return hash
      Just fp -> return fp
 
@@ -142,28 +164,36 @@ findImportedModule hsc_env mod pkg_qual =
       dflags    = hsc_dflags hsc_env
       fopts     = initFinderOpts dflags
   in do
-    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) mhome_unit mod pkg_qual
+    let home_module_map = mgHomeModuleMap (hsc_mod_graph hsc_env)
+    query <- hscUnitIndexQuery hsc_env
+    findImportedModuleNoHsc fc fopts (hsc_unit_env hsc_env) query home_module_map mhome_unit mod pkg_qual
 
 findImportedModuleNoHsc
   :: FinderCache
   -> FinderOpts
   -> UnitEnv
+  -> UnitIndexQuery
+  -> ModuleNameHomeMap
   -> Maybe HomeUnit
   -> ModuleName
   -> PkgQual
   -> IO FindResult
-findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
+findImportedModuleNoHsc fc fopts ue query home_module_map mhome_unit mod_name mb_pkg =
   case mb_pkg of
     NoPkgQual  -> unqual_import
     ThisPkg uid | (homeUnitId <$> mhome_unit) == Just uid -> home_import
-                | Just os <- lookup uid other_fopts -> home_pkg_import (uid, os)
+                | Just os <- M.lookup uid other_fopts_map -> home_pkg_import (uid, os)
                 | otherwise -> pprPanic "findImportModule" (ppr mod_name $$ ppr mb_pkg $$ ppr (homeUnitId <$> mhome_unit) $$ ppr uid $$ ppr (map fst all_opts))
     OtherPkg _ -> pkg_import
   where
+    (complete_units, module_name_map) = home_module_map
+    module_home_units = M.findWithDefault Set.empty mod_name module_name_map
+    current_unit_id = homeUnitId <$> mhome_unit
     all_opts = case mhome_unit of
-                Nothing -> other_fopts
-                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts
+                Nothing -> other_fopts_list
+                Just home_unit -> (homeUnitId home_unit, fopts) : other_fopts_list
 
+    other_fopts_map = M.fromList other_fopts_list
 
     home_import = case mhome_unit of
                    Just home_unit -> findHomeModule fc fopts home_unit mod_name
@@ -174,7 +204,7 @@ findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
       -- If the module is reexported, then look for it as if it was from the perspective
       -- of that package which reexports it.
       | mod_name `Set.member` finder_reexportedModules opts =
-        findImportedModuleNoHsc fc opts ue (Just $ DefiniteHomeUnit uid Nothing) mod_name NoPkgQual
+        findImportedModuleNoHsc fc opts ue query home_module_map (Just $ DefiniteHomeUnit uid Nothing) mod_name NoPkgQual
       | mod_name `Set.member` finder_hiddenModules opts =
         return (mkHomeHidden uid)
       | otherwise =
@@ -183,32 +213,44 @@ findImportedModuleNoHsc fc fopts ue mhome_unit mod_name mb_pkg =
     -- Do not be smart and change this to `foldr orIfNotFound home_import hs` as
     -- that is not the same!! home_import is first because we need to look within ourselves
     -- first before looking at the packages in order.
-    any_home_import = foldr1 orIfNotFound (home_import: map home_pkg_import other_fopts)
+    any_home_import = foldr1 orIfNotFound (home_import: map home_pkg_import other_fopts_list)
 
-    pkg_import    = findExposedPackageModule fc fopts units  mod_name mb_pkg
+    pkg_import    = findExposedPackageModule fc fopts units query mod_name mb_pkg
 
     unqual_import = any_home_import
                     `orIfNotFound`
-                    findExposedPackageModule fc fopts units mod_name NoPkgQual
+                    findExposedPackageModule fc fopts units query mod_name NoPkgQual
 
     units     = case mhome_unit of
                   Nothing -> ue_units ue
                   Just home_unit -> homeUnitEnv_units $ ue_findHomeUnitEnv (homeUnitId home_unit) ue
-    hpt_deps :: [UnitId]
+    hpt_deps :: Set.Set UnitId
     hpt_deps  = homeUnitDepends units
-    other_fopts  = map (\uid -> (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))) hpt_deps
+    dep_providers = Set.intersection module_home_units hpt_deps
+    known_other_uids =
+      let providers = maybe dep_providers (\u -> Set.delete u dep_providers) current_unit_id
+      in Set.toList providers
+    unknown_units =
+      let candidates = Set.difference hpt_deps complete_units
+          excluded = maybe dep_providers (\u -> Set.insert u dep_providers) current_unit_id
+      in Set.toList (Set.difference candidates excluded)
+    other_home_uids = known_other_uids ++ unknown_units
+    other_fopts_list =
+      [ (uid, initFinderOpts (homeUnitEnv_dflags (ue_findHomeUnitEnv uid ue)))
+      | uid <- other_home_uids
+      ]
 
 -- | Locate a plugin module requested by the user, for a compiler
 -- plugin.  This consults the same set of exposed packages as
 -- 'findImportedModule', unless @-hide-all-plugin-packages@ or
 -- @-plugin-package@ are specified.
-findPluginModule :: FinderCache -> FinderOpts -> UnitState -> Maybe HomeUnit -> ModuleName -> IO FindResult
-findPluginModule fc fopts units (Just home_unit) mod_name =
+findPluginModule :: FinderCache -> FinderOpts -> UnitState -> UnitIndexQuery -> Maybe HomeUnit -> ModuleName -> IO FindResult
+findPluginModule fc fopts units query (Just home_unit) mod_name =
   findHomeModule fc fopts home_unit mod_name
   `orIfNotFound`
-  findExposedPluginPackageModule fc fopts units mod_name
-findPluginModule fc fopts units Nothing mod_name =
-  findExposedPluginPackageModule fc fopts units mod_name
+  findExposedPluginPackageModule fc fopts units query mod_name
+findPluginModule fc fopts units query Nothing mod_name =
+  findExposedPluginPackageModule fc fopts units query mod_name
 
 -- | Locate a specific 'Module'.  The purpose of this function is to
 -- create a 'ModLocation' for a given 'Module', that is to find out
@@ -264,15 +306,15 @@ homeSearchCache fc home_unit mod_name do_this = do
   let mod = mkModule home_unit mod_name
   modLocationCache fc mod do_this
 
-findExposedPackageModule :: FinderCache -> FinderOpts -> UnitState -> ModuleName -> PkgQual -> IO FindResult
-findExposedPackageModule fc fopts units mod_name mb_pkg =
+findExposedPackageModule :: FinderCache -> FinderOpts -> UnitState -> UnitIndexQuery -> ModuleName -> PkgQual -> IO FindResult
+findExposedPackageModule fc fopts units query mod_name mb_pkg =
   findLookupResult fc fopts
-    $ lookupModuleWithSuggestions units mod_name mb_pkg
+    $ lookupModuleWithSuggestions units query mod_name mb_pkg
 
-findExposedPluginPackageModule :: FinderCache -> FinderOpts -> UnitState -> ModuleName -> IO FindResult
-findExposedPluginPackageModule fc fopts units mod_name =
+findExposedPluginPackageModule :: FinderCache -> FinderOpts -> UnitState -> UnitIndexQuery -> ModuleName -> IO FindResult
+findExposedPluginPackageModule fc fopts units query mod_name =
   findLookupResult fc fopts
-    $ lookupPluginModuleWithSuggestions units mod_name NoPkgQual
+    $ lookupPluginModuleWithSuggestions units query mod_name NoPkgQual
 
 findLookupResult :: FinderCache -> FinderOpts -> LookupResult -> IO FindResult
 findLookupResult fc fopts r = case r of
@@ -722,30 +764,30 @@ mkHiePath fopts basename mod_basename = hie_basename <.> hiesuf
 -- We don't have to store these in ModLocations, because they can be derived
 -- from other available information, and they're only rarely needed.
 
+-- | Compute the file name of a header file for foreign stubs, using either the
+-- directory explicitly specified in the command line option @-stubdir@, or the
+-- directory of the module's source file.
+--
+-- When compiling bytecode from interface Core bindings, @ModLocation@ does not
+-- contain a source file path, so the header isn't written.
+-- This doesn't have an impact, since we cannot support headers importing
+-- Haskell symbols defined in bytecode for TH whatsoever at the moment.
 mkStubPaths
   :: FinderOpts
   -> ModuleName
   -> ModLocation
-  -> FilePath
+  -> Maybe FilePath
+mkStubPaths fopts mod location = do
+  stub_basename <- in_stub_dir <|> src_basename
+  pure (stub_basename `mappend` "_stub" <.> "h")
+  where
+    in_stub_dir = (</> mod_basename) <$> (finder_stubDir fopts)
 
-mkStubPaths fopts mod location
-  = let
-        stubdir = finder_stubDir fopts
-
-        mod_basename = moduleNameSlashes mod
-        src_basename = dropExtension $ expectJust "mkStubPaths"
-                                                  (ml_hs_file location)
-
-        stub_basename0
-            | Just dir <- stubdir = dir </> mod_basename
-            | otherwise           = src_basename
-
-        stub_basename = stub_basename0 ++ "_stub"
-     in
-        stub_basename <.> "h"
+    mod_basename = moduleNameSlashes mod
+    src_basename = dropExtension <$> ml_hs_file location
 
 -- -----------------------------------------------------------------------------
--- findLinkable isn't related to the other stuff in here,
+-- findObjectLinkable isn't related to the other stuff in here,
 -- but there's no other obvious place for it
 
 findObjectLinkableMaybe :: Module -> ModLocation -> IO (Maybe Linkable)
@@ -759,7 +801,8 @@ findObjectLinkableMaybe mod locn
 -- Make an object linkable when we know the object file exists, and we know
 -- its modification time.
 findObjectLinkable :: Module -> FilePath -> UTCTime -> IO Linkable
-findObjectLinkable mod obj_fn obj_time = return (LM obj_time mod [DotO obj_fn])
+findObjectLinkable mod obj_fn obj_time =
+  pure (Linkable obj_time mod (NE.singleton (DotO obj_fn ModuleObject)))
   -- We used to look for _stub.o files here, but that was a bug (#706)
   -- Now GHC merges the stub.o into the main .o (#3687)
 

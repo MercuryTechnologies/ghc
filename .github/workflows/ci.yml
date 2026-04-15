@@ -1,0 +1,96 @@
+name: Build and Test GHC
+
+on:
+  pull_request:
+    branches:
+      - ghc-9.10.3-base
+      - mercury-ghc9103
+      - mercury-ghc9103-no-mega
+
+jobs:
+  build-and-test:
+    name: Build GHC and run testsuite
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      - name: Install Nix
+        uses: samueldr/lix-gha-installer-action@latest
+
+      - name: Cache Nix store
+        uses: actions/cache@v4
+        with:
+          path: |
+            /nix/store
+            ~/.cache/nix
+          key: ghc-nix-${{ hashFiles('shell.nix') }}-${{ github.sha }}
+          restore-keys: |
+            ghc-nix-${{ hashFiles('shell.nix') }}-
+            ghc-nix-
+
+      - name: Write shell.nix
+        run: |
+          cat > shell.nix << 'EOF'
+          let
+            pkgs = import (builtins.fetchTarball "https://github.com/NixOS/nixpkgs/archive/c5296fdd05cfa2c187990dd909864da9658df755.tar.gz") {};
+          in pkgs.mkShell {
+            buildInputs = [
+              pkgs.haskell.compiler.ghc967
+              pkgs.haskell.packages.ghc967.alex
+              pkgs.haskell.packages.ghc967.happy_1_20_1_1
+              pkgs.autoconf
+              pkgs.automake
+              pkgs.m4
+              pkgs.perl
+              pkgs.gmp.dev
+              pkgs.ncurses.dev
+              pkgs.numactl
+              pkgs.libffi.dev
+              pkgs.pkg-config
+              pkgs.python3
+              pkgs.gnumake
+              pkgs.gcc
+              pkgs.binutils
+              pkgs.cabal-install
+              pkgs.xorg.lndir
+              pkgs.gmp
+              pkgs.numactl.out
+              pkgs.libffi
+            ];
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.gmp
+              pkgs.libffi
+            ];
+          }
+          EOF
+
+      - name: Boot and configure
+        run: |
+          nix-shell shell.nix --run "python3 boot && ./configure"
+
+      - name: Build GHC
+        run: |
+          nix-shell shell.nix --run "cabal update && hadrian/build -j --flavour=release+split_sections"
+
+      - name: Run testsuite
+        run: |
+          nix-shell shell.nix --run "hadrian/build -j --flavour=release+split_sections test"
+
+      - name: Check for unexpected failures
+        if: always()
+        run: |
+          if [ -f testsuite_summary.txt ]; then
+            cat testsuite_summary.txt
+            if grep -q 'unexpected failures' testsuite_summary.txt; then
+              count=$(grep 'unexpected failures' testsuite_summary.txt | awk '{print $1}')
+              if [ "$count" != "0" ]; then
+                echo "::error::$count unexpected test failures"
+                exit 1
+              fi
+            fi
+          fi

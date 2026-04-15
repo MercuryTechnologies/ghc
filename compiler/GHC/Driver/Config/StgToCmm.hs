@@ -38,7 +38,6 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
   -- flags
   , stgToCmmLoopification = gopt Opt_Loopification         dflags
   , stgToCmmAlignCheck    = gopt Opt_AlignmentSanitisation dflags
-  , stgToCmmOptHpc        = gopt Opt_Hpc                   dflags
   , stgToCmmFastPAPCalls  = gopt Opt_FastPAPCalls          dflags
   , stgToCmmSCCProfiling  = sccProfilingEnabled            dflags
   , stgToCmmEagerBlackHole = gopt Opt_EagerBlackHoling     dflags
@@ -53,6 +52,7 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
   , stgToCmmExtDynRefs    = gopt Opt_ExternalDynamicRefs   dflags
   , stgToCmmDoBoundsCheck = gopt Opt_DoBoundsChecking      dflags
   , stgToCmmDoTagCheck    = gopt Opt_DoTagInferenceChecks  dflags
+  , stgToCmmObjectDeterminism = gopt Opt_ObjectDeterminism dflags
   -- backend flags
   , stgToCmmAllowBigArith             = not ncg || platformArch platform == ArchWasm32 || platformArch platform == ArchX86
   , stgToCmmAllowBigQuot              = not ncg || platformArch platform == ArchWasm32

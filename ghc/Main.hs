@@ -291,6 +291,10 @@ main' postLoadMode units dflags0 args flagWarnings = do
                                                     (hsc_units  hsc_env)
                                                     (hsc_NC     hsc_env)
                                                     f
+       ShowInterfaceAbiHash f -> liftIO $ showIfaceAbiHash logger
+                                                           (hsc_dflags hsc_env)
+                                                           (hsc_NC     hsc_env)
+                                                           f
        DoMake                 -> doMake units srcs
        DoMkDependHS           -> doMkDependHS (map fst srcs)
        StopBefore p           -> liftIO (oneShot hsc_env p srcs)
@@ -481,6 +485,8 @@ isShowGhciUsageMode _ = False
 
 data PostLoadMode
   = ShowInterface FilePath  -- ghc --show-iface
+  | ShowInterfaceAbiHash FilePath
+                            -- ghc --show-iface-abi-hash
   | DoMkDependHS            -- ghc -M
   | StopBefore StopPhase    -- ghc -E | -C | -S
                             -- StopBefore StopLn is the default
@@ -504,6 +510,9 @@ showUnitsMode = mkPostLoadMode ShowPackages
 
 showInterfaceMode :: FilePath -> Mode
 showInterfaceMode fp = mkPostLoadMode (ShowInterface fp)
+
+showInterfaceAbiHashMode :: FilePath -> Mode
+showInterfaceAbiHashMode fp = mkPostLoadMode (ShowInterfaceAbiHash fp)
 
 stopBeforeMode :: StopPhase -> Mode
 stopBeforeMode phase = mkPostLoadMode (StopBefore phase)
@@ -638,6 +647,9 @@ mode_flags =
       ------- interfaces ----------------------------------------------------
   [ defFlag "-show-iface"  (HasArg (\f -> setMode (showInterfaceMode f)
                                                "--show-iface"))
+
+  , defFlag "-show-iface-abi-hash" (HasArg (\f -> setMode (showInterfaceAbiHashMode f)
+                                               "--show-iface-abi-hash"))
 
       ------- primary modes ------------------------------------------------
   , defFlag "c"            (PassFlag (\f -> do setMode (stopBeforeMode NoStop) f
@@ -827,12 +839,13 @@ initMulti unitArgsFiles  = do
 
   let (initial_home_graph, mainUnitId) = createUnitEnvFromFlags unitDflags
       home_units = unitEnv_keys initial_home_graph
+      ue_index = hscUnitIndex hsc_env
 
   home_unit_graph <- forM initial_home_graph $ \homeUnitEnv -> do
     let cached_unit_dbs = homeUnitEnv_unit_dbs homeUnitEnv
         hue_flags = homeUnitEnv_dflags homeUnitEnv
         dflags = homeUnitEnv_dflags homeUnitEnv
-    (dbs,unit_state,home_unit,mconstants) <- liftIO $ State.initUnits logger hue_flags cached_unit_dbs home_units
+    (dbs,unit_state,home_unit,mconstants) <- liftIO $ State.initUnits logger hue_flags ue_index cached_unit_dbs home_units
 
     updated_dflags <- liftIO $ updatePlatformConstants dflags mconstants
     pure $ HomeUnitEnv
@@ -847,7 +860,7 @@ initMulti unitArgsFiles  = do
 
   let dflags = homeUnitEnv_dflags $ unitEnv_lookup mainUnitId home_unit_graph
   unitEnv <- assertUnitEnvInvariant <$> (liftIO $ initUnitEnv mainUnitId home_unit_graph (ghcNameVersion dflags) (targetPlatform dflags))
-  let final_hsc_env = hsc_env { hsc_unit_env = unitEnv }
+  let final_hsc_env = hsc_env { hsc_unit_env = unitEnv {ue_index} }
 
   GHC.setSession final_hsc_env
 
@@ -880,7 +893,7 @@ checkUnitCycles :: DynFlags -> UnitEnvGraph HomeUnitEnv -> Ghc ()
 checkUnitCycles dflags graph = processSCCs sccs
   where
     mkNode :: (UnitId, HomeUnitEnv) -> Node UnitId UnitId
-    mkNode (uid, hue) = DigraphNode uid uid (homeUnitDepends (homeUnitEnv_units hue))
+    mkNode (uid, hue) = DigraphNode uid uid (Set.toList (homeUnitDepends (homeUnitEnv_units hue)))
     nodes = map mkNode (unitEnv_elts graph)
 
     sccs = stronglyConnCompFromEdgedVerticesOrd nodes

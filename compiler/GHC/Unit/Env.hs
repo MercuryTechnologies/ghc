@@ -100,6 +100,8 @@ data UnitEnv = UnitEnv
 
     , ue_namever   :: !GhcNameVersion
         -- ^ GHC name/version (used for dynamic library suffix)
+
+    , ue_index :: !UnitIndex
     }
 
 ueEPS :: UnitEnv -> IO ExternalPackageState
@@ -108,12 +110,14 @@ ueEPS = eucEPS . ue_eps
 initUnitEnv :: UnitId -> HomeUnitGraph -> GhcNameVersion -> Platform -> IO UnitEnv
 initUnitEnv cur_unit hug namever platform = do
   eps <- initExternalUnitCache
+  ue_index <- newUnitIndex
   return $ UnitEnv
     { ue_eps             = eps
     , ue_home_unit_graph = hug
     , ue_current_unit    = cur_unit
     , ue_platform        = platform
     , ue_namever         = namever
+    , ue_index
     }
 
 -- | Get home-unit
@@ -138,7 +142,7 @@ ue_transitiveHomeDeps uid unit_env = Set.toList (loop Set.empty [uid])
     loop acc (uid:uids)
       | uid `Set.member` acc = loop acc uids
       | otherwise =
-        let hue = homeUnitDepends (homeUnitEnv_units (ue_findHomeUnitEnv uid unit_env))
+        let hue = Set.toList (homeUnitDepends (homeUnitEnv_units (ue_findHomeUnitEnv uid unit_env)))
         in loop (Set.insert uid acc) (hue ++ uids)
 
 

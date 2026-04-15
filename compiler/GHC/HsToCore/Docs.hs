@@ -148,7 +148,6 @@ mkDocStructure _ _ Nothing rn_decls all_exports def_meths_env =
 -- TODO:
 -- * Maybe remove items that export nothing?
 -- * Combine sequences of DsiExports?
--- * Check the ordering of avails in DsiModExport
 mkDocStructureFromExportList
   :: Module                         -- ^ The current module
   -> ImportAvails
@@ -163,13 +162,17 @@ mkDocStructureFromExportList mdl import_avails export_list =
       (IEGroup _ level doc, _)         -> DsiSectionHeading level (unLoc doc)
       (IEDoc _ doc, _)                 -> DsiDocChunk (unLoc doc)
       (IEDocNamed _ name, _)           -> DsiNamedChunkRef name
-      (_, avails)                      -> DsiExports (nubAvails avails)
+      (IEThingWith{}, avails)          ->
+        DsiExports $
+          {- For explicit export lists, use the explicit order. It is deterministic by construction -}
+          DefinitelyDeterministicAvails (nubAvails avails)
+      (_, avails)                      -> DsiExports (sortAvails (nubAvails avails))
 
     moduleExport :: ModuleName -- Alias
                  -> Avails
                  -> DocStructureItem
     moduleExport alias avails =
-        DsiModExport (nubSortNE orig_names) (nubAvails avails)
+        DsiModExport (nubSortNE orig_names) (sortAvails (nubAvails avails))
       where
         orig_names = M.findWithDefault aliasErr alias aliasMap
         aliasErr = error $ "mkDocStructureFromExportList: "
@@ -205,10 +208,10 @@ mkDocStructureFromDecls env all_exports decls =
     avails :: [Located DocStructureItem]
     avails = flip fmap all_exports $ \avail ->
       case M.lookup (availName avail) name_locs of
-        Just loc -> L loc (DsiExports [avail])
+        Just loc -> L loc (DsiExports (sortAvails [avail]))
         -- FIXME: This is just a workaround that we use when handling e.g.
         -- associated data families like in the html-test Instances.hs.
-        Nothing -> noLoc (DsiExports [])
+        Nothing -> noLoc (DsiExports (sortAvails []))
 
         -- This causes the associated data family to be incorrectly documented
         -- separately from its class:

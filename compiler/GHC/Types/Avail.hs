@@ -1,5 +1,7 @@
 
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE PatternSynonyms #-}
 --
 -- (c) The University of Glasgow
 --
@@ -19,6 +21,8 @@ module GHC.Types.Avail (
     filterAvail,
     filterAvails,
     nubAvails,
+    sortAvails,
+    DetOrdAvails(DetOrdAvails, DefinitelyDeterministicAvails)
   ) where
 
 import GHC.Prelude
@@ -36,7 +40,7 @@ import GHC.Utils.Constants (debugIsOn)
 import Control.DeepSeq
 import Data.Data ( Data )
 import Data.Functor.Classes ( liftCompare )
-import Data.List ( find )
+import Data.List ( find, sortBy )
 import qualified Data.Semigroup as S
 
 -- -----------------------------------------------------------------------------
@@ -63,6 +67,20 @@ data AvailInfo
 
 -- | A collection of 'AvailInfo' - several things that are \"available\"
 type Avails = [AvailInfo]
+
+-- | Occurrences of Avails in interface files must be deterministically ordered
+-- to guarantee interface file determinism.
+--
+-- We guarantee a deterministic order by either using the order explicitly
+-- given by the user (e.g. in an explicit constructor export list) or instead
+-- by sorting the avails with 'sortAvails'.
+newtype DetOrdAvails = DefinitelyDeterministicAvails Avails
+  deriving newtype (Binary, Outputable, NFData)
+
+-- | It's always safe to match on 'DetOrdAvails'
+pattern DetOrdAvails :: Avails -> DetOrdAvails
+pattern DetOrdAvails x <- DefinitelyDeterministicAvails x
+{-# COMPLETE DetOrdAvails #-}
 
 {- Note [Representing pattern synonym fields in AvailInfo]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -130,6 +148,20 @@ availSubordinateNames (Avail {}) = []
 availSubordinateNames avail@(AvailTC _ ns)
   | availExportsDecl avail = tail ns
   | otherwise              = ns
+
+-- | Sort 'Avails'/'AvailInfo's
+sortAvails :: Avails -> DetOrdAvails
+sortAvails = DefinitelyDeterministicAvails . sortBy stableAvailCmp . map sort_subs
+  where
+    sort_subs :: AvailInfo -> AvailInfo
+    sort_subs (Avail n) = Avail n
+    sort_subs (AvailTC n []) = AvailTC n []
+    sort_subs (AvailTC n (m:ms))
+       | n == m
+       = AvailTC n (m:sortBy stableNameCmp ms)
+       | otherwise
+       = AvailTC n (sortBy stableNameCmp (m:ms))
+       -- Maintain the AvailTC Invariant
 
 -- -----------------------------------------------------------------------------
 -- Utility

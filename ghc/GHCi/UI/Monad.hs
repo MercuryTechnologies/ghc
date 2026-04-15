@@ -25,7 +25,7 @@ module GHCi.UI.Monad (
         ActionStats(..), runAndPrintStats, runWithStats, printStats,
 
         printForUserNeverQualify,
-        printForUserModInfo, printForUserGlobalRdrEnv,
+        printForUserGlobalRdrEnv,
         printForUser, printForUserPartWay, prettyLocations,
 
         compileGHCiExpr,
@@ -365,9 +365,6 @@ printForUserNeverQualify doc = do
   dflags <- GHC.getInteractiveDynFlags
   liftIO $ Ppr.printForUser dflags stdout neverQualify AllTheWay doc
 
-printForUserModInfo :: GhcMonad m => GHC.ModuleInfo -> SDoc -> m ()
-printForUserModInfo info = printForUserGlobalRdrEnv (GHC.modInfoRdrEnv info)
-
 printForUserGlobalRdrEnv :: (GhcMonad m, Outputable info)
                          => Maybe (GlobalRdrEnvX info) -> SDoc -> m ()
 printForUserGlobalRdrEnv mb_rdr_env doc = do
@@ -377,10 +374,11 @@ printForUserGlobalRdrEnv mb_rdr_env doc = do
     where
       mkNamePprCtxFromGlobalRdrEnv _ Nothing = GHC.getNamePprCtx
       mkNamePprCtxFromGlobalRdrEnv dflags (Just rdr_env) =
-        withSession $ \ hsc_env ->
+        withSession $ \ hsc_env -> do
+        query <- liftIO $ hscUnitIndexQuery hsc_env
         let unit_env = hsc_unit_env hsc_env
             ptc = initPromotionTickContext dflags
-        in  return $ Ppr.mkNamePprCtx ptc unit_env rdr_env
+        return $ Ppr.mkNamePprCtx ptc unit_env query rdr_env
 
 printForUser :: GhcMonad m => SDoc -> m ()
 printForUser doc = do

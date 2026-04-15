@@ -76,6 +76,7 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Data.Maybe
 import GHC.Data.StringBuffer
 import GHC.Data.FastString
+import qualified GHC.Data.OsPath as OsPath
 import qualified GHC.Data.EnumSet as EnumSet
 import qualified GHC.Data.ShortText as ST
 
@@ -345,8 +346,7 @@ buildUnit session cid insts lunit = do
             linkables = map (expectJust "bkp link" . homeModInfoObject)
                       . filter ((==HsSrcFile) . mi_hsc_src . hm_iface)
                       $ home_mod_infos
-            getOfiles LM{ linkableUnlinked = us } = map nameOfObject (filter isObject us)
-            obj_files = concatMap getOfiles linkables
+            obj_files = concatMap linkableFiles linkables
             state     = hsc_units hsc_env
 
         let compat_fs = unitIdFS cid
@@ -429,15 +429,16 @@ addUnit u = do
     logger <- getLogger
     let dflags0 = hsc_dflags hsc_env
     let old_unit_env = hsc_unit_env hsc_env
+        ue_index = hscUnitIndex hsc_env
     newdbs <- case ue_unit_dbs old_unit_env of
         Nothing  -> panic "addUnit: called too early"
         Just dbs ->
          let newdb = UnitDatabase
-               { unitDatabasePath  = "(in memory " ++ showSDoc dflags0 (ppr (unitId u)) ++ ")"
+               { unitDatabasePath  = OsPath.unsafeEncodeUtf $ "(in memory " ++ showSDoc dflags0 (ppr (unitId u)) ++ ")"
                , unitDatabaseUnits = [u]
                }
          in return (dbs ++ [newdb]) -- added at the end because ordering matters
-    (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags0 (Just newdbs) (hsc_all_home_unit_ids hsc_env)
+    (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags0 ue_index (Just newdbs) (hsc_all_home_unit_ids hsc_env)
 
     -- update platform constants
     dflags <- liftIO $ updatePlatformConstants dflags0 mconstants
@@ -452,6 +453,7 @@ addUnit u = do
                     (homeUnitId home_unit)
                     (mkHomeUnitEnv dflags (ue_hpt old_unit_env) (Just home_unit))
           , ue_eps       = ue_eps old_unit_env
+          , ue_index
           }
     setSession $ hscSetFlags dflags $ hsc_env { hsc_unit_env = unit_env }
 
@@ -796,6 +798,7 @@ summariseRequirement pn mod_name = do
         ms_hie_date = hie_timestamp,
         ms_srcimps = [],
         ms_textual_imps = ((,) NoPkgQual . noLoc) <$> extra_sig_imports,
+        ms_opts = [],
         ms_ghc_prim_import = False,
         ms_parsed_mod = Just (HsParsedModule {
                 hpm_module = L loc (HsModule {
@@ -869,6 +872,8 @@ hsModuleToModSummary home_keys pn hsc_src modname
     hi_timestamp <- liftIO $ modificationTimeIfExists (ml_hi_file location)
     hie_timestamp <- liftIO $ modificationTimeIfExists (ml_hie_file location)
 
+    query <- liftIO $ hscUnitIndexQuery hsc_env
+
     -- Also copied from 'getImports'
     let (src_idecls, ord_idecls) = partition ((== IsBoot) . ideclSource . unLoc) imps
 
@@ -881,7 +886,7 @@ hsModuleToModSummary home_keys pn hsc_src modname
         implicit_imports = mkPrelImports modname loc
                                          implicit_prelude imps
 
-        rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env) modname
+        rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env) query modname
         convImport (L _ i) = (rn_pkg_qual (ideclPkgQual i), reLoc $ ideclName i)
 
     extra_sig_imports <- liftIO $ findExtraSigImports hsc_env hsc_src modname
@@ -911,6 +916,7 @@ hsModuleToModSummary home_keys pn hsc_src modname
                            -- extra imports
                            ++ ((,) NoPkgQual . noLoc <$> extra_sig_imports)
                            ++ ((,) NoPkgQual . noLoc <$> implicit_sigs),
+            ms_opts = [],
             -- This is our hack to get the parse tree to the right spot
             ms_parsed_mod = Just (HsParsedModule {
                     hpm_module = hsmod,

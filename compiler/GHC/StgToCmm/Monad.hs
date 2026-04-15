@@ -76,7 +76,6 @@ import GHC.StgToCmm.Sequel
 import GHC.Cmm.Graph as CmmGraph
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
-import GHC.Cmm.Dataflow.Label
 import GHC.Runtime.Heap.Layout
 import GHC.Unit
 import GHC.Types.Id
@@ -85,6 +84,7 @@ import GHC.Data.OrdList
 import GHC.Types.Basic( ConTagZ )
 import GHC.Types.Unique
 import GHC.Types.Unique.Supply
+import qualified GHC.Types.Unique.DSM as DSM ( MonadGetUnique, getUniqueM )
 import GHC.Data.FastString
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -169,6 +169,9 @@ instance MonadUnique FCode where
   getUniqueM = FCode $ \_ _ st ->
     let (u, us') = takeUniqFromSupply (cgs_uniqs st)
     in (u, st { cgs_uniqs = us' })
+
+instance DSM.MonadGetUnique FCode where
+  getUniqueM = GHC.Types.Unique.Supply.getUniqueM
 
 initC :: IO CgState
 initC  = do { uniqs <- mkSplitUniqSupply 'c'
@@ -281,7 +284,7 @@ data CgState
   = MkCgState {
      cgs_stmts :: CmmAGraph,          -- Current procedure
 
-     cgs_tops  :: OrdList CmmDecl,
+     cgs_tops  :: OrdList DCmmDecl,
         -- Other procedures and data blocks in this compilation unit
         -- Both are ordered only so that we can
         -- reduce forward references, when it's easy to do so
@@ -450,8 +453,8 @@ newUnique = do
         setState $ state { cgs_uniqs = us' }
         return u
 
-newTemp :: MonadUnique m => CmmType -> m LocalReg
-newTemp rep = do { uniq <- getUniqueM
+newTemp :: DSM.MonadGetUnique m => CmmType -> m LocalReg
+newTemp rep = do { uniq <- DSM.getUniqueM
                  ; return (LocalReg uniq rep) }
 
 ------------------
@@ -740,7 +743,7 @@ emit ag
   = do  { state <- getState
         ; setState $ state { cgs_stmts = cgs_stmts state CmmGraph.<*> ag } }
 
-emitDecl :: CmmDecl -> FCode ()
+emitDecl :: DCmmDecl -> FCode ()
 emitDecl decl
   = do  { state <- getState
         ; setState $ state { cgs_tops = cgs_tops state `snocOL` decl } }
@@ -783,16 +786,16 @@ emitProc :: Maybe CmmInfoTable -> CLabel -> [GlobalReg] -> CmmAGraphScoped
 emitProc mb_info lbl live blocks offset do_layout
   = do  { l <- newBlockId
         ; let
-              blks :: CmmGraph
+              blks :: DCmmGraph
               blks = labelAGraph l blocks
 
-              infos | Just info <- mb_info = mapSingleton (g_entry blks) info
-                    | otherwise            = mapEmpty
+              infos | Just info <- mb_info = [((g_entry blks), info)]
+                    | otherwise            = []
 
               sinfo = StackInfo { arg_space = offset
                                 , do_layout = do_layout }
 
-              tinfo = TopInfo { info_tbls = infos
+              tinfo = TopInfo { info_tbls = DWrap infos
                               , stack_info=sinfo}
 
               proc_block = CmmProc tinfo lbl live blks
@@ -800,7 +803,7 @@ emitProc mb_info lbl live blocks offset do_layout
         ; state <- getState
         ; setState $ state { cgs_tops = cgs_tops state `snocOL` proc_block } }
 
-getCmm :: FCode a -> FCode (a, CmmGroup)
+getCmm :: FCode a -> FCode (a, DCmmGroup)
 -- Get all the CmmTops (there should be no stmts)
 -- Return a single Cmm which may be split from other Cmms by
 -- object splitting (at a later stage)
@@ -876,7 +879,7 @@ mkCmmCall f results actuals updfr_off
 -- ----------------------------------------------------------------------------
 -- turn CmmAGraph into CmmGraph, for making a new proc.
 
-aGraphToGraph :: CmmAGraphScoped -> FCode CmmGraph
+aGraphToGraph :: CmmAGraphScoped -> FCode DCmmGraph
 aGraphToGraph stmts
   = do  { l <- newBlockId
         ; return (labelAGraph l stmts) }

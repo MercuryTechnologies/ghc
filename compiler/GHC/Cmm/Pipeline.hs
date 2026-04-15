@@ -21,15 +21,17 @@ import GHC.Cmm.Switch.Implement
 import GHC.Cmm.ThreadSanitizer
 
 import GHC.Types.Unique.Supply
+import GHC.Types.Unique.DSM
 
 import GHC.Utils.Error
 import GHC.Utils.Logger
 import GHC.Utils.Outputable
-import GHC.Utils.Misc ( partitionWithM )
+import GHC.Utils.Misc ( partitionWith )
 
 import GHC.Platform
 
 import Control.Monad
+import GHC.Utils.Monad (mapAccumLM)
 
 -----------------------------------------------------------------------------
 -- | Top level driver for C-- pipeline
@@ -43,18 +45,19 @@ cmmPipeline
  -> CmmConfig
  -> ModuleSRTInfo        -- Info about SRTs generated so far
  -> CmmGroup             -- Input C-- with Procedures
- -> IO (ModuleSRTInfo, CmmGroupSRTs) -- Output CPS transformed C--
+ -> DUniqSupply
+ -> IO ((ModuleSRTInfo, CmmGroupSRTs), DUniqSupply) -- Output CPS transformed C--
 
-cmmPipeline logger cmm_config srtInfo prog = do
-  let forceRes (info, group) = info `seq` foldr seq () group
+cmmPipeline logger cmm_config srtInfo prog dus0 = do
+  let forceRes ((info, group), us) = info `seq` us `seq` foldr seq () group
   let platform = cmmPlatform cmm_config
   withTimingSilent logger (text "Cmm pipeline") forceRes $ do
-     (procs, data_) <- {-# SCC "tops" #-} partitionWithM (cpsTop logger platform cmm_config) prog
-     (srtInfo, cmms) <- {-# SCC "doSRTs" #-} doSRTs cmm_config srtInfo procs data_
+     (dus1, prog')  <- {-# SCC "tops" #-} mapAccumLM (cpsTop logger platform cmm_config) dus0 prog
+     let (procs, data_) = partitionWith id prog'
+     (srtInfo, dus, cmms) <- {-# SCC "doSRTs" #-} doSRTs cmm_config srtInfo dus1 procs data_
      dumpWith logger Opt_D_dump_cmm_cps "Post CPS Cmm" FormatCMM (pdoc platform cmms)
 
-     return (srtInfo, cmms)
-
+     return ((srtInfo, cmms), dus)
 
 -- | The Cmm pipeline for a single 'CmmDecl'. Returns:
 --
@@ -64,9 +67,10 @@ cmmPipeline logger cmm_config srtInfo prog = do
 --     [SRTs].
 --
 --   - in the case of a `CmmData`, the unmodified 'CmmDecl' and a 'CAFSet' containing
-cpsTop :: Logger -> Platform -> CmmConfig -> CmmDecl -> IO (Either (CAFEnv, [CmmDecl]) (CAFSet, CmmDataDecl))
-cpsTop _logger platform _ (CmmData section statics) = return (Right (cafAnalData platform statics, CmmData section statics))
-cpsTop logger platform cfg proc =
+cpsTop :: Logger -> Platform -> CmmConfig -> DUniqSupply -> CmmDecl -> IO (DUniqSupply, Either (CAFEnv, [CmmDecl]) (CAFSet, CmmDataDecl))
+cpsTop _logger platform _ dus (CmmData section statics) =
+  return (dus, Right (cafAnalData platform statics, CmmData section statics))
+cpsTop logger platform cfg dus proc =
     do
       ----------- Control-flow optimisations ----------------------------------
 
@@ -76,7 +80,7 @@ cpsTop logger platform cfg proc =
       --
       CmmProc h l v g <- {-# SCC "cmmCfgOpts(1)" #-}
            return $ cmmCfgOptsProc splitting_proc_points proc
-      dump Opt_D_dump_cmm_cfg "Post control-flow optimisations" g
+      dump Opt_D_dump_cmm_cfg "Post control-flow optimisations (1)" g
 
       let !TopInfo {stack_info=StackInfo { arg_space = entry_off
                                          , do_layout = do_layout }} = h
@@ -90,16 +94,22 @@ cpsTop logger platform cfg proc =
       -- elimCommonBlocks
 
       ----------- Implement switches ------------------------------------------
-      g <- if cmmDoCmmSwitchPlans cfg
+      (g, dus) <- if cmmDoCmmSwitchPlans cfg
              then {-# SCC "createSwitchPlans" #-}
-                  runUniqSM $ cmmImplementSwitchPlans platform g
-             else pure g
+                  pure $ runUniqueDSM dus $ cmmImplementSwitchPlans platform g
+             else pure (g, dus)
       dump Opt_D_dump_cmm_switch "Post switch plan" g
 
       ----------- ThreadSanitizer instrumentation -----------------------------
       g <- {-# SCC "annotateTSAN" #-}
           if cmmOptThreadSanitizer cfg
-          then runUniqSM $ annotateTSAN platform g
+          then do
+             -- TODO(#25273): Use the deterministic UniqDSM (ie `runUniqueDSM`) instead
+             -- of UniqSM (see `initUs_`) to guarantee deterministic objects
+             -- when doing thread sanitization.
+            us <- mkSplitUniqSupply 'u'
+            return $ initUs_ us $
+              annotateTSAN platform g
           else return g
       dump Opt_D_dump_cmm_thread_sanitizer "ThreadSanitizer instrumentation" g
 
@@ -107,49 +117,51 @@ cpsTop logger platform cfg proc =
       let
         call_pps :: ProcPointSet -- LabelMap
         call_pps = {-# SCC "callProcPoints" #-} callProcPoints g
-      proc_points <-
+      (proc_points, dus) <-
          if splitting_proc_points
             then do
-              pp <- {-# SCC "minimalProcPointSet" #-} runUniqSM $
-                 minimalProcPointSet platform call_pps g
+              let (pp, dus') = {-# SCC "minimalProcPointSet" #-} runUniqueDSM dus $
+                    minimalProcPointSet platform call_pps g
               dumpWith logger Opt_D_dump_cmm_proc "Proc points"
                     FormatCMM (pdoc platform l $$ ppr pp $$ pdoc platform g)
-              return pp
+              return (pp, dus')
             else
-              return call_pps
+              return (call_pps, dus)
 
       ----------- Layout the stack and manifest Sp ----------------------------
-      (g, stackmaps) <-
-           {-# SCC "layoutStack" #-}
-           if do_layout
-              then runUniqSM $ cmmLayoutStack cfg proc_points entry_off g
-              else return (g, mapEmpty)
+      ((g, stackmaps), dus) <- pure $
+         {-# SCC "layoutStack" #-}
+         if do_layout
+            then runUniqueDSM dus $ cmmLayoutStack cfg proc_points entry_off g
+            else ((g, mapEmpty), dus)
       dump Opt_D_dump_cmm_sp "Layout Stack" g
 
       ----------- Sink and inline assignments  --------------------------------
-      g <- {-# SCC "sink" #-} -- See Note [Sinking after stack layout]
-           condPass (cmmOptSink cfg) (cmmSink platform) g
-                    Opt_D_dump_cmm_sink "Sink assignments"
+      (g, dus) <- {-# SCC "sink" #-} -- See Note [Sinking after stack layout]
+         if cmmOptSink cfg
+            then pure $ runUniqueDSM dus $ cmmSink cfg g
+            else return (g, dus)
+      dump Opt_D_dump_cmm_sink "Sink assignments" g
 
       ------------- CAF analysis ----------------------------------------------
       let cafEnv = {-# SCC "cafAnal" #-} cafAnal platform call_pps l g
       dumpWith logger Opt_D_dump_cmm_caf "CAFEnv" FormatText (pdoc platform cafEnv)
 
-      g <- if splitting_proc_points
+      (g, dus) <- if splitting_proc_points
            then do
              ------------- Split into separate procedures -----------------------
              let pp_map = {-# SCC "procPointAnalysis" #-}
                           procPointAnalysis proc_points g
              dumpWith logger Opt_D_dump_cmm_procmap "procpoint map"
                 FormatCMM (ppr pp_map)
-             g <- {-# SCC "splitAtProcPoints" #-} runUniqSM $
+             (g, dus) <- {-# SCC "splitAtProcPoints" #-} pure $ runUniqueDSM dus $
                   splitAtProcPoints platform l call_pps proc_points pp_map
                                     (CmmProc h l v g)
              dumps Opt_D_dump_cmm_split "Post splitting" g
-             return g
+             return (g, dus)
            else
              -- attach info tables to return points
-             return $ [attachContInfoTables call_pps (CmmProc h l v g)]
+             return ([attachContInfoTables call_pps (CmmProc h l v g)], dus)
 
       ------------- Populate info tables with stack info -----------------
       g <- {-# SCC "setInfoTableStackMap" #-}
@@ -163,9 +175,9 @@ cpsTop logger platform cfg proc =
                     else g
       g <- return $ map (removeUnreachableBlocksProc platform) g
            -- See Note [unreachable blocks]
-      dumps Opt_D_dump_cmm_cfg "Post control-flow optimisations" g
+      dumps Opt_D_dump_cmm_cfg "Post control-flow optimisations (2)" g
 
-      return (Left (cafEnv, g))
+      return (dus, Left (cafEnv, g))
 
   where dump = dumpGraph logger platform (cmmDoLinting cfg)
 
@@ -348,12 +360,6 @@ removing them is good because it might save time in the native code
 generator later.
 
 -}
-
-runUniqSM :: UniqSM a -> IO a
-runUniqSM m = do
-  us <- mkSplitUniqSupply 'u'
-  return (initUs_ us m)
-
 
 dumpGraph :: Logger -> Platform -> Bool -> DumpFlag -> String -> CmmGraph -> IO ()
 dumpGraph logger platform do_linting flag name g = do

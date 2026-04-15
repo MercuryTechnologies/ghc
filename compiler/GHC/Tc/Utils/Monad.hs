@@ -321,6 +321,7 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
                 tcg_th_needed_deps = th_needed_deps_var,
                 tcg_exports        = [],
                 tcg_imports        = emptyImportAvails,
+                tcg_import_decls   = [],
                 tcg_used_gres     = used_gre_var,
                 tcg_dus            = emptyDUs,
 
@@ -872,7 +873,8 @@ getNamePprCtx
   = do { ptc <- initPromotionTickContext <$> getDynFlags
        ; rdr_env <- getGlobalRdrEnv
        ; hsc_env <- getTopEnv
-       ; return $ mkNamePprCtx ptc (hsc_unit_env hsc_env) rdr_env }
+       ; query <- liftIO $ hscUnitIndexQuery hsc_env
+       ; return $ mkNamePprCtx ptc (hsc_unit_env hsc_env) query rdr_env }
 
 -- | Like logInfoTcRn, but for user consumption
 printForUserTcRn :: SDoc -> TcRn ()

@@ -1,5 +1,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module GHC.Cmm.Sink (
      cmmSink
@@ -19,6 +20,8 @@ import GHC.Platform.Regs
 
 import GHC.Platform
 import GHC.Types.Unique.FM
+import GHC.Types.Unique.DSM
+import GHC.Cmm.Config
 
 import qualified GHC.Data.Word64Set as Word64Set
 import Data.List (partition)
@@ -150,9 +153,10 @@ type Assignments = [Assignment]
   --     y = e2
   --     x = e1
 
-cmmSink :: Platform -> CmmGraph -> CmmGraph
-cmmSink platform graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
+cmmSink :: CmmConfig -> CmmGraph -> UniqDSM CmmGraph
+cmmSink cfg graph = ofBlockList (g_entry graph) <$> sink mapEmpty blocks
   where
+  platform = cmmPlatform cfg
   liveness = cmmLocalLivenessL platform graph
   getLive l = mapFindWithDefault emptyLRegSet l liveness
 
@@ -160,11 +164,11 @@ cmmSink platform graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
 
   join_pts = findJoinPoints blocks
 
-  sink :: LabelMap Assignments -> [CmmBlock] -> [CmmBlock]
-  sink _ [] = []
+  sink :: LabelMap Assignments -> [CmmBlock] -> UniqDSM [CmmBlock]
+  sink _ [] = pure []
   sink sunk (b:bs) =
     -- pprTrace "sink" (ppr lbl) $
-    blockJoin first final_middle final_last : sink sunk' bs
+    (blockJoin first final_middle final_last :) <$> sink sunk' bs
     where
       lbl = entryLabel b
       (first, middle, last) = blockSplit b
@@ -519,7 +523,7 @@ tryToInline platform liveAfter node assigs =
 
 {- Note [Keeping assignments mentioned in skipped RHSs]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    If we have to assignments: [z = y, y = e1] and we skip
+    If we have two assignments: [z = y, y = e1] and we skip
     z we *must* retain the assignment y = e1. This is because
     we might inline "z = y" into another node later on so we
     must ensure y is still defined at this point.
@@ -592,7 +596,7 @@ improveConditional other = other
 -- Now we can go ahead and inline x.
 --
 -- For now we do nothing, because this would require putting
--- everything inside UniqSM.
+-- everything inside UniqDSM.
 --
 -- One more variant of this (#7366):
 --

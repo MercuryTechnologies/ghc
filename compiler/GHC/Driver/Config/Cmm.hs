@@ -32,3 +32,13 @@ initCmmConfig dflags = CmmConfig
           case (platformArch platform, platformOS platform, positionIndependent dflags)
           of   (ArchX86, OSDarwin, pic) -> pic
                _                        -> False
+        -- Copied from StgToCmm
+        (ncg, llvm) = case backendPrimitiveImplementation (backend dflags) of
+                          GenericPrimitives -> (False, False)
+                          NcgPrimitives -> (True, False)
+                          LlvmPrimitives -> (False, True)
+                          JSPrimitives -> (False, False)
+        x86ish  = case platformArch platform of
+                    ArchX86    -> True
+                    ArchX86_64 -> True
+                    _          -> False

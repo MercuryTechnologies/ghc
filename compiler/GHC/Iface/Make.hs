@@ -54,6 +54,7 @@ import GHC.Driver.Plugins
 
 import GHC.Types.Id
 import GHC.Types.Fixity.Env
+import GHC.Types.ForeignStubs (ForeignStubs (NoStubs))
 import GHC.Types.SafeHaskell
 import GHC.Types.Annotations
 import GHC.Types.Name
@@ -87,6 +88,7 @@ import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.ModGuts
 import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.Deps
+import GHC.Unit.Module.WholeCoreBindings (encodeIfaceForeign, emptyIfaceForeign)
 
 import Data.Function
 import Data.List ( sortBy )
@@ -106,9 +108,10 @@ mkPartialIface :: HscEnv
                -> CoreProgram
                -> ModDetails
                -> ModSummary
+               -> [ImportUserSpec]
                -> ModGuts
                -> PartialModIface
-mkPartialIface hsc_env core_prog mod_details mod_summary
+mkPartialIface hsc_env core_prog mod_details mod_summary import_decls
   ModGuts{ mg_module       = this_mod
          , mg_hsc_src      = hsc_src
          , mg_usages       = usages
@@ -122,7 +125,7 @@ mkPartialIface hsc_env core_prog mod_details mod_summary
          , mg_trust_pkg    = self_trust
          , mg_docs         = docs
          }
-  = mkIface_ hsc_env this_mod core_prog hsc_src used_th deps rdr_env fix_env warns hpc_info self_trust
+  = mkIface_ hsc_env this_mod core_prog hsc_src used_th deps rdr_env import_decls fix_env warns hpc_info self_trust
              safe_mode usages docs mod_summary mod_details
 
 -- | Fully instantiate an interface. Adds fingerprints and potentially code
@@ -131,17 +134,20 @@ mkPartialIface hsc_env core_prog mod_details mod_summary
 -- CmmCgInfos is not available when not generating code (-fno-code), or when not
 -- generating interface pragmas (-fomit-interface-pragmas). See also
 -- Note [Conveying CAF-info and LFInfo between modules] in GHC.StgToCmm.Types.
-mkFullIface :: HscEnv -> PartialModIface -> Maybe StgCgInfos -> Maybe CmmCgInfos -> IO ModIface
-mkFullIface hsc_env partial_iface mb_stg_infos mb_cmm_infos = do
+mkFullIface :: HscEnv -> PartialModIface -> Maybe StgCgInfos -> Maybe CmmCgInfos -> ForeignStubs -> [(ForeignSrcLang, FilePath)] -> IO ModIface
+mkFullIface hsc_env partial_iface mb_stg_infos mb_cmm_infos stubs foreign_files = do
     let decls
           | gopt Opt_OmitInterfacePragmas (hsc_dflags hsc_env)
           = mi_decls partial_iface
           | otherwise
           = updateDecl (mi_decls partial_iface) mb_stg_infos mb_cmm_infos
 
+    -- See Note [Foreign stubs and TH bytecode linking]
+    foreign_ <- encodeIfaceForeign (hsc_logger hsc_env) (hsc_dflags hsc_env) stubs foreign_files
+
     full_iface <-
       {-# SCC "addFingerprints" #-}
-      addFingerprints hsc_env partial_iface{ mi_decls = decls }
+      addFingerprints hsc_env partial_iface{ mi_decls = decls, mi_foreign = foreign_ }
 
     -- Debug printing
     let unit_state = hsc_units hsc_env
@@ -194,6 +200,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
   tc_result@TcGblEnv{ tcg_mod = this_mod,
                       tcg_src = hsc_src,
                       tcg_imports = imports,
+                      tcg_import_decls = import_decls,
                       tcg_rdr_env = rdr_env,
                       tcg_fix_env = fix_env,
                       tcg_merged = merged,
@@ -212,7 +219,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
                                     (map mi_module pluginModules)
           let hpc_info = emptyHpcInfo other_hpc_info
           used_th <- readIORef tc_splice_used
-          dep_files <- (readIORef dependent_files)
+          dep_files <- sortBy compare <$> (readIORef dependent_files)
           (needed_links, needed_pkgs) <- readIORef (tcg_th_needed_deps tc_result)
           let uc = initUsageConfig hsc_env
               plugins = hsc_plugins hsc_env
@@ -232,16 +239,16 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
 
           let partial_iface = mkIface_ hsc_env
                    this_mod (fromMaybe [] mb_program) hsc_src
-                   used_th deps rdr_env
+                   used_th deps rdr_env import_decls
                    fix_env warns hpc_info
                    (imp_trust_own_pkg imports) safe_mode usages
                    docs mod_summary
                    mod_details
 
-          mkFullIface hsc_env partial_iface Nothing Nothing
+          mkFullIface hsc_env partial_iface Nothing Nothing NoStubs []
 
 mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
-         -> Bool -> Dependencies -> GlobalRdrEnv
+         -> Bool -> Dependencies -> GlobalRdrEnv -> [ImportUserSpec]
          -> NameEnv FixItem -> Warnings GhcRn -> HpcInfo
          -> Bool
          -> SafeHaskellMode
@@ -251,7 +258,7 @@ mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
          -> ModDetails
          -> PartialModIface
 mkIface_ hsc_env
-         this_mod core_prog hsc_src used_th deps rdr_env fix_env src_warns
+         this_mod core_prog hsc_src used_th deps rdr_env import_decls fix_env src_warns
          hpc_info pkg_trust_req safe_mode usages
          docs mod_summary
          ModDetails{  md_insts     = insts,
@@ -323,10 +330,11 @@ mkIface_ hsc_env
           mi_fixities    = fixities,
           mi_warns       = warns,
           mi_anns        = annotations,
-          mi_globals     = rdrs,
+          mi_top_env     = rdrs,
           mi_used_th     = used_th,
           mi_decls       = decls,
           mi_extra_decls = extra_decls,
+          mi_foreign     = emptyIfaceForeign,
           mi_hpc         = isHpcUsed hpc_info,
           mi_trust       = trust_info,
           mi_trust_pkg   = pkg_trust_req,
@@ -345,16 +353,18 @@ mkIface_ hsc_env
 
      dflags = hsc_dflags hsc_env
 
-     -- We only fill in mi_globals if the module was compiled to byte
+     -- We only fill in mi_top_env if the module was compiled to byte
      -- code.  Otherwise, the compiler may not have retained all the
      -- top-level bindings and they won't be in the TypeEnv (see
-     -- Desugar.addExportFlagsAndRules).  The mi_globals field is used
+     -- Desugar.addExportFlagsAndRules).  The mi_top_env field is used
      -- by GHCi to decide whether the module has its full top-level
      -- scope available. (#5534)
-     maybeGlobalRdrEnv :: GlobalRdrEnv -> Maybe IfGlobalRdrEnv
+     maybeGlobalRdrEnv :: GlobalRdrEnv -> Maybe IfaceTopEnv
      maybeGlobalRdrEnv rdr_env
         | backendWantsGlobalBindings (backend dflags)
-        = Just $! forceGlobalRdrEnv rdr_env
+        = Just $! let !exports = forceGlobalRdrEnv (globalRdrEnvLocal rdr_env)
+                      !imports = mkIfaceImports import_decls
+                  in IfaceTopEnv exports imports
           -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
         | otherwise
         = Nothing
@@ -472,19 +482,15 @@ mkIfaceAnnotation (Annotation { ann_target = target, ann_value = payload })
         ifAnnotatedValue = payload
     }
 
-mkIfaceExports :: [AvailInfo] -> [IfaceExport]  -- Sort to make canonical
-mkIfaceExports exports
-  = sortBy stableAvailCmp (map sort_subs exports)
+mkIfaceImports :: [ImportUserSpec] -> [IfaceImport]
+mkIfaceImports = map go
   where
-    sort_subs :: AvailInfo -> AvailInfo
-    sort_subs (Avail n) = Avail n
-    sort_subs (AvailTC n []) = AvailTC n []
-    sort_subs (AvailTC n (m:ms))
-       | n == m
-       = AvailTC n (m:sortBy stableNameCmp ms)
-       | otherwise
-       = AvailTC n (sortBy stableNameCmp (m:ms))
-       -- Maintain the AvailTC Invariant
+    go (ImpUserSpec decl ImpUserAll) = IfaceImport decl ImpIfaceAll
+    go (ImpUserSpec decl (ImpUserExplicit env)) = IfaceImport decl (ImpIfaceExplicit (forceGlobalRdrEnv env))
+    go (ImpUserSpec decl (ImpUserEverythingBut ns)) = IfaceImport decl (ImpIfaceEverythingBut ns)
+
+mkIfaceExports :: [AvailInfo] -> [IfaceExport] -- Sort to make canonical
+mkIfaceExports as = case sortAvails as of DefinitelyDeterministicAvails sas -> sas
 
 {-
 Note [Original module]

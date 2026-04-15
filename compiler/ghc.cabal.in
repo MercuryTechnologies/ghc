@@ -115,6 +115,7 @@ Library
                    containers >= 0.6.2.1 && < 0.8,
                    array      >= 0.1 && < 0.6,
                    filepath   >= 1   && < 1.6,
+                   os-string  >= 2.0.1 && < 2.1,
                    template-haskell == 2.22.*,
                    hpc        >= 0.6 && < 0.8,
                    transformers >= 0.5 && < 0.7,
@@ -245,6 +246,7 @@ Library
         GHC.Cmm.Switch
         GHC.Cmm.Switch.Implement
         GHC.Cmm.ThreadSanitizer
+        GHC.Cmm.UniqueRenamer
         GHC.CmmToAsm
         GHC.Cmm.LRegSet
         GHC.CmmToAsm.AArch64
@@ -419,6 +421,8 @@ Library
         GHC.Data.Graph.Color
         GHC.Data.Graph.Collapse
         GHC.Data.Graph.Directed
+        GHC.Data.Graph.Directed.Internal
+        GHC.Data.Graph.Directed.Reachability
         GHC.Data.Graph.Inductive.Graph
         GHC.Data.Graph.Inductive.PatriciaTree
         GHC.Data.Graph.Ops
@@ -429,6 +433,7 @@ Library
         GHC.Data.List.SetOps
         GHC.Data.Maybe
         GHC.Data.OrdList
+        GHC.Data.OsPath
         GHC.Data.Pair
         GHC.Data.SmallArray
         GHC.Data.Stream
@@ -494,6 +499,7 @@ Library
         GHC.Driver.Main
         GHC.Driver.Make
         GHC.Driver.MakeFile
+        GHC.Driver.MakeFile.JSON
         GHC.Driver.Monad
         GHC.Driver.Phases
         GHC.Driver.Pipeline
@@ -868,6 +874,7 @@ Library
         GHC.Types.SourceError
         GHC.Types.SourceFile
         GHC.Types.SourceText
+        GHC.Types.SptEntry
         GHC.Types.SrcLoc
         GHC.Types.Target
         GHC.Types.Tickish
@@ -876,6 +883,7 @@ Library
         GHC.Types.Unique
         GHC.Types.Unique.DFM
         GHC.Types.Unique.DSet
+        GHC.Types.Unique.DSM
         GHC.Types.Unique.FM
         GHC.Types.Unique.Map
         GHC.Types.Unique.MemoFun

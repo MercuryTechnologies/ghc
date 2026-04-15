@@ -5,7 +5,6 @@
 -- (c) The University of Glasgow 2006
 --
 -----------------------------------------------------------------------------
-
 module GHC.Cmm.Opt (
         constantFoldNode,
         constantFoldExpr,
@@ -436,7 +435,6 @@ we really want to convert to
 
 That's what the constant-folding operations on comparison operators do above.
 -}
-
 
 -- -----------------------------------------------------------------------------
 -- Utils

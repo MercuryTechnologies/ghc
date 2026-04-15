@@ -18,11 +18,14 @@ module GHC.Unit.Module.Graph
    , mgModSummaries
    , mgModSummaries'
    , mgLookupModule
-   , mgTransDeps
+   , ModuleNameHomeMap
+   , mgHomeModuleMap
    , showModMsg
    , moduleGraphNodeModule
    , moduleGraphNodeModSum
    , moduleGraphModulesBelow
+   , mgReachable
+   , mgQuery
 
    , moduleGraphNodes
    , SummaryNode
@@ -49,6 +52,7 @@ import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Data.Maybe
 import GHC.Data.Graph.Directed
+import GHC.Data.Graph.Directed.Reachability
 
 import GHC.Driver.Backend
 import GHC.Driver.DynFlags
@@ -72,6 +76,7 @@ import Data.Bifunctor
 import Data.Function
 import Data.List (sort)
 import GHC.Data.List.SetOps
+import GHC.Stack
 
 -- | A '@ModuleGraphNode@' is a node in the '@ModuleGraph@'.
 -- Edges between nodes mark dependencies arising from module imports
@@ -150,35 +155,58 @@ instance Outputable ModNodeKeyWithUid where
 -- check that the module and its hs-boot agree.
 --
 -- The graph is not necessarily stored in topologically-sorted order.  Use
+type ModuleNameHomeMap = (Set UnitId, Map.Map ModuleName (Set UnitId))
+
 -- 'GHC.topSortModuleGraph' and 'GHC.Data.Graph.Directed.flattenSCC' to achieve this.
 data ModuleGraph = ModuleGraph
   { mg_mss :: [ModuleGraphNode]
-  , mg_trans_deps :: Map.Map NodeKey (Set.Set NodeKey)
+  , mg_graph :: (ReachabilityIndex SummaryNode, NodeKey -> Maybe SummaryNode)
     -- A cached transitive dependency calculation so that a lot of work is not
     -- repeated whenever the transitive dependencies need to be calculated (for example, hptInstances)
+  , mg_home_map :: ModuleNameHomeMap
+    -- ^ For each module name, which home-unit UnitIds define it together with the set of units for which the listing is complete.
   }
 
 -- | Map a function 'f' over all the 'ModSummaries'.
 -- To preserve invariants 'f' can't change the isBoot status.
 mapMG :: (ModSummary -> ModSummary) -> ModuleGraph -> ModuleGraph
 mapMG f mg@ModuleGraph{..} = mg
-  { mg_mss = flip fmap mg_mss $ \case
-      InstantiationNode uid iuid -> InstantiationNode uid iuid
-      LinkNode uid nks -> LinkNode uid nks
-      ModuleNode deps ms  -> ModuleNode deps (f ms)
+  { mg_mss = new_mss
+  , mg_home_map = mkHomeModuleMap new_mss
   }
+  where
+    new_mss =
+      flip fmap mg_mss $ \case
+        InstantiationNode uid iuid -> InstantiationNode uid iuid
+        LinkNode uid nks -> LinkNode uid nks
+        ModuleNode deps ms  -> ModuleNode deps (f ms)
 
 unionMG :: ModuleGraph -> ModuleGraph -> ModuleGraph
 unionMG a b =
   let new_mss = nubOrdBy compare $ mg_mss a `mappend` mg_mss b
   in ModuleGraph {
         mg_mss = new_mss
-      , mg_trans_deps = mkTransDeps new_mss
+      , mg_graph = mkTransDeps new_mss
+      , mg_home_map = mkHomeModuleMap new_mss
       }
 
+mkTransDeps :: [ModuleGraphNode] -> (ReachabilityIndex SummaryNode, NodeKey -> Maybe SummaryNode)
+mkTransDeps = first graphReachability {- module graph is acyclic -} . moduleGraphNodes False
 
-mgTransDeps :: ModuleGraph -> Map.Map NodeKey (Set.Set NodeKey)
-mgTransDeps = mg_trans_deps
+mkHomeModuleMap :: [ModuleGraphNode] -> ModuleNameHomeMap
+mkHomeModuleMap nodes =
+  (complete_units, provider_map)
+  where
+    provider_map =
+      Map.fromListWith Set.union
+        [ (ms_mod_name ms, Set.singleton (ms_unitid ms))
+        | ModuleNode _ ms <- nodes
+        ]
+    complete_units =
+      Set.fromList
+        [ ms_unitid ms
+        | ModuleNode _ ms <- nodes
+        ]
 
 mgModSummaries :: ModuleGraph -> [ModSummary]
 mgModSummaries mg = [ m | ModuleNode _ m <- mgModSummaries' mg ]
@@ -198,8 +226,11 @@ mgLookupModule ModuleGraph{..} m = listToMaybe $ mapMaybe go mg_mss
       = Just ms
     go _ = Nothing
 
+mgHomeModuleMap :: ModuleGraph -> ModuleNameHomeMap
+mgHomeModuleMap = mg_home_map
+
 emptyMG :: ModuleGraph
-emptyMG = ModuleGraph [] Map.empty
+emptyMG = ModuleGraph [] (graphReachability emptyGraph, const Nothing) (Set.empty, Map.empty)
 
 isTemplateHaskellOrQQNonBoot :: ModSummary -> Bool
 isTemplateHaskellOrQQNonBoot ms =
@@ -211,14 +242,12 @@ isTemplateHaskellOrQQNonBoot ms =
 -- not an element of the ModuleGraph.
 extendMG :: ModuleGraph -> [NodeKey] -> ModSummary -> ModuleGraph
 extendMG ModuleGraph{..} deps ms = ModuleGraph
-  { mg_mss = ModuleNode deps ms : mg_mss
-  , mg_trans_deps = mkTransDeps (ModuleNode deps ms : mg_mss)
+  { mg_mss = new_mss
+  , mg_graph = mkTransDeps new_mss
+  , mg_home_map = mkHomeModuleMap new_mss
   }
-
-mkTransDeps :: [ModuleGraphNode] -> Map.Map NodeKey (Set.Set NodeKey)
-mkTransDeps mss =
-  let (gg, _lookup_node) = moduleGraphNodes False mss
-  in allReachable gg (mkNodeKey . node_payload)
+  where
+    new_mss = ModuleNode deps ms : mg_mss
 
 extendMGInst :: ModuleGraph -> UnitId -> InstantiatedUnit -> ModuleGraph
 extendMGInst mg uid depUnitId = mg
@@ -394,12 +423,9 @@ type ModNodeKey = ModuleNameWithIsBoot
 -- boot module and the non-boot module can be reached, it only returns the
 -- non-boot one.
 moduleGraphModulesBelow :: ModuleGraph -> UnitId -> ModuleNameWithIsBoot -> Set ModNodeKeyWithUid
-moduleGraphModulesBelow mg uid mn = filtered_mods $ [ mn |  NodeKey_Module mn <- modules_below]
+moduleGraphModulesBelow mg uid mn = filtered_mods [ mn | NodeKey_Module mn <- modules_below ]
   where
-    td_map = mgTransDeps mg
-
-    modules_below = maybe [] Set.toList $ Map.lookup (NodeKey_Module (ModNodeKeyWithUid mn uid)) td_map
-
+    modules_below = maybe [] (map mkNodeKey) (mgReachable mg (NodeKey_Module (ModNodeKeyWithUid mn uid)))
     filtered_mods = Set.fromDistinctAscList . filter_mods . sort
 
     -- IsBoot and NotBoot modules are necessarily consecutive in the sorted list
@@ -415,3 +441,22 @@ moduleGraphModulesBelow mg uid mn = filtered_mods $ [ mn |  NodeKey_Module mn <-
                        in r' : filter_mods rs
         | otherwise -> r1 : filter_mods (r2:rs)
       rs -> rs
+
+mgReachable :: HasCallStack => ModuleGraph -> NodeKey -> Maybe [ModuleGraphNode]
+mgReachable mg nk = map summaryNodeSummary <$> modules_below where
+  (td_map, lookup_node) = mg_graph mg
+  modules_below =
+    allReachable td_map <$> lookup_node nk
+
+-- | Reachability Query. @mgQuery(g, a, b)@ asks: Can we reach @b@ from @a@ in
+-- graph @g@?
+-- INVARIANT: Both @a@ and @b@ must be in @g@.
+mgQuery :: ModuleGraph -- ^ @g@
+        -> NodeKey -- ^ @a@
+        -> NodeKey -- ^ @b@
+        -> Bool -- ^ @b@ is reachable from @a@
+mgQuery mg nka nkb = isReachable td_map na nb where
+  (td_map, lookup_node) = mg_graph mg
+  na = expectJust "mgQuery:a" $ lookup_node nka
+  nb = expectJust "mgQuery:b" $ lookup_node nkb
+
