@@ -268,7 +268,7 @@ mkRecompUsageInfo hsc_env tc_result = do
     then return Nothing
     else do
      let used_names = mkUsedNames tc_result
-     dep_files <- (readIORef (tcg_dependent_files tc_result))
+     dep_files <- sortBy compare <$> (readIORef (tcg_dependent_files tc_result))
      (needed_links, needed_pkgs) <- readIORef (tcg_th_needed_deps tc_result)
      let uc = initUsageConfig hsc_env
          plugins = hsc_plugins hsc_env
