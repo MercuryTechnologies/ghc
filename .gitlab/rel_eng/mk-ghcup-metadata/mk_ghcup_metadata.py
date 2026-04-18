@@ -96,9 +96,6 @@ def darwin(arch):
 windowsArtifact = PlatformSpec ( 'x86_64-windows'
                                , 'ghc-{version}-x86_64-unknown-mingw32' )
 
-def centos(n, arch='x86_64'):
-    return linux_platform(arch, "{arch}-linux-centos{n}".format(n=n,arch=arch))
-
 def fedora(n, arch='x86_64'):
     return linux_platform(arch, "{arch}-linux-fedora{n}".format(n=n,arch=arch))
 
@@ -201,15 +198,15 @@ def mk_new_yaml(release_mode, version, date, pipeline_type, job_map):
     ubuntu1804 = mk(ubuntu("18_04"))
     ubuntu2004 = mk(ubuntu("20_04"))
     ubuntu2204 = mk(ubuntu("22_04"))
+    ubuntu2404 = mk(ubuntu("24_04"))
     rocky8 = mk(rocky("8"))
-    centos7 = mk(centos(7))
     fedora33 = mk(fedora(33))
     darwin_x86 = mk(darwin("x86_64"))
     darwin_arm64 = mk(darwin("aarch64"))
     windows = mk(windowsArtifact)
-    alpine3_12 = mk(alpine("3_12"))
-    alpine3_20 = mk(alpine("3_20"))
-    alpine3_18_arm64 = mk(alpine("3_18", arch='aarch64'))
+    alpine3_22 = mk(alpine("3_22"))
+    alpine3_22_arm64 = mk(alpine("3_22", arch='aarch64'))
+    alpine3_22_i386 = mk(alpine("3_22", arch='i386'))
     deb9 = mk(debian(9, "x86_64"))
     deb10 = mk(debian(10, "x86_64"))
     deb11 = mk(debian(11, "x86_64"))
@@ -234,23 +231,23 @@ def mk_new_yaml(release_mode, version, date, pipeline_type, job_map):
                              , "( >= 16 && < 18 )": deb9
                              , "( >= 18 && < 19 )": ubuntu1804
                              , "( >= 19 && < 21 )": ubuntu2004
-                             , "( >= 21 )": ubuntu2204
+                             , "( >= 21 && < 24 )": ubuntu2204
+                             , "( >= 24 )": ubuntu2404
                              }
           , "Linux_Mint"   : { "< 20": ubuntu1804
                              , ">= 20": ubuntu2004
                              , "unknown_versioning": ubuntu2004 }
-          , "Linux_CentOS"  : { "( >= 7 && < 8 )" : centos7
-                              , "unknown_versioning" : centos7  }
+          , "Linux_CentOS"  : { "( >= 8 && < 9 )" : rocky8
+                              , "unknown_versioning" : rocky8  }
           , "Linux_Fedora"  : { ">= 33": fedora33
-                              , "unknown_versioning": centos7 }
-          , "Linux_RedHat"  : { "unknown_versioning": centos7 }
+                              , "unknown_versioning": rocky8 }
+          , "Linux_RedHat"  : { "< 9": rocky8
+                              , ">= 9": fedora33
+                              , "unknown_versioning": fedora33 }
           , "Linux_UnknownLinux" : { "unknown_versioning": rocky8 }
           , "Darwin" : { "unknown_versioning" : darwin_x86 }
           , "Windows" : { "unknown_versioning" :  windows }
-          , "Linux_Alpine" : { "( >= 3.12 && < 3.20 )": alpine3_12
-                             , ">= 3.20": alpine3_20
-                             , "unknown_versioning": alpine3_12 }
-
+          , "Linux_Alpine" : { "unknown_versioning": alpine3_22 }
           }
 
     a32 = { "Linux_Debian": { "( >= 10 && < 12 )": deb10_i386
@@ -258,11 +255,12 @@ def mk_new_yaml(release_mode, version, date, pipeline_type, job_map):
                             , "unknown_versioning": deb10_i386 }
           , "Linux_Ubuntu": { "unknown_versioning": deb10_i386 }
           , "Linux_Mint" : { "unknown_versioning": deb10_i386 }
+          , "Linux_Alpine" : { "unknown_versioning": alpine3_22_i386 }
           , "Linux_UnknownLinux" : { "unknown_versioning": deb10_i386 }
           }
 
     arm64 = { "Linux_UnknownLinux": { "unknown_versioning": deb10_arm64 }
-            , "Linux_Alpine" : { "unknown_versioning": alpine3_18_arm64 }
+            , "Linux_Alpine" : { "unknown_versioning": alpine3_22_arm64 }
             , "Linux_Debian": { "( >= 10 && < 12 )": deb10_arm64
                               , "( >= 12 )": deb12_arm64
                               , "unknown_versioning": deb10_arm64
@@ -369,4 +367,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-

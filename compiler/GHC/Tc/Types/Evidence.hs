@@ -15,7 +15,7 @@ module GHC.Tc.Types.Evidence (
 
   -- * Evidence bindings
   TcEvBinds(..), EvBindsVar(..),
-  EvBindMap(..), emptyEvBindMap, extendEvBinds,
+  EvBindMap(..), emptyEvBindMap, extendEvBinds, unionEvBindMap,
   lookupEvBind, evBindMapBinds,
   foldEvBindMap, nonDetStrictFoldEvBindMap,
   filterEvBindMap,
@@ -27,10 +27,14 @@ module GHC.Tc.Types.Evidence (
 
   -- * EvTerm (already a CoreExpr)
   EvTerm(..), EvExpr,
-  evId, evCoercion, evCast, evDFunApp,  evDataConApp, evSelector,
-  mkEvCast, evVarsOfTerm, mkEvScSelectors, evTypeable, findNeededEvVars,
+  evId, evCoercion, evCast, evCastE, evDFunApp,  evDictApp, evSelector, evDelayedError,
+  mkEvScSelectors, evTypeable,
+  evWrapIPE, evUnwrapIPE, evUnaryDictAppE,
+  mkEvCast,
+  nestedEvIdsOfTerm, evTermFVs,
 
   evTermCoercion, evTermCoercion_maybe,
+  evExprCoercion, evExprCoercion_maybe,
   EvCallStack(..),
   EvTypeable(..),
 
@@ -42,7 +46,6 @@ module GHC.Tc.Types.Evidence (
   TcMCoercion, TcMCoercionN, TcMCoercionR,
   Role(..), LeftOrRight(..), pickLR,
   maybeSymCo,
-  unwrapIP, wrapIP,
 
   -- * QuoteWrapper
   QuoteWrapper(..), applyQuoteWrapper, quoteWrapperTyVarTy
@@ -50,28 +53,35 @@ module GHC.Tc.Types.Evidence (
 
 import GHC.Prelude
 
-import GHC.Types.Unique.DFM
-import GHC.Types.Unique.FM
-import GHC.Types.Var
-import GHC.Types.Id( idScaledType )
+import GHC.Tc.Utils.TcType
+
+import GHC.Core
 import GHC.Core.Coercion.Axiom
 import GHC.Core.Coercion
 import GHC.Core.Ppr ()   -- Instance OutputableBndr TyVar
-import GHC.Tc.Utils.TcType
+import GHC.Core.Predicate
 import GHC.Core.Type
 import GHC.Core.TyCon
-import GHC.Core.DataCon ( DataCon, dataConWrapId )
-import GHC.Builtin.Names
-import GHC.Types.Var.Env
-import GHC.Types.Var.Set
-import GHC.Core.Predicate
-import GHC.Types.Basic
-
-import GHC.Core
+import GHC.Core.Make    ( mkWildCase, mkRuntimeErrorApp, tYPE_ERROR_ID )
+import GHC.Core.Class   ( classTyCon )
+import GHC.Core.DataCon ( dataConWrapId )
 import GHC.Core.Class (Class, classSCSelId )
-import GHC.Core.FVs   ( exprSomeFreeVars )
+import GHC.Core.FVs
 import GHC.Core.InstEnv ( CanonicalEvidence(..) )
 
+import GHC.Types.Unique.DFM
+import GHC.Types.Unique.FM
+import GHC.Types.Name( isInternalName )
+import GHC.Types.Var
+import GHC.Types.Id( idScaledType )
+import GHC.Types.Var.Env
+import GHC.Types.Var.Set
+import GHC.Types.Basic
+
+import GHC.Builtin.Names
+import GHC.Builtin.Types( unitTy )
+
+import GHC.Utils.FV
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Outputable
@@ -194,28 +204,44 @@ instance Monoid HsWrapper where
   mempty = WpHole
 
 (<.>) :: HsWrapper -> HsWrapper -> HsWrapper
-WpHole <.> c = c
-c <.> WpHole = c
-c1 <.> c2    = c1 `WpCompose` c2
+WpHole    <.> c         = c
+c         <.> WpHole    = c
+WpCast c1 <.> WpCast c2 = WpCast (c1 `mkTransCo` c2)
+  -- If we can represent the HsWrapper as a cast, try to do so: this may avoid
+  -- unnecessary eta-expansion (see 'mkWpFun').
+c1        <.> c2        = c1 `WpCompose` c2
 
--- | Smart constructor to create a 'WpFun' 'HsWrapper'.
+-- | Smart constructor to create a 'WpFun' 'HsWrapper', which avoids introducing
+-- a lambda abstraction if the two supplied wrappers are either identities or
+-- casts.
 --
--- PRECONDITION: the "from" type of the first wrapper must have a syntactically
--- fixed RuntimeRep (see Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete).
+-- PRECONDITION: either:
+--
+--  1. both of the 'HsWrapper's are identities or casts, or
+--  2. both the "from" and "to" types of the first wrapper have a syntactically
+--     fixed RuntimeRep (see Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete).
 mkWpFun :: HsWrapper -> HsWrapper
         -> Scaled TcTypeFRR -- ^ the "from" type of the first wrapper
-                            -- MUST have a fixed RuntimeRep
         -> TcType           -- ^ Either "from" type or "to" type of the second wrapper
                             --   (used only when the second wrapper is the identity)
         -> HsWrapper
-  -- NB: we can't check that the argument type has a fixed RuntimeRep with an assertion,
-  -- because of [Wrinkle: Typed Template Haskell] in Note [hasFixedRuntimeRep]
-  -- in GHC.Tc.Utils.Concrete.
 mkWpFun WpHole       WpHole       _             _  = WpHole
 mkWpFun WpHole       (WpCast co2) (Scaled w t1) _  = WpCast (mk_wp_fun_co w (mkRepReflCo t1) co2)
 mkWpFun (WpCast co1) WpHole       (Scaled w _)  t2 = WpCast (mk_wp_fun_co w (mkSymCo co1)    (mkRepReflCo t2))
 mkWpFun (WpCast co1) (WpCast co2) (Scaled w _)  _  = WpCast (mk_wp_fun_co w (mkSymCo co1)    co2)
-mkWpFun co1          co2          t1            _  = WpFun co1 co2 t1
+mkWpFun w_arg        w_res        t1            _  =
+  -- In this case, we will desugar to a lambda
+  --
+  --   \x. w_res[ e w_arg[x] ]
+  --
+  -- To satisfy Note [Representation polymorphism invariants] in GHC.Core,
+  -- it must be the case that both the lambda bound variable x and the function
+  -- argument w_arg[x] have a fixed runtime representation, i.e. that both the
+  -- "from" and "to" types of the first wrapper "w_arg" have a fixed runtime representation.
+  --
+  -- Unfortunately, we can't check this with an assertion here, because of
+  -- [Wrinkle: Typed Template Haskell] in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
+  WpFun w_arg w_res t1
 
 mkWpEta :: [Id] -> HsWrapper -> HsWrapper
 -- (mkWpEta [x1, x2] wrap) [e]
@@ -263,12 +289,7 @@ mkWpTyLams ids = mk_co_lam_fn WpTyLam ids
 -- but in that case we refrain from calling it.
 mkWpForAllCast :: [ForAllTyBinder] -> Type -> HsWrapper
 mkWpForAllCast bndrs res_ty
-  = mkWpCastR (go bndrs)
-  where
-    go []                 = mkRepReflCo res_ty
-    go (Bndr tv vis : bs) = mkForAllCo tv coreTyLamForAllTyFlag vis kind_co (go bs)
-      where
-        kind_co = mkNomReflCo (varType tv)
+  = mkWpCastR (mkForAllVisCos bndrs (mkRepReflCo res_ty))
 
 mkWpEvLams :: [Var] -> HsWrapper
 mkWpEvLams ids = mk_co_lam_fn WpEvLam ids
@@ -357,11 +378,13 @@ data EvBindsVar
       --     (dictionaries etc)
       -- Some Given, some Wanted
 
-      ebv_tcvs :: IORef CoVarSet
-      -- The free Given coercion vars needed by Wanted coercions that
-      -- are solved by filling in their HoleDest in-place. Since they
-      -- don't appear in ebv_binds, we keep track of their free
-      -- variables so that we can report unused given constraints
+      ebv_tcvs :: IORef [TcCoercion]
+      -- When we solve a Wanted by filling in a CoercionHole, it is as
+      -- if we were adding an evidence binding
+      --       co_hole := coercion
+      -- We keep all these RHS coercions in a list, alongside `ebv_binds`,
+      --  so that we can report unused given constraints,
+      --  in GHC.Tc.Solver.neededEvVars
       -- See Note [Tracking redundant constraints] in GHC.Tc.Solver
     }
 
@@ -369,14 +392,19 @@ data EvBindsVar
 
       -- See above for comments on ebv_uniq, ebv_tcvs
       ebv_uniq :: Unique,
-      ebv_tcvs :: IORef CoVarSet
+      ebv_tcvs :: IORef [TcCoercion]
     }
 
 instance Data.Data TcEvBinds where
-  -- Placeholder; we can't travers into TcEvBinds
+  -- Placeholder; we can't traverse into TcEvBinds
   toConstr _   = abstractConstr "TcEvBinds"
   gunfold _ _  = error "gunfold"
   dataTypeOf _ = Data.mkNoRepType "TcEvBinds"
+instance Data.Data EvBind where
+  -- Placeholder; we can't traverse into EvBind
+  toConstr _   = abstractConstr "TcEvBind"
+  gunfold _ _  = error "gunfold"
+  dataTypeOf _ = Data.mkNoRepType "EvBind"
 
 {- Note [Coercion evidence only]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -427,6 +455,11 @@ extendEvBinds bs ev_bind
   = EvBindMap { ev_bind_varenv = extendDVarEnv (ev_bind_varenv bs)
                                                (eb_lhs ev_bind)
                                                ev_bind }
+
+-- | Union two evidence binding maps
+unionEvBindMap :: EvBindMap -> EvBindMap -> EvBindMap
+unionEvBindMap (EvBindMap env1) (EvBindMap env2) =
+  EvBindMap { ev_bind_varenv = plusDVarEnv env1 env2 }
 
 isEmptyEvBindMap :: EvBindMap -> Bool
 isEmptyEvBindMap (EvBindMap m) = isEmptyDVarEnv m
@@ -496,16 +529,13 @@ data EvTerm
   | EvFun     -- /\as \ds. let binds in v
       { et_tvs   :: [TyVar]
       , et_given :: [EvVar]
-      , et_binds :: TcEvBinds -- This field is why we need an EvFun
-                              -- constructor, and can't just use EvExpr
+      , et_binds :: TcEvBinds  -- This field is why we need an EvFun
+                               -- constructor, and can't just use EvExpr
       , et_body  :: EvVar }
 
   deriving Data.Data
 
 type EvExpr = CoreExpr
-
--- An EvTerm is (usually) constructed by any of the constructors here
--- and those more complicated ones who were moved to module GHC.Tc.Types.EvTerm
 
 -- | Any sort of evidence Id, including coercions
 evId ::  EvId -> EvExpr
@@ -516,17 +546,62 @@ evId = Var
 evCoercion :: TcCoercion -> EvTerm
 evCoercion co = EvExpr (Coercion co)
 
--- | d |> co
+{-# DEPRECATED mkEvCast "Please use evCast instead" #-}
+-- We had gotten duplicate functions; let's get rid of mkEvCast in due course
+mkEvCast :: EvExpr -> TcCoercion -> EvTerm
+mkEvCast = evCast
+
 evCast :: EvExpr -> TcCoercion -> EvTerm
-evCast et tc | isReflCo tc = EvExpr et
-             | otherwise   = EvExpr (Cast et tc)
+evCast et tc = EvExpr (evCastE et tc)
 
--- Dictionary instance application
+-- | d |> co
+evCastE :: EvExpr -> TcCoercion -> EvExpr
+evCastE ee co
+  | assertPpr (coercionRole co == Representational)
+              (vcat [text "Coercion of wrong role passed to evCastE:", ppr ee, ppr co]) $
+    isReflCo co = ee
+  | otherwise   = Cast ee co
+
 evDFunApp :: DFunId -> [Type] -> [EvExpr] -> EvTerm
-evDFunApp df tys ets = EvExpr $ Var df `mkTyApps` tys `mkApps` ets
+-- Dictionary instance application, including when the "dictionary function"
+-- is actually the data construtor for a dictionary
+evDFunApp df tys ets = EvExpr (evDFunAppE df tys ets)
 
-evDataConApp :: DataCon -> [Type] -> [EvExpr] -> EvTerm
-evDataConApp dc tys ets = evDFunApp (dataConWrapId dc) tys ets
+evDFunAppE :: DFunId -> [Type] -> [EvExpr] -> EvExpr
+evDFunAppE df tys ets = Var df `mkTyApps` tys `mkApps` ets
+
+evDictApp :: Class -> [Type] -> [EvExpr] -> EvTerm
+evDictApp cls tys args = EvExpr (evDictAppE cls tys args)
+
+evDictAppE :: Class -> [Type] -> [EvExpr] -> EvExpr
+evDictAppE cls tys args
+  = case tyConSingleDataCon_maybe (classTyCon cls) of
+      Just dc -> evDFunAppE (dataConWrapId dc) tys args
+      Nothing -> pprPanic "evDictApp" (ppr cls)
+
+evUnaryDictAppE :: Class -> [Type] -> EvExpr -> EvExpr
+-- See (UCM6) in Note [Unary class magic] in GHC.Core.TyCon
+evUnaryDictAppE cls tys meth
+  = evDictAppE cls tys [meth]
+
+evWrapIPE :: PredType -> EvExpr -> EvExpr
+-- Given  pred = IP s ty
+  --      et_tm :: ty
+-- Return an EvTerm of type (IP s ty)
+evWrapIPE pred ev_tm
+  = evUnaryDictAppE cls tys ev_tm
+  where
+    (cls, tys) = getClassPredTys pred
+
+evUnwrapIPE :: PredType -> EvExpr -> EvExpr
+-- Given  pred = IP s ty
+  --      et_tm :: (IP s ty)
+-- Return an EvTerm of type ty
+evUnwrapIPE pred ev_tm
+  = mkApps (Var ip_sel) (map Type tys ++ [ev_tm])
+  where
+    (ip_sel, tys) = decomposeIPPred pred
+
 
 -- Selector id plus the types at which it
 -- should be instantiated, used for HasField
@@ -585,7 +660,7 @@ data EvCallStack
 -}
 
 -- | Where to store evidence for expression holes
--- See Note [Holes] in GHC.Tc.Types.Constraint
+-- See Note [Holes in expressions] in GHC.Hs.Expr.
 data HoleExprRef = HER (IORef EvTerm)   -- ^ where to write the erroring expression
                        TcType           -- ^ expected type of that expression
                        Unique           -- ^ for debug output only
@@ -655,7 +730,6 @@ Conclusion: a new wanted coercion variable should be made mutable.
 [Notice though that evidence variables that bind coercion terms
  from super classes will be "given" and hence rigid]
 
-
 Note [Overview of implicit CallStacks]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 (See https://gitlab.haskell.org/ghc/ghc/wikis/explicit-call-stack/implicit-locations)
@@ -667,12 +741,13 @@ to constraints of type GHC.Stack.Types.HasCallStack, an alias
 
   type HasCallStack = (?callStack :: CallStack)
 
-Implicit parameters of type GHC.Stack.Types.CallStack (the name is not
-important) are solved in three steps:
+Implicit parameters of type GHC.Stack.Types.CallStack (the /name/ of the
+implicit parameter is not important, see (CS5) below) are solved as follows:
 
-1. Explicit, user-written occurrences of `?stk :: CallStack`
-   which have IPOccOrigin, are solved directly from the given IP,
-   just like a regular IP; see GHC.Tc.Solver.Dict.tryInertDicts.
+1. Plan NORMAL. Explicit, user-written occurrences of `?stk :: CallStack`, which
+   have IPOccOrigin, are solved directly from the given IP, just like any other
+   implicit-parameter constraint; see GHC.Tc.Solver.Dict.tryInertDicts. We can
+   solve it from a Given or from another Wanted, if the two have the same type.
 
    For example, the occurrence of `?stk` in
 
@@ -681,44 +756,33 @@ important) are solved in three steps:
 
    will be solved for the `?stk` in `error`s context as before.
 
-2. In a function call, instead of simply passing the given IP, we first
-   append the current call-site to it. For example, consider a
-   call to the callstack-aware `error` above.
+2. Plan PUSH.  A /function call/ with a CallStack constraint, such as
+   a call to `foo` where
+        foo :: (?stk :: CallStack) => a
+   will give rise to a Wanted constraint
+        [W] d :: (?stk :: CallStack)    CtOrigin = OccurrenceOf "foo"
 
-     foo :: (?stk :: CallStack) => a
-     foo = error "undefined!"
+   We do /not/ solve this constraint from Givens, or from other
+   Wanteds.  Rather, have a built-in mechanism in that solves it thus:
+        d := EvCsPushCall "foo" <details of call-site of `foo`> d2
+        [W] d2 :: (?stk :: CallStack)    CtOrigin = IPOccOrigin
 
-   Here we want to take the given `?stk` and append the current
-   call-site, before passing it to `error`. In essence, we want to
-   rewrite `foo "undefined!"` to
+   That is, `d` is a call-stack that has the `foo` call-site pushed on top of
+   `d2`, which can now be solved normally (as in (1) above).  This is done as follows:
+     - In GHC.Tc.Solver.Dict.canDictCt we do the pushing.
+     - We only look up canonical constraints in the inert set
 
-     let ?stk = pushCallStack <foo's location> ?stk
-     in foo "undefined!"
+3. For a CallStack constraint, we choose how to solve it based on its CtOrigin:
 
-   We achieve this as follows:
+     * solve it normally (plan NORMAL above)
+         - IPOccOrigin (discussed above)
+         - GivenOrigin (see (CS1) below)
 
-   * At a call of foo :: (?stk :: CallStack) => blah
-     we emit a Wanted
-        [W] d1 : IP "stk" CallStack
-     with CtOrigin = OccurrenceOf "foo"
+     * push an item on the stack and emit a new constraint (plan PUSH above)
+         - OccurrenceOf "foo" (discused above)
+         - anything else      (see (CS1) below)
 
-   * We /solve/ this constraint, in GHC.Tc.Solver.Dict.canDictNC
-     by emitting a NEW Wanted
-        [W] d2 :: IP "stk" CallStack
-     with CtOrigin = IPOccOrigin
-
-     and solve d1 = EvCsPushCall "foo" <foo's location> (EvId d1)
-
-   * The new Wanted, for `d2` will be solved per rule (1), ie as a regular IP.
-
-3. We use the predicate isPushCallStackOrigin to identify whether we
-   want to do (1) solve directly, or (2) push and then solve directly.
-   Key point (see #19918): the CtOrigin where we want to push an item on the
-   call stack can include IfThenElseOrigin etc, when RebindableSyntax is
-   involved.  See the defn of fun_orig in GHC.Tc.Gen.App.tcInstFun; it is
-   this CtOrigin that is pinned on the constraints generated by functions
-   in the "expansion" for rebindable syntax. c.f. GHC.Rename.Expr
-   Note [Handling overloaded and rebindable constructs]
+   This choice is by the predicate isPushCallStackOrigin_maybe
 
 4. We default any insoluble CallStacks to the empty CallStack. Suppose
    `undefined` did not request a CallStack, ie
@@ -754,21 +818,38 @@ and the call to `error` in `undefined`, but *not* the call to `head`
 in `g`, because `head` did not explicitly request a CallStack.
 
 
-Important Details:
-- GHC should NEVER report an insoluble CallStack constraint.
+Wrinkles
 
-- GHC should NEVER infer a CallStack constraint unless one was requested
+(CS1) Which CtOrigins should qualify for plan PUSH?  Certainly ones that arise
+   from a function call like (f a b).
+
+   But (see #19918) when RebindableSyntax is involved we can function call whose
+   CtOrigin is somethign like `IfThenElseOrigin`. See the defn of fun_orig in
+   GHC.Tc.Gen.App.tcInstFun; it is this CtOrigin that is pinned on the
+   constraints generated by functions in the "expansion" for rebindable
+   syntax. c.f. GHC.Rename.Expr Note [Handling overloaded and rebindable
+   constructs].
+
+   So isPushCallStackOrigin_maybe has a fall-through for "anything else", and
+   assumes that we should adopt plan PUSH for it.
+
+   However we should /not/ take this fall-through for Given constraints
+   (#25675).  So isPushCallStackOrigin_maybe identifies Givens as plan NORMAL.
+
+(CS2) GHC should NEVER report an insoluble CallStack constraint.
+
+(CS3) GHC should NEVER infer a CallStack constraint unless one was requested
   with a partial type signature (See GHC.Tc.Solver..pickQuantifiablePreds).
 
-- A CallStack (defined in GHC.Stack.Types) is a [(String, SrcLoc)],
+(CS4) A CallStack (defined in GHC.Stack.Types) is a [(String, SrcLoc)],
   where the String is the name of the binder that is used at the
   SrcLoc. SrcLoc is also defined in GHC.Stack.Types and contains the
   package/module/file name, as well as the full source-span. Both
   CallStack and SrcLoc are kept abstract so only GHC can construct new
   values.
 
-- We will automatically solve any wanted CallStack regardless of the
-  name of the IP, i.e.
+(CS5) We will automatically solve any wanted CallStack regardless of the
+  /name/ of the IP, i.e.
 
     f = show (?stk :: CallStack)
     g = show (?loc :: CallStack)
@@ -782,26 +863,17 @@ Important Details:
   the printed CallStack will NOT include head's call-site. This reflects the
   standard scoping rules of implicit-parameters.
 
-- An EvCallStack term desugars to a CoreExpr of type `IP "some str" CallStack`.
+(CS6) An EvCallStack term desugars to a CoreExpr of type `IP "some str" CallStack`.
   The desugarer will need to unwrap the IP newtype before pushing a new
   call-site onto a given stack (See GHC.HsToCore.Binds.dsEvCallStack)
 
-- When we emit a new wanted CallStack from rule (2) we set its origin to
+(CS7) When we emit a new wanted CallStack in plan PUSH we set its origin to
   `IPOccOrigin ip_name` instead of the original `OccurrenceOf func`
   (see GHC.Tc.Solver.Dict.tryInertDicts).
 
   This is a bit shady, but is how we ensure that the new wanted is
   solved like a regular IP.
-
 -}
-
-mkEvCast :: EvExpr -> TcCoercion -> EvTerm
-mkEvCast ev lco
-  | assertPpr (coercionRole lco == Representational)
-              (vcat [text "Coercion of wrong role passed to mkEvCast:", ppr ev, ppr lco]) $
-    isReflCo lco = EvExpr ev
-  | otherwise    = evCast ev lco
-
 
 mkEvScSelectors         -- Assume   class (..., D ty, ...) => C a b
   :: Class -> [TcType]  -- C ty1 ty2
@@ -822,25 +894,42 @@ isEmptyTcEvBinds :: TcEvBinds -> Bool
 isEmptyTcEvBinds (EvBinds b)    = isEmptyBag b
 isEmptyTcEvBinds (TcEvBinds {}) = panic "isEmptyTcEvBinds"
 
+evExprCoercion_maybe :: EvExpr -> Maybe TcCoercion
+-- Applied only to EvExprs of type (s~t)
+-- See Note [Coercion evidence terms]
+evExprCoercion_maybe (Var v)       = return (mkCoVarCo v)
+evExprCoercion_maybe (Coercion co) = return co
+evExprCoercion_maybe (Cast tm co)  = do { co' <- evExprCoercion_maybe tm
+                                        ; return (mkCoCast co' co) }
+evExprCoercion_maybe _             = Nothing
+
+evExprCoercion :: EvExpr -> TcCoercion
+evExprCoercion tm = case evExprCoercion_maybe tm of
+                      Just co -> co
+                      Nothing -> pprPanic "evExprCoercion" (ppr tm)
+
 evTermCoercion_maybe :: EvTerm -> Maybe TcCoercion
 -- Applied only to EvTerms of type (s~t)
 -- See Note [Coercion evidence terms]
 evTermCoercion_maybe ev_term
-  | EvExpr e <- ev_term = go e
+  | EvExpr e <- ev_term = evExprCoercion_maybe e
   | otherwise           = Nothing
-  where
-    go :: EvExpr -> Maybe TcCoercion
-    go (Var v)       = return (mkCoVarCo v)
-    go (Coercion co) = return co
-    go (Cast tm co)  = do { co' <- go tm
-                          ; return (mkCoCast co' co) }
-    go _             = Nothing
 
 evTermCoercion :: EvTerm -> TcCoercion
 evTermCoercion tm = case evTermCoercion_maybe tm of
                       Just co -> co
                       Nothing -> pprPanic "evTermCoercion" (ppr tm)
 
+-- Used with Opt_DeferTypeErrors
+-- See Note [Deferring coercion errors to runtime]
+-- in GHC.Tc.Solver
+evDelayedError :: Type -> String -> EvTerm
+evDelayedError ty msg
+  = EvExpr $
+    let fail_expr = mkRuntimeErrorApp tYPE_ERROR_ID unitTy msg
+    in mkWildCase fail_expr (unrestricted unitTy) ty []
+       -- See Note [Incompleteness and linearity] in GHC.HsToCore.Utils
+       -- c.f. mkErrorAppDs in GHC.HsToCore.Utils
 
 {- *********************************************************************
 *                                                                      *
@@ -848,41 +937,38 @@ evTermCoercion tm = case evTermCoercion_maybe tm of
 *                                                                      *
 ********************************************************************* -}
 
-findNeededEvVars :: EvBindMap -> VarSet -> VarSet
--- Find all the Given evidence needed by seeds,
--- looking transitively through binds
-findNeededEvVars ev_binds seeds
-  = transCloVarSet also_needs seeds
-  where
-   also_needs :: VarSet -> VarSet
-   also_needs needs = nonDetStrictFoldUniqSet add emptyVarSet needs
-     -- It's OK to use a non-deterministic fold here because we immediately
-     -- forget about the ordering by creating a set
+isNestedEvId :: Var -> Bool
+-- Just returns /nested/ free evidence variables; i.e ones with Internal Names
+-- Top-level ones (DFuns, dictionary selectors and the like) don't count
+-- Evidence variables are always Ids; do not pick TyVars
+isNestedEvId v = isId v && isInternalName (varName v)
 
-   add :: Var -> VarSet -> VarSet
-   add v needs
-     | Just ev_bind <- lookupEvBind ev_binds v
-     , EvBind { eb_info = EvBindGiven, eb_rhs = rhs } <- ev_bind
-     = evVarsOfTerm rhs `unionVarSet` needs
-     | otherwise
-     = needs
+nestedEvIdsOfTerm :: EvTerm -> VarSet
+-- Returns only EvIds satisfying relevantEvId
+nestedEvIdsOfTerm tm = fvVarSet (filterFV isNestedEvId (evTermFVs tm))
 
-evVarsOfTerm :: EvTerm -> VarSet
-evVarsOfTerm (EvExpr e)         = exprSomeFreeVars isEvVar e
-evVarsOfTerm (EvTypeable _ ev)  = evVarsOfTypeable ev
-evVarsOfTerm (EvFun {})         = emptyVarSet -- See Note [Free vars of EvFun]
+evTermFVs :: EvTerm -> FV
+evTermFVs (EvExpr e)         = exprFVs e
+evTermFVs (EvTypeable _ ev)  = evFVsOfTypeable ev
+evTermFVs (EvFun { et_tvs = tvs, et_given = given
+                 , et_binds = tc_ev_binds, et_body = v })
+  = case tc_ev_binds of
+      TcEvBinds {}  -> emptyFV  -- See Note [Free vars of EvFun]
+      EvBinds binds -> addBndrsFV bndrs fvs
+        where
+          fvs = foldr (unionFV . evTermFVs . eb_rhs) (unitFV v) binds
+          bndrs = foldr ((:) . eb_lhs) (tvs ++ given) binds
 
-evVarsOfTerms :: [EvTerm] -> VarSet
-evVarsOfTerms = mapUnionVarSet evVarsOfTerm
+evTermFVss :: [EvTerm] -> FV
+evTermFVss = mapUnionFV evTermFVs
 
-evVarsOfTypeable :: EvTypeable -> VarSet
-evVarsOfTypeable ev =
+evFVsOfTypeable :: EvTypeable -> FV
+evFVsOfTypeable ev =
   case ev of
-    EvTypeableTyCon _ e      -> mapUnionVarSet evVarsOfTerm e
-    EvTypeableTyApp e1 e2    -> evVarsOfTerms [e1,e2]
-    EvTypeableTrFun em e1 e2 -> evVarsOfTerms [em,e1,e2]
-    EvTypeableTyLit e        -> evVarsOfTerm e
-
+    EvTypeableTyCon _ e      -> mapUnionFV evTermFVs e
+    EvTypeableTyApp e1 e2    -> evTermFVss [e1,e2]
+    EvTypeableTrFun em e1 e2 -> evTermFVss [em,e1,e2]
+    EvTypeableTyLit e        -> evTermFVs e
 
 {- Note [Free vars of EvFun]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -890,19 +976,22 @@ Finding the free vars of an EvFun is made tricky by the fact the
 bindings et_binds may be a mutable variable.  Fortunately, we
 can just squeeze by.  Here's how.
 
-* evVarsOfTerm is used only by GHC.Tc.Solver.neededEvVars.
-* Each EvBindsVar in an et_binds field of an EvFun is /also/ in the
-  ic_binds field of an Implication
-* So we can track usage via the processing for that implication,
-  (see Note [Tracking redundant constraints] in GHC.Tc.Solver).
-  We can ignore usage from the EvFun altogether.
+* /During/ typechecking, `evTermFVs` is used only by `GHC.Tc.Solver.neededEvVars`
+  * Each EvBindsVar in an et_binds field of an EvFun is /also/ in the
+    ic_binds field of an Implication
+  * So we can track usage via the processing for that implication,
+    (see Note [Tracking redundant constraints] in GHC.Tc.Solver).
+    We can ignore usage from the EvFun altogether.
 
-************************************************************************
+* /After/ typechecking `evTermFVs` is used by `GHC.Iface.Ext.Ast`, but by
+  then it has been zonked so we can get at the bindings.
+-}
+
+{- *********************************************************************
 *                                                                      *
                   Pretty printing
 *                                                                      *
-************************************************************************
--}
+********************************************************************* -}
 
 instance Outputable HsWrapper where
   ppr co_fn = pprHsWrapper co_fn (no_parens (text "<>"))
@@ -983,30 +1072,6 @@ instance Outputable EvTypeable where
   ppr (EvTypeableTrFun tm t1 t2) = parens (ppr t1 <+> arr <+> ppr t2)
     where
       arr = pprArrowWithMultiplicity visArgTypeLike (Right (ppr tm))
-
-
-----------------------------------------------------------------------
--- Helper functions for dealing with IP newtype-dictionaries
-----------------------------------------------------------------------
-
--- | Create a 'Coercion' that unwraps an implicit-parameter
--- dictionary to expose the underlying value.
--- We expect the 'Type' to have the form `IP sym ty`,
--- and return a 'Coercion' `co :: IP sym ty ~ ty`
-unwrapIP :: Type -> CoercionR
-unwrapIP ty =
-  case unwrapNewTyCon_maybe tc of
-    Just (_,_,ax) -> mkUnbranchedAxInstCo Representational ax tys []
-    Nothing       -> pprPanic "unwrapIP" $
-                       text "The dictionary for" <+> quotes (ppr tc)
-                         <+> text "is not a newtype!"
-  where
-  (tc, tys) = splitTyConApp ty
-
--- | Create a 'Coercion' that wraps a value in an implicit-parameter
--- dictionary. See 'unwrapIP'.
-wrapIP :: Type -> CoercionR
-wrapIP ty = mkSymCo (unwrapIP ty)
 
 ----------------------------------------------------------------------
 -- A datatype used to pass information when desugaring quotations

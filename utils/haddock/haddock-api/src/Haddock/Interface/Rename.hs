@@ -25,20 +25,25 @@ import Control.Applicative ()
 import Control.DeepSeq (force)
 import Control.Monad hiding (mapM)
 import Control.Monad.Reader
-import Control.Monad.Writer.CPS
+import Control.Monad.Trans.Maybe (MaybeT (..), hoistMaybe)
+import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT)
+import Control.Monad.Writer.Class
 import Data.Foldable (traverse_)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Traversable (mapM)
 
-import GHC hiding (NoLink)
+import GHC hiding (NoLink, HsTypeGhcPsExt (..))
 import GHC.Builtin.Types (eqTyCon_RDR, tupleDataConName, tupleTyConName)
+import GHC.Core.TyCon (tyConResKind)
+import GHC.Driver.DynFlags (getDynFlags)
 import GHC.Types.Basic (Boxity (..), TopLevelFlag (..), TupleSort (..))
 import GHC.Types.Name
 import GHC.Types.Name.Reader (RdrName (Exact))
 import Language.Haskell.Syntax.BooleanFormula(BooleanFormula(..))
 
 import Haddock.Backends.Hoogle (ppExportD)
+import Haddock.Convert (synifyKindSig)
 import Haddock.GhcUtils
 import Haddock.Types
 
@@ -51,9 +56,7 @@ import Haddock.Types
 -- The renamed output gets written into fields in the Haddock interface record
 -- that were previously left empty.
 renameInterface
-  :: DynFlags
-  -- ^ GHC session dyn flags
-  -> Map.Map (Maybe String) (Set.Set String)
+  :: Map.Map (Maybe String) (Set.Set String)
   -- ^ Ignored symbols. A map from module names to unqualified names. Module
   -- 'Just M' mapping to name 'f' means that link warnings should not be
   -- generated for occurances of specifically 'M.f'. Module 'Nothing' mapping to
@@ -61,6 +64,7 @@ renameInterface
   -> LinkEnv
   -- ^ Link environment. A map from 'Name' to 'Module', where name 'n' maps to
   -- module 'M' if 'M' is the preferred link destination for name 'n'.
+  -> ExportInfo
   -> Bool
   -- ^ Are warnings enabled?
   -> Bool
@@ -68,18 +72,17 @@ renameInterface
   -> Interface
   -- ^ The interface we are renaming.
   -> Ghc Interface
-  -- ^ The renamed interface. Note that there is nothing really special about
-  -- this being in the 'Ghc' monad. This could very easily be any 'MonadIO' or
-  -- even pure, depending on the link warnings are reported.
-renameInterface dflags ignoreSet renamingEnv warnings hoogle iface = do
-  let (iface', warnedNames) =
-        runRnM
-          dflags
-          mdl
-          localLinkEnv
-          warnName
-          (hoogle && not (OptHide `elem` ifaceOptions iface))
-          (renameInterfaceRn iface)
+  -- ^ The renamed interface. The 'Ghc' monad is used to look up type
+  -- information and to get dynamic flags.
+renameInterface ignoreSet renamingEnv expInfo warnings hoogle iface = do
+  (iface', warnedNames) <-
+    runRnM
+      mdl
+      localLinkEnv
+      (expInfo <$ guard (OptRedactTypeSyns `elem` ifaceOptions iface))
+      warnName
+      (hoogle && not (OptHide `elem` ifaceOptions iface))
+      (renameInterfaceRn iface)
   reportMissingLinks mdl warnedNames
   return iface'
   where
@@ -107,6 +110,7 @@ renameInterface dflags ignoreSet renamingEnv warnings hoogle iface = do
         && isExternalName name
         && not (isBuiltInSyntax name)
         && not (isTyVarName name)
+        && not (isDerivedOccName $ nameOccName name)
         && Exact name /= eqTyCon_RDR
         -- Must not be in the set of ignored symbols for the module or the
         -- unqualified ignored symbols
@@ -144,14 +148,20 @@ reportMissingLinks mdl names
 -- | A renaming monad which provides 'MonadReader' access to a renaming
 -- environment, and 'MonadWriter' access to a 'Set' of names for which link
 -- warnings should be generated, based on the renaming environment.
-newtype RnM a = RnM {unRnM :: ReaderT RnMEnv (Writer (Set.Set Name)) a}
+newtype RnM a = RnM {unRnM :: ReaderT RnMEnv (WriterT (Set.Set Name) Ghc) a}
   deriving newtype (Functor, Applicative, Monad, MonadReader RnMEnv, MonadWriter (Set.Set Name))
+
+liftGhc :: Ghc a -> RnM a
+liftGhc = RnM . lift . lift
 
 -- | The renaming monad environment. Stores the linking environment (mapping
 -- names to modules), the link warning predicate, and the current module.
 data RnMEnv = RnMEnv
   { rnLinkEnv :: LinkEnv
   -- ^ The linking environment (map from names to modules)
+  , rnExportInfo :: Maybe ExportInfo
+  -- ^ Information about exported names and modules, only if
+  -- redact-type-synonyms is enabled
   , rnWarnName :: (Name -> Bool)
   -- ^ Link warning predicate (whether failing to find a link destination
   -- for a given name should result in a warning)
@@ -159,26 +169,24 @@ data RnMEnv = RnMEnv
   -- ^ The current module
   , rnHoogleOutput :: Bool
   -- ^ Should Hoogle output be generated for this module?
-  , rnDynFlags :: DynFlags
-  -- ^ GHC Session DynFlags, necessary for Hoogle output generation
   }
 
 -- | Run the renamer action in a renaming environment built using the given
 -- module, link env, and link warning predicate. Returns the renamed value along
 -- with a set of 'Name's that were not renamed and should be warned for (i.e.
 -- they satisfied the link warning predicate).
-runRnM :: DynFlags -> Module -> LinkEnv -> (Name -> Bool) -> Bool -> RnM a -> (a, Set.Set Name)
-runRnM dflags mdl linkEnv warnName hoogleOutput rn =
-  runWriter $ runReaderT (unRnM rn) rnEnv
+runRnM :: Module -> LinkEnv -> Maybe ExportInfo -> (Name -> Bool) -> Bool -> RnM a -> Ghc (a, Set.Set Name)
+runRnM mdl linkEnv mbExpInfo warnName hoogleOutput rn =
+  runWriterT $ runReaderT (unRnM rn) rnEnv
   where
     rnEnv :: RnMEnv
     rnEnv =
       RnMEnv
         { rnLinkEnv = linkEnv
+        , rnExportInfo = mbExpInfo
         , rnWarnName = warnName
         , rnModuleString = moduleString mdl
         , rnHoogleOutput = hoogleOutput
-        , rnDynFlags = dflags
         }
 
 --------------------------------------------------------------------------------
@@ -243,12 +251,13 @@ renameExportItem item = case item of
   ExportDecl ed@(ExportD decl pats doc subs instances fixities splice) -> do
     -- If Hoogle output should be generated, generate it
     RnMEnv{..} <- ask
+    dflags0 <- liftGhc getDynFlags
     let !hoogleOut =
           force $
             if rnHoogleOutput
               then
                 -- Since Hoogle is line based, we want to avoid breaking long lines.
-                let dflags = rnDynFlags{pprCols = maxBound}
+                let dflags = dflags0{pprCols = maxBound}
                  in ppExportD dflags ed
               else []
 
@@ -340,10 +349,10 @@ renameMaybeInjectivityAnn
   -> RnM (Maybe (LInjectivityAnn DocNameI))
 renameMaybeInjectivityAnn = traverse renameInjectivityAnn
 
-renameArrow :: HsArrow GhcRn -> RnM (HsArrow DocNameI)
-renameArrow (HsUnrestrictedArrow _) = return (HsUnrestrictedArrow noExtField)
-renameArrow (HsLinearArrow _) = return (HsLinearArrow noExtField)
-renameArrow (HsExplicitMult _ p) = HsExplicitMult noExtField <$> renameLType p
+renameMultAnn :: HsMultAnn GhcRn -> RnM (HsMultAnn DocNameI)
+renameMultAnn (HsUnannotated _) = return (HsUnannotated noExtField)
+renameMultAnn (HsLinearAnn _) = return (HsLinearAnn noExtField)
+renameMultAnn (HsExplicitMult _ p) = HsExplicitMult noExtField <$> renameLType p
 
 renameType :: HsType GhcRn -> RnM (HsType DocNameI)
 renameType t = case t of
@@ -361,8 +370,7 @@ renameType t = case t of
     lcontext' <- renameLContext lcontext
     ltype' <- renameLType ltype
     return (HsQualTy{hst_xqual = noAnn, hst_ctxt = lcontext', hst_body = ltype'})
-  HsTyVar _ ip (L l n) -> return . HsTyVar noAnn ip . L l =<< renameName n
-  HsBangTy _ b ltype -> return . HsBangTy noAnn b =<< renameLType ltype
+  HsTyVar _ ip (L l n) -> return . HsTyVar noAnn ip . L l =<< renameName (getName n)
   HsStarTy _ isUni -> return (HsStarTy noAnn isUni)
   HsAppTy _ a b -> do
     a' <- renameLType a
@@ -375,7 +383,7 @@ renameType t = case t of
   HsFunTy _ w a b -> do
     a' <- renameLType a
     b' <- renameLType b
-    w' <- renameArrow w
+    w' <- renameMultAnn w
     return (HsFunTy noAnn w' a' b')
   HsListTy _ ty -> return . (HsListTy noAnn) =<< renameLType ty
   HsIParamTy _ n ty -> liftM (HsIParamTy noAnn n) (renameLType ty)
@@ -389,7 +397,7 @@ renameType t = case t of
   HsTupleTy _ b ts -> return . HsTupleTy noAnn b =<< mapM renameLType ts
   HsSumTy _ ts -> HsSumTy noAnn <$> mapM renameLType ts
   HsOpTy _ prom a (L loc op) b -> do
-    op' <- renameName op
+    op' <- renameName (getName op)
     a' <- renameLType a
     b' <- renameLType b
     return (HsOpTy noAnn prom a' (L loc op') b')
@@ -403,8 +411,7 @@ renameType t = case t of
     doc' <- renameLDocHsSyn doc
     return (HsDocTy noAnn ty' doc')
   HsTyLit _ x -> return (HsTyLit noAnn (renameTyLit x))
-  HsRecTy _ a -> HsRecTy noAnn <$> mapM renameConDeclFieldField a
-  XHsType a -> pure (XHsType a)
+  XHsType a -> pure (XHsType (HsCoreTy a))
   HsExplicitListTy _ a b -> HsExplicitListTy noAnn a <$> mapM renameLType b
   -- Special-case unary boxed tuples so that they are pretty-printed as
   -- `'MkSolo x`, not `'(x)`
@@ -538,7 +545,16 @@ renameTyClD d = case d of
   SynDecl{tcdLName = lname, tcdTyVars = tyvars, tcdFixity = fixity, tcdRhs = rhs} -> do
     lname' <- renameNameL lname
     tyvars' <- renameLHsQTyVars tyvars
-    rhs' <- renameLType rhs
+    rhs' <- maybe (renameLType rhs) pure <=< runMaybeT $ do
+      expInfo <- MaybeT $ asks rnExportInfo
+      -- Given that we have matched on a 'SynDecl', this lookup /really should/
+      -- be 'ATyCon', and the 'synTyConRhs_maybe' result /really should/ be
+      -- 'Just', but out of an abundance of caution, failing either expectation
+      -- gracefully exits the monad instead of erroring.
+      ATyCon tc <- MaybeT $ liftGhc $ GHC.lookupName $ getName lname
+      guard . isTypeHidden expInfo <=< hoistMaybe $ synTyConRhs_maybe tc
+      let hsKind = synifyKindSig $ tyConResKind tc
+      lift $ fmap (XHsType . HsRedacted) <$> renameLType hsKind
     return
       ( SynDecl
           { tcdSExt = noExtField
@@ -694,14 +710,16 @@ renameCon
 renameCon
   ConDeclGADT
     { con_names = lnames
-    , con_bndrs = bndrs
+    , con_outer_bndrs = outer_bndrs
+    , con_inner_bndrs = inner_bndrs
     , con_mb_cxt = lcontext
     , con_g_args = details
     , con_res_ty = res_ty
     , con_doc = mbldoc
     } = do
     lnames' <- mapM renameNameL lnames
-    bndrs' <- mapM renameOuterTyVarBndrs bndrs
+    outer_bndrs' <- mapM renameOuterTyVarBndrs outer_bndrs
+    inner_bndrs' <- mapM renameHsForAllTelescope inner_bndrs
     lcontext' <- traverse renameLContext lcontext
     details' <- renameGADTDetails details
     res_ty' <- renameLType res_ty
@@ -710,7 +728,8 @@ renameCon
       ( ConDeclGADT
           { con_g_ext = noExtField
           , con_names = lnames'
-          , con_bndrs = bndrs'
+          , con_outer_bndrs = outer_bndrs'
+          , con_inner_bndrs = inner_bndrs'
           , con_mb_cxt = lcontext'
           , con_g_args = details'
           , con_res_ty = res_ty'
@@ -718,37 +737,47 @@ renameCon
           }
       )
 
-renameHsScaled
-  :: HsScaled GhcRn (LHsType GhcRn)
-  -> RnM (HsScaled DocNameI (LHsType DocNameI))
-renameHsScaled (HsScaled w ty) = HsScaled <$> renameArrow w <*> renameLType ty
+renameHsConDeclField
+  :: HsConDeclField GhcRn
+  -> RnM (HsConDeclField DocNameI)
+renameHsConDeclField cdf = do
+  w <- renameMultAnn (cdf_multiplicity cdf)
+  ty <- renameLType (cdf_type cdf)
+  doc <- mapM renameLDocHsSyn (cdf_doc cdf)
+  return
+    ( cdf
+      { cdf_ext = noExtField
+      , cdf_multiplicity = w
+      , cdf_type = ty
+      , cdf_doc = doc
+      }
+    )
 
 renameH98Details
   :: HsConDeclH98Details GhcRn
   -> RnM (HsConDeclH98Details DocNameI)
 renameH98Details (RecCon (L l fields)) = do
-  fields' <- mapM renameConDeclFieldField fields
+  fields' <- mapM renameHsConDeclRecFieldField fields
   return (RecCon (L (locA l) fields'))
-renameH98Details (PrefixCon ts ps) = PrefixCon ts <$> mapM renameHsScaled ps
+renameH98Details (PrefixCon ps) = PrefixCon <$> mapM renameHsConDeclField ps
 renameH98Details (InfixCon a b) = do
-  a' <- renameHsScaled a
-  b' <- renameHsScaled b
+  a' <- renameHsConDeclField a
+  b' <- renameHsConDeclField b
   return (InfixCon a' b')
 
 renameGADTDetails
   :: HsConDeclGADTDetails GhcRn
   -> RnM (HsConDeclGADTDetails DocNameI)
 renameGADTDetails (RecConGADT _ (L l fields)) = do
-  fields' <- mapM renameConDeclFieldField fields
+  fields' <- mapM renameHsConDeclRecFieldField fields
   return (RecConGADT noExtField (L (locA l) fields'))
-renameGADTDetails (PrefixConGADT _ ps) = PrefixConGADT noExtField <$> mapM renameHsScaled ps
+renameGADTDetails (PrefixConGADT _ ps) = PrefixConGADT noExtField <$> mapM renameHsConDeclField ps
 
-renameConDeclFieldField :: LConDeclField GhcRn -> RnM (LConDeclField DocNameI)
-renameConDeclFieldField (L l (ConDeclField _ names t doc)) = do
+renameHsConDeclRecFieldField :: LHsConDeclRecField GhcRn -> RnM (LHsConDeclRecField DocNameI)
+renameHsConDeclRecFieldField (L l (HsConDeclRecField _ names t)) = do
   names' <- mapM renameLFieldOcc names
-  t' <- renameLType t
-  doc' <- mapM renameLDocHsSyn doc
-  return $ L (locA l) (ConDeclField noExtField names' t' doc')
+  t' <- renameHsConDeclField t
+  return $ L (locA l) (HsConDeclRecField noExtField names' t')
 
 renameLFieldOcc :: LFieldOcc GhcRn -> RnM (LFieldOcc DocNameI)
 renameLFieldOcc (L l (FieldOcc rdr (L n sel))) = do

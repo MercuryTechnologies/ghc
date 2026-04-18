@@ -237,7 +237,7 @@ padLiveArgs platform live =
                text ") both alive AND mapped to the same real register: " <> ppr real <>
                text ". This isn't currently supported by the LLVM backend."
          go (cu@(GlobalRegUse c _):cs) f
-            | fpr_num c == f = go cs f                     -- already covered by a real register
+            | fpr_num c == f = go cs (f+1)                 -- already covered by a real register
             | otherwise      = ctor f : go (cu:cs) (f + 1) -- add padding register
 
     fpr_ctor :: GlobalRegUse -> Int -> GlobalRegUse
@@ -290,7 +290,7 @@ data LlvmEnv = LlvmEnv
 
     -- the following get cleared for every function (see @withClearVars@)
   , envVarMap    :: LlvmEnvMap       -- ^ Local variables so far, with type
-  , envStackRegs :: [GlobalReg]      -- ^ Non-constant registers (alloca'd in the function prelude)
+  , envStackRegs :: [GlobalRegUse]   -- ^ Non-constant registers (alloca'd in the function prelude)
   }
 
 type LlvmEnvMap = UniqFM Unique LlvmType
@@ -374,12 +374,14 @@ varLookup s = getEnv (flip lookupUFM (getUnique s) . envVarMap)
 funLookup s = getEnv (flip lookupUFM (getUnique s) . envFunMap)
 
 -- | Set a register as allocated on the stack
-markStackReg :: GlobalReg -> LlvmM ()
+markStackReg :: GlobalRegUse -> LlvmM ()
 markStackReg r = modifyEnv $ \env -> env { envStackRegs = r : envStackRegs env }
 
 -- | Check whether a register is allocated on the stack
-checkStackReg :: GlobalReg -> LlvmM Bool
-checkStackReg r = getEnv ((elem r) . envStackRegs)
+checkStackReg :: GlobalReg -> LlvmM (Maybe CmmType)
+checkStackReg r = do
+  stack_regs <- getEnv envStackRegs
+  return $ fmap globalRegUse_type $ lookupRegUse r stack_regs
 
 -- | Allocate a new global unnamed metadata identifier
 getMetaUniqueId :: LlvmM MetaId
@@ -524,10 +526,10 @@ generateExternDecls = do
   modifyEnv $ \env -> env { envAliases = emptyUniqSet }
   return (concat defss, [])
 
--- | Is a variable one of the special @$llvm@ globals?
+-- | Is a variable one of the special @\@llvm@ globals?
 isBuiltinLlvmVar :: LlvmVar -> Bool
 isBuiltinLlvmVar (LMGlobalVar lbl _ _ _ _ _) =
-    "$llvm" `isPrefixOf` unpackFS lbl
+    "llvm." `isPrefixOf` unpackFS lbl
 isBuiltinLlvmVar _ = False
 
 -- | Here we take a global variable definition, rename it with a

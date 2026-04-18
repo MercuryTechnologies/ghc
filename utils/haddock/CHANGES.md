@@ -1,6 +1,8 @@
 ## Changes in 2.32.0
  * Add highlighting for inline-code-blocks (sections enclosed in @'s)
 
+ * Fix missing documentation for orphan instances from other packages.
+
  * Add incremental mode to support rendering documentation one module at a time.
 
  * The flag `--no-compilation` has been added. This flag causes Haddock to avoid
@@ -10,6 +12,10 @@
  * Fix large margin on top of small headings
 
  * Include `package_info` with haddock's `--show-interface` option.
+
+ * `{-# OPTIONS_HADDOCK redact-type-synonyms #-}` pragma will hide the RHS of
+   type synonyms, and display the result kind instead, if the RHS contains any
+   unexported types.
 
 ## Changes in 2.28.0
  * `hi-haddock` is integrated, which means docstrings are no longer extracted

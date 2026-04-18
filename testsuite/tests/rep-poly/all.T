@@ -34,9 +34,14 @@ test('T22291', normal, compile, [''])
 test('T22291b', normal, compile, [''])
 test('T23051', normal, compile_fail, [''])
 test('T23153', normal, compile_fail, [''])
+test('T23153b', normal, compile, [''])
 test('T23154', normal, compile_fail, [''])
 test('T23176', normal, compile_fail, ['-XPartialTypeSignatures -fdefer-out-of-scope-variables'])
+test('T23883a', normal, compile_fail, [''])
+test('T23883b', normal, compile_fail, [''])
+test('T23883c', normal, compile_fail, [''])
 test('T23903', normal, compile_fail, [''])
+test('T26107', js_broken(22364), compile, ['-O'])
 
 test('EtaExpandDataCon', normal, compile, ['-O'])
 test('EtaExpandStupid1', normal, compile, ['-Wno-deprecated-flags'])
@@ -107,6 +112,7 @@ test('RepPolyWrappedVar', normal, compile_fail, [''])
 test('RepPolyWrappedVar2', [js_skip], compile, [''])
 test('UnliftedNewtypesCoerceFail', normal, compile_fail, [''])
 test('UnliftedNewtypesLevityBinder', normal, compile_fail, [''])
+test('NoEtaRequired', normal, compile, [''])
 
 ###############################################################################
 ## The following tests require rewriting in RuntimeReps,                     ##

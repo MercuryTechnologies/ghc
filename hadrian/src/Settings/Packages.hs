@@ -11,6 +11,7 @@ import Settings.Builders.Common (wayCcArgs)
 import GHC.Toolchain.Target
 import GHC.Platform.ArchOS
 import Data.Version.Extra
+import Settings.Program (ghcWithInterpreter)
 
 -- | Package-specific command-line arguments.
 packageArgs :: Args
@@ -39,11 +40,9 @@ packageArgs = do
     mconcat
         --------------------------------- base ---------------------------------
         [ package base ? mconcat
-          [ builder (Cabal Flags) ? notStage0 `cabalFlag` (pkgName ghcBignum)
-
-          -- This fixes the 'unknown symbol stat' issue.
-          -- See: https://github.com/snowleopard/hadrian/issues/259.
-          , builder (Ghc CompileCWithGhc) ? arg "-optc-O2" ]
+          [ -- This fixes the 'unknown symbol stat' issue.
+            -- See: https://github.com/snowleopard/hadrian/issues/259.
+            builder (Ghc CompileCWithGhc) ? arg "-optc-O2" ]
 
         --------------------------------- cabal --------------------------------
         -- Cabal is a large library and slow to compile. Moreover, we build it
@@ -85,7 +84,7 @@ packageArgs = do
             -- (#14335) and completely untested in CI for cross
             -- backends at the moment, so we might as well disable it
             -- for cross GHC.
-            [ andM [expr ghcWithInterpreter, notStage0, notCross] `cabalFlag` "internal-interpreter"
+            [ andM [expr (ghcWithInterpreter stage), notCross] `cabalFlag` "internal-interpreter"
             , notM cross `cabalFlag` "terminfo"
             , arg "-build-tool-depends"
             , flag UseLibzstd `cabalFlag` "with-libzstd"
@@ -107,16 +106,7 @@ packageArgs = do
              , compilerStageOption ghcDebugAssertions ? arg "-DDEBUG" ]
 
           , builder (Cabal Flags) ? mconcat
-            [
-              -- When cross compiling, enable for stage0 to get ghci
-              -- support. But when not cross compiling, disable for
-              -- stage0, otherwise we introduce extra dependencies
-              -- like haskeline etc, and mixing stageBoot/stage0 libs
-              -- can cause extra trouble (e.g. #25406)
-              expr ghcWithInterpreter ?
-                ifM (expr cross)
-                  (arg "internal-interpreter")
-                  (notStage0 `cabalFlag` "internal-interpreter")
+            [ (expr (ghcWithInterpreter stage)) `cabalFlag` "internal-interpreter"
             , ifM stage0
                   -- We build a threaded stage 1 if the bootstrapping compiler
                   -- supports it.
@@ -131,13 +121,6 @@ packageArgs = do
         -------------------------------- ghcPkg --------------------------------
         , package ghcPkg ?
           builder (Cabal Flags) ? notM cross `cabalFlag` "terminfo"
-
-        -------------------------------- ghcPrim -------------------------------
-        , package ghcPrim ? mconcat
-          [ builder (Cabal Flags) ? flag NeedLibatomic `cabalFlag` "need-atomic"
-
-          , builder (Cc CompileC) ? (not <$> flag CcLlvmBackend) ?
-            input "**/cbits/atomic.c"  ? arg "-Wno-sync-nand" ]
 
         -------------------------------- ghcBoot ------------------------------
         , package ghcBoot ?
@@ -232,8 +215,8 @@ packageArgs = do
         , package hsc2hs ?
           builder (Cabal Flags) ? arg "in-ghc-tree"
 
-        ------------------------------ ghc-bignum ------------------------------
-        , ghcBignumArgs
+        ------------------------------ ghc-internal ------------------------------
+        , ghcInternalArgs
 
         ---------------------------------- rts ---------------------------------
         , package rts ? rtsPackageArgs -- RTS deserves a separate function
@@ -253,8 +236,8 @@ packageArgs = do
 
         ]
 
-ghcBignumArgs :: Args
-ghcBignumArgs = package ghcBignum ? do
+ghcInternalArgs :: Args
+ghcInternalArgs = package ghcInternal ? do
     -- These are only used for non-in-tree builds.
     librariesGmp <- getSetting GmpLibDir
     includesGmp <- getSetting GmpIncludeDir
@@ -263,11 +246,11 @@ ghcBignumArgs = package ghcBignum ? do
     check   <- getBignumCheck
 
     mconcat
-          [ -- select BigNum backend
-            builder (Cabal Flags) ? arg backend
+          [ -- select bignum backend
+            builder (Cabal Flags) ? arg ("bignum-" <> backend)
 
           , -- check the selected backend against native backend
-            builder (Cabal Flags) ? check `cabalFlag` "check"
+            builder (Cabal Flags) ? check `cabalFlag` "bignum-check"
 
             -- backend specific
           , case backend of
@@ -275,7 +258,7 @@ ghcBignumArgs = package ghcBignum ? do
                    [ builder (Cabal Setup) ? mconcat
 
                        -- enable GMP backend: configure script will produce
-                       -- `ghc-bignum.buildinfo` and `include/HsIntegerGmp.h`
+                       -- `ghc-internal.buildinfo` and `include/HsIntegerGmp.h`
                      [ arg "--configure-option=--with-gmp"
 
                        -- enable in-tree support: don't depend on external "gmp"
@@ -286,30 +269,20 @@ ghcBignumArgs = package ghcBignum ? do
                      , flag GmpFrameworkPref ?
                        arg "--configure-option=--with-gmp-framework-preferred"
 
-                       -- Ensure that the ghc-bignum package registration includes
+                       -- Ensure that the ghc-internal package registration includes
                        -- knowledge of the system gmp's library and include directories.
                      , notM (flag GmpInTree) ? cabalExtraDirs includesGmp librariesGmp
                      ]
                   ]
                _ -> mempty
+
+          , builder (Cabal Flags) ? flag NeedLibatomic `cabalFlag` "need-atomic"
+
           ]
 
 -- | RTS-specific command line arguments.
 rtsPackageArgs :: Args
 rtsPackageArgs = package rts ? do
-    projectVersion <- getSetting ProjectVersion
-    hostPlatform   <- queryHost targetPlatformTriple
-    hostArch       <- queryHost queryArch
-    hostOs         <- queryHost queryOS
-    hostVendor     <- queryHost queryVendor
-    buildPlatform  <- queryBuild targetPlatformTriple
-    buildArch      <- queryBuild queryArch
-    buildOs        <- queryBuild queryOS
-    buildVendor    <- queryBuild queryVendor
-    targetPlatform <- queryTarget targetPlatformTriple
-    targetArch     <- queryTarget queryArch
-    targetOs       <- queryTarget queryOS
-    targetVendor   <- queryTarget queryVendor
     ghcUnreg       <- queryTarget tgtUnregisterised
     ghcEnableTNC   <- queryTarget tgtTablesNextToCode
     rtsWays        <- getRtsWays
@@ -377,27 +350,11 @@ rtsPackageArgs = package rts ? do
 
           , inputs ["**/RtsMessages.c", "**/Trace.c"] ?
             pure
-              ["-DProjectVersion=" ++ show projectVersion
-              , "-DRtsWay=\"rts_" ++ show way ++ "\""
+              [ "-DRtsWay=\"rts_" ++ show way ++ "\""
               ]
 
           , input "**/RtsUtils.c" ? pure
-            [ "-DProjectVersion="            ++ show projectVersion
-            , "-DHostPlatform="              ++ show hostPlatform
-            , "-DHostArch="                  ++ show hostArch
-            , "-DHostOS="                    ++ show hostOs
-            , "-DHostVendor="                ++ show hostVendor
-            , "-DBuildPlatform="             ++ show buildPlatform
-            , "-DBuildArch="                 ++ show buildArch
-            , "-DBuildOS="                   ++ show buildOs
-            , "-DBuildVendor="               ++ show buildVendor
-            , "-DTargetPlatform="            ++ show targetPlatform
-            , "-DTargetArch="                ++ show targetArch
-            , "-DTargetOS="                  ++ show targetOs
-            , "-DTargetVendor="              ++ show targetVendor
-            , "-DGhcUnregisterised="         ++ show (yesNo ghcUnreg)
-            , "-DTablesNextToCode="          ++ show (yesNo ghcEnableTNC)
-            , "-DRtsWay=\"rts_" ++ show way ++ "\""
+            [ "-DRtsWay=\"rts_" ++ show way ++ "\""
             ]
 
           -- We're after pure performance here. So make sure fast math and
@@ -444,6 +401,9 @@ rtsPackageArgs = package rts ? do
 
           , input "**/RetainerProfile.c" ? flag CcLlvmBackend ?
             arg "-Wno-incompatible-pointer-types"
+
+          , input "**/prim/atomic.c"  ? (not <$> flag CcLlvmBackend) ?
+            arg "-Wno-sync-nand"
           ]
 
     mconcat

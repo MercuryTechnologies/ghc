@@ -134,6 +134,7 @@ CrossCompiling        = @CrossCompiling@
 CrossCompilePrefix    = @CrossCompilePrefix@
 GhcUnregisterised     = @Unregisterised@
 EnableDistroToolchain = @SettingsUseDistroMINGW@
+BaseUnitId            = @BaseUnitId@
 
 # The THREADED_RTS requires `BaseReg` to be in a register and the
 # `GhcUnregisterised` mode doesn't allow that.
@@ -148,7 +149,7 @@ endif
 # Whether to include GHCi in the compiler.  Depends on whether the RTS linker
 # has support for this OS/ARCH combination.
 OsSupportsGHCi=$(strip $(patsubst $(TargetOS_CPP), YES, $(findstring $(TargetOS_CPP), mingw32 linux solaris2 freebsd dragonfly netbsd openbsd darwin kfreebsdgnu wasi)))
-ArchSupportsGHCi=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 powerpc powerpc64 powerpc64le sparc sparc64 arm aarch64 riscv64 wasm32)))
+ArchSupportsGHCi=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 powerpc powerpc64 powerpc64le sparc sparc64 arm aarch64 riscv64 wasm32 loongarch64)))
 
 ifeq "$(OsSupportsGHCi)$(ArchSupportsGHCi)" "YESYES"
 GhcWithInterpreter=YES

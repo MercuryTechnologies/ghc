@@ -54,7 +54,7 @@ import GHC.Internal.Base ( Applicative(..), Monad(..), Monoid, Maybe(..), NonEmp
                   ($), (.), id, flip )
 import GHC.Internal.Generics
 import qualified GHC.Internal.List as List ( foldr )
-import GHC.Tuple (Solo (..))
+import GHC.Internal.Tuple (Solo (..))
 
 -- $setup
 -- >>> import Prelude
@@ -245,7 +245,7 @@ instance Traversable [] where
 
 -- | @since base-4.9.0.0
 instance Traversable NonEmpty where
-  traverse f ~(a :| as) = liftA2 (:|) (f a) (traverse f as)
+  traverse f (a :| as) = liftA2 (:|) (f a) (traverse f as)
 
 -- | @since base-4.7.0.0
 instance Traversable (Either a) where
@@ -486,4 +486,3 @@ foldMapDefault :: forall t m a . (Traversable t, Monoid m)
 {-# INLINE foldMapDefault #-}
 -- See Note [Function coercion] in Data.Functor.Utils.
 foldMapDefault = coerce (traverse @t @(Const m) @a @())
-

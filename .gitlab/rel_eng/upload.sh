@@ -6,9 +6,9 @@ set -Eeuo pipefail
 # This is a script for preparing and uploading a release of GHC.
 #
 # Usage,
-#   1. Update $ver
-#   2. Set $SIGNING_KEY to your key id (prefixed with '=')
-#   3. Create a directory and place the source and binary tarballs there
+#   1. Set $SIGNING_KEY to your key id (prefixed with '=')
+#   2. Create a directory named after the release name (e.g. 9.6.1-rc1 or 9.6.1)
+#   3. Place the source and binary tarballs in this directory
 #   4. Run this script from that directory
 #
 # You can also invoke the script with an argument to perform only
@@ -34,10 +34,10 @@ set -Eeuo pipefail
 : ${SIGNING_KEY:="=Benjamin Gamari <ben@well-typed.com>"}
 
 
-# Infer release name from directory name
+# Infer friendly release name from directory name
 : ${rel_name:=$(basename $(pwd))}
 
-# Infer version from tarball names
+# Infer project version from tarball names
 : ${ver:=$(ls ghc-*.tar.* | sed -ne 's/ghc-\([0-9]\+\.[0-9]\+\.[0-9]\+\(\.[0-9]\+\)\?\).\+/\1/p' | head -n1)}
 if [ -z "$ver" ]; then echo "Failed to infer \$ver"; exit 1; fi
 
@@ -59,8 +59,10 @@ usage() {
     echo "  prepare_docs       prepare the documentation directory"
     echo "  upload_docs        upload documentation downloads.haskell.org"
     echo "  upload             upload the tarballs and documentation to downloads.haskell.org"
+    echo "  set_symlink <symlink>"
+    echo "                     set the given symlink (e.g. latest) to the current version"
     echo "  purge_all          purge entire release from the CDN"
-    echo "  purge_file file    purge a given file from the CDN"
+    echo "  purge_file <file>  purge a given file from the CDN"
     echo "  verify             verify the signatures in this directory"
     echo
 }
@@ -198,6 +200,14 @@ function upload_docs() {
         args+=( "--publish" )
     fi
     "$GHC_TREE/.gitlab/rel_eng/upload_ghc_libs.py" upload --docs=hackage_docs ${args[@]}
+}
+
+function set_symlink() {
+    local SYMLINK="$1"
+    # Check to make sure that the indicated version actually exists.
+    curl "https://downloads.haskell.org/ghc/$ver" > /dev/null || (echo "$ver doesn't exist"; exit 1)
+    echo -e "rm ghc/$SYMLINK\nln -s $ver ghc/$SYMLINK" | sftp ghc@downloads-origin.haskell.org
+    curl -X PURGE "http://downloads.haskell.org/~ghc/$SYMLINK"
 }
 
 if [ "x$1" == "x" ]; then

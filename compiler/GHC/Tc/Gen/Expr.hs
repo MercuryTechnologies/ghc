@@ -19,7 +19,7 @@ module GHC.Tc.Gen.Expr
        ( tcCheckPolyExpr, tcCheckPolyExprNC,
          tcCheckMonoExpr, tcCheckMonoExprNC,
          tcMonoExpr, tcMonoExprNC,
-         tcInferRho, tcInferRhoNC,
+         tcInferExpr, tcInferSigma, tcInferRho, tcInferRhoNC,
          tcPolyLExpr, tcPolyExpr, tcExpr, tcPolyLExprSig,
          tcSyntaxOp, tcSyntaxOpGen, SyntaxOpType(..), synKnownType,
          tcCheckId,
@@ -34,58 +34,65 @@ import {-# SOURCE #-} GHC.Tc.Gen.Splice
 
 import GHC.Hs
 import GHC.Hs.Syn.Type
+
 import GHC.Rename.Utils
-import GHC.Tc.Utils.Monad
-import GHC.Tc.Utils.Unify
-import GHC.Types.Basic
-import GHC.Types.Error
-import GHC.Types.FieldLabel
-import GHC.Types.Unique.FM
-import GHC.Types.Unique.Map
-import GHC.Types.Unique.Set
-import GHC.Core.Multiplicity
-import GHC.Core.UsageEnv
-import GHC.Tc.Errors.Types
-import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic, hasFixedRuntimeRep )
-import GHC.Tc.Utils.Instantiate
+import GHC.Rename.Env         ( addUsedGRE, getUpdFieldLbls )
+
 import GHC.Tc.Gen.App
 import GHC.Tc.Gen.Head
 import GHC.Tc.Gen.Bind        ( tcLocalBinds )
-import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
-import GHC.Core.FamInstEnv    ( FamInstEnvs )
-import GHC.Rename.Env         ( addUsedGRE, getUpdFieldLbls )
-import GHC.Tc.Utils.Env
+import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Arrow
 import GHC.Tc.Gen.Match( tcBody, tcLambdaMatches, tcCaseMatches
-                       , tcGRHSList, tcDoStmts )
-import GHC.Tc.Gen.HsType
-import GHC.Tc.Utils.TcMType
+                       , tcGRHSNE, tcDoStmts )
+import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
 import GHC.Tc.Zonk.TcType
-import GHC.Tc.Types.Origin
+import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType as TcType
-import GHC.Types.Id
-import GHC.Types.Id.Info
+import GHC.Tc.Utils.Monad
+import GHC.Tc.Utils.Unify
+import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic, hasFixedRuntimeRep )
+import GHC.Tc.Utils.Instantiate
+import GHC.Tc.Utils.Env
+import GHC.Tc.Types.Origin
+import GHC.Tc.Types.Evidence
+import GHC.Tc.Errors.Types hiding (HoleError)
+
+import GHC.Core.Multiplicity
+import GHC.Core.UsageEnv
+import GHC.Core.FamInstEnv    ( FamInstEnvs )
 import GHC.Core.ConLike
 import GHC.Core.DataCon
-import GHC.Types.Name
-import GHC.Types.Name.Env
-import GHC.Types.Name.Set
-import GHC.Types.Name.Reader
 import GHC.Core.Class(classTyCon)
 import GHC.Core.TyCon
 import GHC.Core.Type
 import GHC.Core.Coercion
-import GHC.Tc.Types.Evidence
+import GHC.Core.Predicate( decomposeIPPred )
+
+import GHC.Types.Basic
+import GHC.Types.Unique.FM
+import GHC.Types.Unique.Map
+import GHC.Types.Unique.Set
+import GHC.Types.Id
+import GHC.Types.Id.Info
+import GHC.Types.Name
+import GHC.Types.Name.Env
+import GHC.Types.Name.Set
+import GHC.Types.Name.Reader
+import GHC.Types.SrcLoc
+
 import GHC.Builtin.Types
 import GHC.Builtin.Names
 import GHC.Builtin.Uniques ( mkBuiltinUnique )
+
 import GHC.Driver.DynFlags
-import GHC.Types.SrcLoc
+
 import GHC.Utils.Misc
-import GHC.Data.List.SetOps
-import GHC.Data.Maybe
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
+
+import GHC.Data.List.SetOps
+import GHC.Data.Maybe
 
 import Control.Monad
 import qualified Data.List.NonEmpty as NE
@@ -226,17 +233,24 @@ tcPolyExprCheck expr res_ty
 *                                                                      *
 ********************************************************************* -}
 
+tcInferSigma :: LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcSigmaType)
+tcInferSigma = tcInferExpr IIF_Sigma
+
 tcInferRho, tcInferRhoNC :: LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcRhoType)
 -- Infer a *rho*-type. The return type is always instantiated.
-tcInferRho (L loc expr)
-  = setSrcSpanA loc   $  -- Set location /first/; see GHC.Tc.Utils.Monad
+tcInferRho   = tcInferExpr   IIF_DeepRho
+tcInferRhoNC = tcInferExprNC IIF_DeepRho
+
+tcInferExpr, tcInferExprNC :: InferInstFlag -> LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcType)
+tcInferExpr iif (L loc expr)
+  = setSrcSpanA loc  $  -- Set location /first/; see GHC.Tc.Utils.Monad
     addExprCtxt expr $  -- Note [Error contexts in generated code]
-    do { (expr', rho) <- tcInfer (tcExpr expr)
+    do { (expr', rho) <- runInfer iif IFRR_Any (tcExpr expr)
        ; return (L loc expr', rho) }
 
-tcInferRhoNC (L loc expr)
-  = setSrcSpanA loc $
-    do { (expr', rho) <- tcInfer (tcExpr expr)
+tcInferExprNC iif (L loc expr)
+  = setSrcSpanA loc  $
+    do { (expr', rho) <- runInfer iif IFRR_Any (tcExpr expr)
        ; return (L loc expr', rho) }
 
 ---------------
@@ -296,23 +310,19 @@ tcExpr e@(ExprWithTySig {})      res_ty = tcApp e res_ty
 
 tcExpr (XExpr e)                 res_ty = tcXExpr e res_ty
 
-tcExpr e@(HsOverLit _ lit) res_ty
-  = do { mb_res <- tcShortCutLit lit res_ty
-         -- See Note [Short cut for overloaded literals] in GHC.Tc.Zonk.Type
-       ; case mb_res of
-           Just lit' -> return (HsOverLit noExtField lit')
-           Nothing   -> tcApp e res_ty }
-
 -- Typecheck an occurrence of an unbound Id
 --
 -- Some of these started life as a true expression hole "_".
--- Others might simply be variables that accidentally have no binding site
-tcExpr (HsUnboundVar _ occ) res_ty
+-- Others might simply be variables that accidentally have no binding site.
+tcExpr (HsHole (HoleVar locc@(L _ occ))) res_ty
   = do { ty <- expTypeToType res_ty    -- Allow Int# etc (#12531)
        ; her <- emitNewExprHole occ ty
        ; tcEmitBindingUsage bottomUE   -- Holes fit any usage environment
                                        -- (#18491)
-       ; return (HsUnboundVar her occ) }
+       ; return (HsHole (HoleVar locc, her))
+       }
+tcExpr (HsHole HoleError) _ =
+  panic "GHC.Tc.Gen.Expr: tcExpr: HoleError: Not implemented"
 
 tcExpr e@(HsLit x lit) res_ty
   = do { let lit_ty = hsLitType lit
@@ -338,20 +348,64 @@ tcExpr e@(HsIPVar _ x) res_ty
           -- Create a unification type variable of kind 'Type'.
           -- (The type of an implicit parameter must have kind 'Type'.)
        ; let ip_name = mkStrLitTy (hsIPNameFS x)
-       ; ipClass <- tcLookupClass ipClassName
-       ; ip_var <- emitWantedEvVar origin (mkClassPred ipClass [ip_name, ip_ty])
+             origin  = IPOccOrigin x
+       ; ip_class <- tcLookupClass ipClassName
+       ; let ip_pred = mkClassPred ip_class [ip_name, ip_ty]
+       ; ip_dict <- emitWantedEvVar origin ip_pred
+       ; let (ip_op, _) = decomposeIPPred ip_pred
+             wrap = mkWpEvVarApps [ip_dict] <.> mkWpTyApps [ip_name, ip_ty]
        ; tcWrapResult e
-                   (fromDict ipClass ip_name ip_ty (HsVar noExtField (noLocA ip_var)))
-                   ip_ty res_ty }
-  where
-  -- Coerces a dictionary for `IP "x" t` into `t`.
-  fromDict ipClass x ty = mkHsWrap $ mkWpCastR $
-                          unwrapIP $ mkClassPred ipClass [x,ty]
-  origin = IPOccOrigin x
+               (mkHsWrap wrap (mkHsVar (noLocA ip_op)))
+               ip_ty res_ty }
 
 tcExpr e@(HsLam x lam_variant matches) res_ty
   = do { (wrap, matches') <- tcLambdaMatches e lam_variant matches [] res_ty
        ; return (mkHsWrap wrap $ HsLam x lam_variant matches') }
+
+{-
+************************************************************************
+*                                                                      *
+                Overloaded literals
+*                                                                      *
+************************************************************************
+-}
+
+tcExpr e@(HsOverLit _ lit) res_ty
+  = -- See Note [Typechecking overloaded literals]
+    do { mb_res <- tcShortCutLit lit res_ty
+         -- See Note [Short cut for overloaded literals] in GHC.Tc.Utils.TcMType
+       ; case mb_res of
+           Just lit' -> return (HsOverLit noExtField lit')
+           Nothing   -> tcApp e res_ty }
+           -- Why go via tcApp? See Note [Typechecking overloaded literals]
+
+{- Note [Typechecking overloaded literals]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Generally speaking, an overloaded literal like "3" typechecks as if you
+had written (fromInteger (3 :: Integer)).   But in practice it's a little
+tricky:
+
+* Rebindable syntax (see #19154 and !4981). With rebindable syntax we might have
+     fromInteger :: Integer -> forall a. Num a => a
+  and then we might hope to use a Visible Type Application (VTA) to write
+     3 @Int
+  expecting it to expand to
+     fromInteger (3::Integer) @Int dNumInt
+  To achieve that, we need to
+    * treat the application using `tcApp` to deal with the VTA
+    * treat the overloaded literal as the "head" of an application;
+      see `GHC.Tc.Gen.Head.tcInferAppHead`.
+
+* Short-cutting.  If we have
+     xs :: [Int]
+     xs = [3,4,5,6... ]
+  then it's a huge short-cut (in compile time) to just cough up the `Int` literal
+  for `3`, rather than (fromInteger @Int d), with a wanted constraint `[W] Num Int`.
+  See Note [Short cut for overloaded literals] in GHC.Tc.Utils.TcMType.
+
+  We can only take this short-cut if rebindable syntax is off; see `tcShortCutLit`.
+-}
+
 
 {-
 ************************************************************************
@@ -456,7 +510,7 @@ tcExpr (HsCase ctxt scrut matches) res_ty
         ; (scrut', scrut_ty) <- tcScalingUsage mult $ tcInferRho scrut
 
         ; hasFixedRuntimeRep_syntactic FRRCase scrut_ty
-        ; matches' <- tcCaseMatches tcBody (Scaled mult scrut_ty) matches res_ty
+        ; matches' <- tcCaseMatches ctxt tcBody (Scaled mult scrut_ty) matches res_ty
         ; return (HsCase ctxt scrut' matches') }
 
 tcExpr (HsIf x pred b1 b2) res_ty
@@ -491,7 +545,7 @@ Not using 'sup' caused #23814.
 -}
 
 tcExpr (HsMultiIf _ alts) res_ty
-  = do { alts' <- tcGRHSList IfAlt tcBody alts res_ty
+  = do { alts' <- tcGRHSNE IfAlt tcBody alts res_ty
                   -- See Note [MultiWayIf linearity checking]
        ; res_ty <- readExpType res_ty
        ; return (HsMultiIf res_ty alts') }
@@ -515,10 +569,8 @@ tcExpr (HsStatic fvs expr) res_ty
   = do  { res_ty          <- expTypeToType res_ty
         ; (co, (p_ty, expr_ty)) <- matchExpectedAppTy res_ty
         ; (expr', lie)    <- captureConstraints $
-            addErrCtxt (hang (text "In the body of a static form:")
-                             2 (ppr expr)
-                       ) $
-            tcCheckPolyExprNC expr expr_ty
+            addErrCtxt (StaticFormCtxt expr) $
+              tcCheckPolyExprNC expr expr_ty
 
         -- Check that the free variables of the static form are closed.
         -- It's OK to use nonDetEltsUniqSet here as the only side effects of
@@ -561,9 +613,9 @@ tcExpr (HsFunArr _ _ _ _) _ = failWith (TcRnIllegalTypeExpr FunctionArrowSyntax)
 ************************************************************************
 -}
 
-tcExpr expr@(RecordCon { rcon_con = L loc con_name
+tcExpr expr@(RecordCon { rcon_con = L loc qcon@(WithUserRdr _ con_name)
                        , rcon_flds = rbinds }) res_ty
-  = do  { con_like <- tcLookupConLike con_name
+  = do  { con_like <- tcLookupConLike qcon
 
         ; (con_expr, con_sigma) <- tcInferConLike con_like
         ; (con_wrap, con_tau)   <- topInstantiate orig con_sigma
@@ -575,12 +627,7 @@ tcExpr expr@(RecordCon { rcon_con = L loc con_name
         ; checkTc (conLikeHasBuilder con_like) $
           nonBidirectionalErr (conLikeName con_like)
 
-        ; rbinds' <- tcRecordBinds con_like (map scaledThing arg_tys) rbinds
-                   -- It is currently not possible for a record to have
-                   -- multiplicities. When they do, `tcRecordBinds` will take
-                   -- scaled types instead. Meanwhile, it's safe to take
-                   -- `scaledThing` above, as we know all the multiplicities are
-                   -- Many.
+        ; rbinds' <- tcRecordBinds con_like arg_tys rbinds
 
         ; let rcon_tc = mkHsWrap con_wrap con_expr
               expr' = RecordCon { rcon_ext = rcon_tc
@@ -673,7 +720,7 @@ tcExpr (HsProjection _ _) _ = panic "GHC.Tc.Gen.Expr: tcExpr: HsProjection: Not 
 -- Here we get rid of it and add the finalizers to the global environment.
 -- See Note [Delaying modFinalizers in untyped splices] in GHC.Rename.Splice.
 tcExpr (HsTypedSplice ext splice)   res_ty = tcTypedSplice ext splice res_ty
-tcExpr e@(HsTypedBracket _ body)    res_ty = tcTypedBracket e body res_ty
+tcExpr e@(HsTypedBracket _ext body)    res_ty = tcTypedBracket e body res_ty
 
 tcExpr e@(HsUntypedBracket ps body) res_ty = tcUntypedBracket e body ps res_ty
 tcExpr (HsUntypedSplice splice _)   res_ty
@@ -735,6 +782,7 @@ tcXExpr xe@(ExpandedThingRn o e') res_ty
   | OrigStmt ls@(L loc _) <- o
   = setSrcSpanA loc $
        mkExpandedStmtTc ls <$> tcApp (XExpr xe) res_ty
+
 tcXExpr xe res_ty = tcApp (XExpr xe) res_ty
 
 {-
@@ -837,7 +885,7 @@ tcInferTupArgs boxity args
          ; return (Missing (Scaled mult arg_ty), arg_ty) }
   tc_infer_tup_arg i (Present x lexpr@(L l expr))
     = do { (expr', arg_ty) <- case boxity of
-             Unboxed -> tcInferFRR (FRRUnboxedTuple i) (tcPolyExpr expr)
+             Unboxed -> runInferRhoFRR (FRRUnboxedTuple i) (tcPolyExpr expr)
              Boxed   -> do { arg_ty <- newFlexiTyVarTy liftedTypeKind
                            ; L _ expr' <- tcCheckPolyExpr lexpr arg_ty
                            ; return (expr', arg_ty) }
@@ -1022,7 +1070,8 @@ tcSynArgA orig op sigma_ty arg_shapes res_shape thing_inside
     tc_syn_arg _ (SynFun {}) _
       = pprPanic "tcSynArgA hits a SynFun" (ppr orig)
     tc_syn_arg res_ty (SynType the_ty) thing_inside
-      = do { wrap   <- tcSubType orig GenSigCtxt res_ty the_ty
+      = do { wrap   <- addSubTypeCtxt res_ty the_ty $
+                       tcSubType orig GenSigCtxt Nothing res_ty the_ty
            ; result <- thing_inside []
            ; return (result, wrap) }
 
@@ -1151,13 +1200,34 @@ Wrinkle [Using IdSig]
 
 Note [Type-directed record disambiguation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-GHC currently supports an additional type-directed disambiguation
-mechanism, which is deprecated and scheduled for removal as part of
-GHC proposal #366 https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0366-no-ambiguous-field-access.rst.
+Deprecation notice:
+  The type-directed disambiguation mechanism for record updates described in
+  this Note is deprecated, as per GHC proposal #366 (https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0366-no-ambiguous-field-access.rst).
+  The removal of type-directed disambiguation for record updates is tracked
+  in GHC ticket #19461, but progress towards this goal has stalled.
 
-To perform this disambiguation, when there are multiple possible parents for
-a record update, the renamer defers to the typechecker.
-See GHC.Tc.Gen.Expr.disambiguateRecordBinds, and in particular the auxiliary
+  Why? There are several suggested replacement mechanisms, such as:
+    1. using module qualification to disambiguate,
+    2. using OverloadedRecordUpdate for type-directed disambiguation
+      (as described in Note [Overview of record dot syntax] in GHC.Hs.Expr).
+  However, these solutions do not work in all situations:
+    1. Module qualification doesn't work for fields defined in the current module,
+       nor to disambiguate between constructors of different data family instances
+       of a given parent data family TyCon.
+    2. OverloadedRecordUpdate does not allow for type-changing record update,
+       nor can it deal with fields with existentials or polytypes.
+  There are also some avenues to improve the renamer's ability to disambiguate:
+    - GHC ticket #23032 suggests using as-patterns to disambiguate in the renamer.
+    - GHC proposal https://github.com/ghc-proposals/ghc-proposals/pull/537
+      suggests a syntactic form of type-directed disambiguation that could be
+      carried out in the renamer.
+  Neither of these have been accepted/implemented at the time of writing (Sept 2025).
+  This means that removal of type-directed disambiguation is currently stalled.
+
+GHC tries to disambiguate record updates in the renamer, as described in
+Note [Disambiguating record updates] in GHC.Rename.Pat. However, if the renamer
+is unable to disambiguate, the renamer will defer to the typechecker: see
+GHC.Tc.Gen.Expr.disambiguateRecordBinds, and in particular the auxiliary
 function identifyParentLabels, which picks a parent for the record update
 using the following additional mechanisms:
 
@@ -1253,7 +1323,7 @@ expandRecordUpd :: LHsExpr GhcRn
                            -- Expanded record update expression
                         , TcType
                            -- result type of expanded record update
-                        , SDoc
+                        , ErrCtxtMsg
                            -- error context to push when typechecking
                            -- the expanded code
                         )
@@ -1298,8 +1368,11 @@ expandRecordUpd record_expr possible_parents rbnds res_ty
            <- disambiguateRecordBinds record_expr record_rho possible_parents rbnds res_ty
        ; let sel_ids       = map (unLoc . foLabel . unLoc . hfbLHS . unLoc) rbinds
              upd_fld_names = map idName sel_ids
-             relevant_cons = nonDetEltsUniqSet cons
-             relevant_con  = head relevant_cons
+             relevant_cons@(relevant_con NE.:| _) =
+              case NE.nonEmpty $ nonDetEltsUniqSet cons of
+                Just rel_cons -> rel_cons
+                Nothing -> pprPanic "desugarRecordUpd: no relevant constructors" $
+                              vcat [ text "record_expr:" <+> ppr record_expr ]
 
       -- STEP 2: expand the record update.
       --
@@ -1425,7 +1498,7 @@ expandRecordUpd record_expr possible_parents rbnds res_ty
              case_expr = HsCase RecUpd record_expr
                        $ mkMatchGroup (Generated OtherExpansion DoPmc) (wrapGenSpan matches)
              matches :: [LMatch GhcRn (LHsExpr GhcRn)]
-             matches = map make_pat relevant_cons
+             matches = map make_pat (NE.toList relevant_cons)
 
              let_binds :: HsLocalBindsLR GhcRn GhcRn
              let_binds = HsValBinds noAnn $ XValBindsLR
@@ -1444,31 +1517,12 @@ expandRecordUpd record_expr possible_parents rbnds res_ty
             vcat [ text "relevant_con:" <+> ppr relevant_con
                  , text "res_ty:" <+> ppr res_ty
                  , text "ds_res_ty:" <+> ppr ds_res_ty
+                 , text "ds_expr:" <+> ppr ds_expr
                  ]
 
-        ; let cons = pprQuotedList relevant_cons
-              err_lines =
-                (text "In a record update at field" <> plural upd_fld_names <+> pprQuotedList upd_fld_names :)
-                $ case relevant_con of
-                     RealDataCon con ->
-                        [ text "with type constructor" <+> quotes (ppr (dataConTyCon con))
-                        , text "data constructor" <+> plural relevant_cons <+> cons ]
-                     PatSynCon {} ->
-                        [ text "with pattern synonym" <+> plural relevant_cons <+> cons ]
-                ++ if null ex_tvs
-                   then []
-                   else [ text "existential variable" <> plural ex_tvs <+> pprQuotedList ex_tvs ]
-              err_ctxt = make_lines_msg err_lines
+        ; return (ds_expr, ds_res_ty, RecordUpdCtxt relevant_cons upd_fld_names ex_tvs) }
 
-        ; return (ds_expr, ds_res_ty, err_ctxt) }
 
--- | Pretty-print a collection of lines, adding commas at the end of each line,
--- and adding "and" to the start of the last line.
-make_lines_msg :: [SDoc] -> SDoc
-make_lines_msg []      = empty
-make_lines_msg [last]  = ppr last <> dot
-make_lines_msg [l1,l2] = l1 $$ text "and" <+> l2 <> dot
-make_lines_msg (l:ls)  = l <> comma $$ make_lines_msg ls
 
 {- *********************************************************************
 *                                                                      *
@@ -1566,7 +1620,8 @@ disambiguateRecordBinds record_expr record_rho possible_parents rbnds res_ty
     lookup_parent_flds par@(RnRecUpdParent { rnRecUpdLabels = lbls, rnRecUpdCons = cons })
       = do { let cons' :: NonDetUniqFM ConLike ConLikeName
                  cons' = NonDetUniqFM $ unsafeCastUFMKey $ getUniqSet cons
-           ; cons <- traverse (tcLookupConLike . conLikeName_Name) cons'
+                 lookup_one con = tcLookupConLike (noUserRdr $ getName con)
+           ; cons <- traverse lookup_one cons'
            ; tc   <- tcLookupRecSelParent par
            ; return $
                TcRecUpdParent
@@ -1632,7 +1687,7 @@ This extends OK when the field types are universally quantified.
 
 tcRecordBinds
         :: ConLike
-        -> [TcType]     -- Expected type for each field
+        -> [Scaled TcType]     -- Expected type for each field
         -> HsRecordBinds GhcRn
         -> TcM (HsRecordBinds GhcTc)
 
@@ -1641,7 +1696,7 @@ tcRecordBinds con_like arg_tys (HsRecFields x rbinds dd)
         ; return (HsRecFields x (catMaybes mb_binds) dd) }
   where
     fields = map flSelector $ conLikeFieldLabels con_like
-    flds_w_tys = zipEqual "tcRecordBinds" fields arg_tys
+    flds_w_tys = zipEqual fields arg_tys
 
     do_bind :: LHsRecField GhcRn (LHsExpr GhcRn)
             -> TcM (Maybe (LHsRecField GhcTc (LHsExpr GhcTc)))
@@ -1657,22 +1712,18 @@ tcRecordBinds con_like arg_tys (HsRecFields x rbinds dd)
                                                      , hfbRHS = rhs'
                                                      , hfbPun = hfbPun fld}))) }
 
-fieldCtxt :: FieldLabelString -> SDoc
-fieldCtxt field_name
-  = text "In the" <+> quotes (ppr field_name) <+> text "field of a record"
-
-tcRecordField :: ConLike -> Assoc Name Type
+tcRecordField :: ConLike -> Assoc Name (Scaled Type)
               -> LFieldOcc GhcRn -> LHsExpr GhcRn
               -> TcM (Maybe (LFieldOcc GhcTc, LHsExpr GhcTc))
 tcRecordField con_like flds_w_tys (L loc (FieldOcc rdr (L l sel_name))) rhs
-  | Just field_ty <- assocMaybe flds_w_tys sel_name
-      = addErrCtxt (fieldCtxt field_lbl) $
-        do { rhs' <- tcCheckPolyExprNC rhs field_ty
+  | Just (Scaled field_mult field_ty) <- assocMaybe flds_w_tys sel_name
+      = addErrCtxt (FieldCtxt field_lbl)$
+        do { rhs' <- tcScalingUsage field_mult $ tcCheckPolyExprNC rhs field_ty
            ; hasFixedRuntimeRep_syntactic (FRRRecordCon rdr (unLoc rhs'))
                 field_ty
            ; let field_id = mkUserLocal (nameOccName sel_name)
                                         (nameUnique sel_name)
-                                        ManyTy field_ty (locA loc)
+                                        field_mult field_ty (locA loc)
                 -- Yuk: the field_id has the *unique* of the selector Id
                 --          (so we can find it easily)
                 --      but is a LocalId with the appropriate type of the RHS

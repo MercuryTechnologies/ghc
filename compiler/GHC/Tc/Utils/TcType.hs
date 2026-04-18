@@ -24,14 +24,14 @@ module GHC.Tc.Utils.TcType (
   --------------------------------
   -- Types
   TcType, TcSigmaType, TcTypeFRR, TcSigmaTypeFRR,
-  TcRhoType, TcTauType, TcPredType, TcThetaType,
+  TcRhoType, TcRhoTypeFRR, TcTauType, TcPredType, TcThetaType,
   TcTyVar, TcTyVarSet, TcDTyVarSet, TcTyCoVarSet, TcDTyCoVarSet,
   TcKind, TcCoVar, TcTyCoVar, TcTyVarBinder, TcInvisTVBinder, TcReqTVBinder,
   TcTyCon, MonoTcTyCon, PolyTcTyCon, TcTyConBinder, KnotTied,
 
-  ExpType(..), ExpKind, InferResult(..),
+  ExpType(..), ExpKind, InferResult(..), InferInstFlag(..), InferFRRFlag(..),
   ExpTypeFRR, ExpSigmaType, ExpSigmaTypeFRR,
-  ExpRhoType,
+  ExpRhoType, ExpRhoTypeFRR,
   mkCheckExpType,
   checkingExpType_maybe, checkingExpType,
 
@@ -53,7 +53,7 @@ module GHC.Tc.Utils.TcType (
   isImmutableTyVar, isSkolemTyVar, isMetaTyVar,  isMetaTyVarTy, isTyVarTy,
   tcIsTcTyVar, isTyVarTyVar, isOverlappableTyVar,  isTyConableTyVar,
   ConcreteTvOrigin(..), isConcreteTyVar_maybe, isConcreteTyVar,
-  isConcreteTyVarTy, isConcreteTyVarTy_maybe, isConcreteInfo,
+  isConcreteTyVarTy, isConcreteTyVarTy_maybe, concreteInfo_maybe,
   ConcreteTyVars, noConcreteTyVars,
   isAmbiguousTyVar, isCycleBreakerTyVar, metaTyVarRef, metaTyVarInfo,
   isFlexi, isIndirect, isRuntimeUnkSkol,
@@ -88,9 +88,9 @@ module GHC.Tc.Utils.TcType (
   isSigmaTy, isRhoTy, isRhoExpTy, isOverloadedTy,
   isFloatingPrimTy, isDoubleTy, isFloatTy, isIntTy, isWordTy, isStringTy,
   isIntegerTy, isNaturalTy,
-  isBoolTy, isUnitTy, isCharTy,
+  isBoolTy, isUnitTy, isAnyTy, isZonkAnyTy, isCharTy,
   isTauTy, isTauTyCon, tcIsTyVarTy,
-  isPredTy, isTyVarClassPred,
+  isPredTy, isSimplePredTy, isTyVarClassPred,
   checkValidClsArgs, hasTyVarHead,
   isRigidTy, anyTy_maybe,
 
@@ -130,7 +130,7 @@ module GHC.Tc.Utils.TcType (
   pSizeZero, pSizeOne,
   pSizeType, pSizeTypeX, pSizeTypes,
   pSizeClassPred, pSizeClassPredX,
-  pSizeTyConApp,
+  pSizeTyConApp, pSizeHead,
   noMoreTyVars, allDistinctTyVars,
   TypeSize, sizeType, sizeTypes, scopedSort,
   isTerminatingClass, isStuckTypeFamily,
@@ -155,7 +155,7 @@ module GHC.Tc.Utils.TcType (
   mkTyConTy, mkTyVarTy, mkTyVarTys,
   mkTyCoVarTy, mkTyCoVarTys,
 
-  isClassPred, isEqPred, isIPLikePred, isEqClassPred,
+  isClassPred, isEqPred, couldBeIPLike, isEqClassPred,
   isEqualityClass, mkClassPred,
   tcSplitQuantPredTy, tcSplitDFunTy, tcSplitDFunHead, tcSplitMethodTy,
   isRuntimeRepVar, isFixedRuntimeRepKind,
@@ -166,7 +166,7 @@ module GHC.Tc.Utils.TcType (
   TvSubstEnv, emptySubst, mkEmptySubst,
   zipTvSubst,
   mkTvSubstPrs, notElemSubst, unionSubst,
-  getTvSubstEnv, getSubstInScope, extendSubstInScope,
+  getTvSubstEnv, substInScopeSet, extendSubstInScope,
   extendSubstInScopeList, extendSubstInScopeSet, extendTvSubstAndInScope,
   Type.lookupTyVar, Type.extendTCvSubst, Type.substTyVarBndr,
   Type.extendTvSubst,
@@ -380,6 +380,7 @@ type TcSigmaType    = TcType
 -- See Note [Return arguments with a fixed RuntimeRep.
 type TcSigmaTypeFRR = TcSigmaType
     -- TODO: consider making this a newtype.
+type TcRhoTypeFRR = TcRhoType
 
 type TcRhoType      = TcType  -- Note [TcRhoType]
 type TcTauType      = TcType
@@ -408,8 +409,12 @@ data InferResult
        , ir_lvl  :: TcLevel
          -- ^ See Note [TcLevel of ExpType] in GHC.Tc.Utils.TcMType
 
-       , ir_frr  :: Maybe FixedRuntimeRepContext
+       , ir_frr  :: InferFRRFlag
          -- ^ See Note [FixedRuntimeRep context in ExpType] in GHC.Tc.Utils.TcMType
+
+       , ir_inst :: InferInstFlag
+         -- ^ True <=> when DeepSubsumption is on, deeply instantiate before filling,
+         -- See Note [Instantiation of InferResult] in GHC.Tc.Utils.Unify
 
        , ir_ref  :: IORef (Maybe TcType) }
          -- ^ The type that fills in this hole should be a @Type@,
@@ -419,25 +424,47 @@ data InferResult
          -- @rr@ must be concrete, in the sense of Note [Concrete types]
          -- in GHC.Tc.Utils.Concrete.
 
-type ExpSigmaType    = ExpType
+data InferFRRFlag
+  = IFRR_Check                -- Check that the result type has a fixed runtime rep
+      FixedRuntimeRepContext  -- Typically used for function arguments and lambdas
+
+  | IFRR_Any                  -- No need to check for fixed runtime-rep
+
+data InferInstFlag  -- Specifies whether the inference should return an uninstantiated
+                    -- SigmaType, or a (possibly deeply) instantiated RhoType
+                    -- See Note [Instantiation of InferResult] in GHC.Tc.Utils.Unify
+
+  = IIF_Sigma       -- Trying to infer a SigmaType
+                    -- Don't instantiate at all, regardless of DeepSubsumption
+                    -- Typically used when inferring the type of a pattern
+
+  | IIF_ShallowRho  -- Trying to infer a shallow RhoType (no foralls or => at the top)
+                    -- Top-instantiate (only, regardless of DeepSubsumption) before filling the hole
+                    -- Typically used when inferring the type of an expression
+
+  | IIF_DeepRho     -- Trying to infer a possibly-deep RhoType (depending on DeepSubsumption)
+                    -- If DeepSubsumption is off, same as IIF_ShallowRho
+                    -- If DeepSubsumption is on, instantiate deeply before filling the hole
+
+type ExpSigmaType = ExpType
+type ExpRhoType   = ExpType
+      -- Invariant: in ExpRhoType, if -XDeepSubsumption is on,
+      --            and we are in checking mode (i.e. the ExpRhoType is (Check rho)),
+      --            then the `rho` is deeply skolemised
 
 -- | An 'ExpType' which has a fixed RuntimeRep.
 --
 -- For a 'Check' 'ExpType', the stored 'TcType' must have
 -- a fixed RuntimeRep. For an 'Infer' 'ExpType', the 'ir_frr'
--- field must be of the form @Just frr_orig@.
-type ExpTypeFRR      = ExpType
+-- field must be of the form @IFRR_Check frr_orig@.
+type ExpTypeFRR = ExpType
 
 -- | Like 'TcSigmaTypeFRR', but for an expected type.
 --
 -- See 'ExpTypeFRR'.
 type ExpSigmaTypeFRR = ExpTypeFRR
+type ExpRhoTypeFRR   = ExpTypeFRR
   -- TODO: consider making this a newtype.
-
-type ExpRhoType = ExpType
-      -- Invariant: if -XDeepSubsumption is on,
-      --            and we are checking (i.e. the ExpRhoType is (Check rho)),
-      --            then the `rho` is deeply skolemised
 
 -- | Like 'ExpType', but on kind level
 type ExpKind = ExpType
@@ -447,12 +474,17 @@ instance Outputable ExpType where
   ppr (Infer ir) = ppr ir
 
 instance Outputable InferResult where
-  ppr (IR { ir_uniq = u, ir_lvl = lvl, ir_frr = mb_frr })
-    = text "Infer" <> mb_frr_text <> braces (ppr u <> comma <> ppr lvl)
+  ppr (IR { ir_uniq = u, ir_lvl = lvl, ir_frr = mb_frr, ir_inst = inst })
+    = text "Infer" <> parens (pp_inst <> pp_frr)
+                   <> braces (ppr u <> comma <> ppr lvl)
     where
-      mb_frr_text = case mb_frr of
-        Just _  -> text "FRR"
-        Nothing -> empty
+     pp_inst = case inst of
+                IIF_Sigma      -> text "Sigma"
+                IIF_ShallowRho -> text "ShallowRho"
+                IIF_DeepRho    -> text "DeepRho"
+     pp_frr = case mb_frr of
+                IFRR_Check {} -> text ",FRR"
+                IFRR_Any      -> empty
 
 -- | Make an 'ExpType' suitable for checking.
 mkCheckExpType :: TcType -> ExpType
@@ -606,7 +638,8 @@ data TcTyVarDetails
                   --     how this level number is used
        Bool       -- True <=> this skolem type variable can be overlapped
                   --          when looking up instances
-                  -- See Note [Binding when looking up instances] in GHC.Core.InstEnv
+                  -- See Note [Super skolems: binding when looking up instances]
+                  --     in GHC.Core.InstEnv
 
   | RuntimeUnk    -- Stands for an as-yet-unknown type in the GHCi
                   -- interactive context
@@ -648,7 +681,7 @@ data MetaInfo
    | RuntimeUnkTv  -- ^ A unification variable used in the GHCi debugger.
                    -- It /is/ allowed to unify with a polytype, unlike TauTv
 
-   | CycleBreakerTv  -- Used to fix occurs-check problems in Givens
+   | CycleBreakerTv  -- ^ Used to fix occurs-check problems in Givens
                      -- See Note [Type equality cycles] in
                      -- GHC.Tc.Solver.Equality
 
@@ -1266,9 +1299,9 @@ isConcreteTyVar_maybe tv
   | otherwise
   = Nothing
 
-isConcreteInfo :: MetaInfo -> Bool
-isConcreteInfo (ConcreteTv {}) = True
-isConcreteInfo _               = False
+concreteInfo_maybe :: MetaInfo -> Maybe ConcreteTvOrigin
+concreteInfo_maybe (ConcreteTv conc_orig) = Just conc_orig
+concreteInfo_maybe _                      = Nothing
 
 -- | Is this type variable a concrete type variable, i.e.
 -- it is a metavariable with 'ConcreteTv' 'MetaInfo'?
@@ -1490,8 +1523,10 @@ tcSplitForAllTyVarsReqTVBindersN n_req ty
   = split n_req ty ty []
   where
     split n_req _orig_ty (ForAllTy b@(Bndr _ argf) ty) bs
-      | isVisibleForAllTyFlag argf, n_req > 0           = split (n_req - 1) ty ty (b:bs)
-      | otherwise                                       = split n_req       ty ty (b:bs)
+      | isVisibleForAllTyFlag argf, n_req > 0  -- Split off a visible forall
+      = split (n_req - 1) ty ty (b:bs)
+      | isInvisibleForAllTyFlag argf           -- Split off an invisible forall,
+      = split n_req       ty ty (b:bs)         -- even if n_req=0, i.e. the trailing ones
     split n_req orig_ty ty bs | Just ty' <- coreView ty = split n_req orig_ty ty' bs
     split n_req orig_ty _ty bs                          = (n_req, reverse bs, orig_ty)
 
@@ -1651,7 +1686,7 @@ tcSplitFunTysN n ty
  = Left n
 
 tcSplitFunTy :: Type -> (Scaled Type, Type)
-tcSplitFunTy  ty = expectJust "tcSplitFunTy" (tcSplitFunTy_maybe ty)
+tcSplitFunTy  ty = expectJust (tcSplitFunTy_maybe ty)
 
 tcFunArgTy :: Type -> Scaled Type
 tcFunArgTy ty = fst (tcSplitFunTy ty)
@@ -1782,11 +1817,11 @@ hasTyVarHead ty                 -- Haskell 98 allows predicates of form
 evVarPred :: EvVar -> PredType
 evVarPred var = varType var
   -- Historical note: I used to have an ASSERT here,
-  -- checking (isEvVarType (varType var)).  But with something like
+  -- checking (isPredTy (varType var)).  But with something like
   --   f :: c => _ -> _
   -- we end up with (c :: kappa), and (kappa ~ Constraint).  Until
   -- we solve and zonk (which there is no particular reason to do for
-  -- partial signatures, (isEvVarType kappa) will return False. But
+  -- partial signatures, (isPredTy kappa) will return False. But
   -- nothing is wrong.  So I just removed the ASSERT.
 
 ---------------------------
@@ -1816,7 +1851,7 @@ pickCapturedPreds
 pickCapturedPreds qtvs theta
   = filter captured theta
   where
-    captured pred = isIPLikePred pred || (tyCoVarsOfType pred `intersectsVarSet` qtvs)
+    captured pred = couldBeIPLike pred || (tyCoVarsOfType pred `intersectsVarSet` qtvs)
 
 
 -- Superclasses
@@ -1975,7 +2010,7 @@ isSigmaTy :: TcType -> Bool
 --     forall a. blah
 --     Eq a => blah
 --     ?x::Int => blah
--- But not
+-- But NOT
 --     forall a -> blah
 isSigmaTy (ForAllTy (Bndr _ af) _)     = isInvisibleForAllTyFlag af
 isSigmaTy (FunTy { ft_af = af })       = isInvisibleFunArg af
@@ -2003,7 +2038,7 @@ isFloatTy, isDoubleTy,
     isFloatPrimTy, isDoublePrimTy,
     isIntegerTy, isNaturalTy,
     isIntTy, isWordTy, isBoolTy,
-    isUnitTy, isCharTy :: Type -> Bool
+    isUnitTy, isAnyTy, isZonkAnyTy, isCharTy :: Type -> Bool
 isFloatTy      = is_tc floatTyConKey
 isDoubleTy     = is_tc doubleTyConKey
 isFloatPrimTy  = is_tc floatPrimTyConKey
@@ -2014,6 +2049,8 @@ isIntTy        = is_tc intTyConKey
 isWordTy       = is_tc wordTyConKey
 isBoolTy       = is_tc boolTyConKey
 isUnitTy       = is_tc unitTyConKey
+isAnyTy        = is_tc anyTyConKey
+isZonkAnyTy    = is_tc zonkAnyTyConKey
 isCharTy       = is_tc charTyConKey
 
 -- | Check whether the type is of the form @Any :: k@,
@@ -2054,6 +2091,7 @@ isRigidTy ty
   | Just (tc,_) <- tcSplitTyConApp_maybe ty = isGenerativeTyCon tc Nominal
   | Just {} <- tcSplitAppTy_maybe ty        = True
   | isForAllTy ty                           = True
+  | Just {} <- isLitTy ty                   = True
   | otherwise                               = False
 
 {-
@@ -2358,6 +2396,13 @@ pSizeTyFamApp :: TyCon -> PatersonSize
 pSizeTyFamApp tc
  | isStuckTypeFamily tc = pSizeZero
  | otherwise            = PS_TyFam tc
+
+pSizeHead :: PredType -> PatersonSize
+-- Getting the size of an instance head is a bit horrible
+-- because of the special treament for class predicates
+pSizeHead pred = case classifyPredType pred of
+                      ClassPred cls tys -> pSizeClassPred cls tys
+                      _                 -> pSizeType pred
 
 pSizeClassPred :: Class -> [Type] -> PatersonSize
 pSizeClassPred = pSizeClassPredX emptyVarSet

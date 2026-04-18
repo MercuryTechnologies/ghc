@@ -46,6 +46,7 @@ import GHC.Runtime.Heap.Layout
 import GHC.Data.FastString
 import GHC.Utils.Misc
 import GHC.Utils.Panic
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe
 
 import Control.Monad (liftM, when, unless, zipWithM_)
@@ -1533,20 +1534,28 @@ emitPrimOp cfg primop =
   (VecSubOp  IntVec n w) -> opTranslate (MO_V_Sub   n w)
   (VecMulOp  IntVec n w) -> opTranslate (MO_V_Mul   n w)
   (VecDivOp  IntVec _ _) -> \_ -> panic "unsupported primop"
-  (VecQuotOp IntVec n w) -> opTranslate (MO_VS_Quot n w)
-  (VecRemOp  IntVec n w) -> opTranslate (MO_VS_Rem  n w)
+  (VecQuotOp IntVec n w) -> opCallish (MO_VS_Quot n w)
+  (VecRemOp  IntVec n w) -> opCallish (MO_VS_Rem n w)
   (VecNegOp  IntVec n w) -> opTranslate (MO_VS_Neg  n w)
+  (VecMinOp  IntVec 2 W64)
+    | not allowIntWord64X2MinMax -> opCallish MO_I64X2_Min
   (VecMinOp  IntVec n w) -> opTranslate (MO_VS_Min  n w)
+  (VecMaxOp  IntVec 2 W64)
+    | not allowIntWord64X2MinMax -> opCallish MO_I64X2_Max
   (VecMaxOp  IntVec n w) -> opTranslate (MO_VS_Max  n w)
 
   (VecAddOp  WordVec n w) -> opTranslate (MO_V_Add   n w)
   (VecSubOp  WordVec n w) -> opTranslate (MO_V_Sub   n w)
   (VecMulOp  WordVec n w) -> opTranslate (MO_V_Mul   n w)
   (VecDivOp  WordVec _ _) -> \_ -> panic "unsupported primop"
-  (VecQuotOp WordVec n w) -> opTranslate (MO_VU_Quot n w)
-  (VecRemOp  WordVec n w) -> opTranslate (MO_VU_Rem  n w)
+  (VecQuotOp WordVec n w) -> opCallish (MO_VU_Quot n w)
+  (VecRemOp  WordVec n w) -> opCallish (MO_VU_Rem n w)
   (VecNegOp  WordVec _ _) -> \_ -> panic "unsupported primop"
+  (VecMinOp  WordVec 2 W64)
+    | not allowIntWord64X2MinMax -> opCallish MO_W64X2_Min
   (VecMinOp  WordVec n w) -> opTranslate (MO_VU_Min  n w)
+  (VecMaxOp  WordVec 2 W64)
+    | not allowIntWord64X2MinMax -> opCallish MO_W64X2_Max
   (VecMaxOp  WordVec n w) -> opTranslate (MO_VU_Max  n w)
 
   -- Vector FMA instructions
@@ -1571,28 +1580,28 @@ emitPrimOp cfg primop =
   CastDoubleToWord64Op -> translateBitcasts (MO_FW_Bitcast W64)
   CastWord64ToDoubleOp -> translateBitcasts (MO_WF_Bitcast W64)
 
-  IntQuotRemOp -> opCallishHandledLater $
-    if allowQuotRem
+  IntQuotRemOp -> \args -> flip opCallishHandledLater args $
+    if allowQuotRem && not (quotRemCanBeOptimized args)
     then Left (MO_S_QuotRem  (wordWidth platform))
     else Right (genericIntQuotRemOp (wordWidth platform))
 
-  Int8QuotRemOp -> opCallishHandledLater $
-    if allowQuotRem
+  Int8QuotRemOp -> \args -> flip opCallishHandledLater args $
+    if allowQuotRem && not (quotRemCanBeOptimized args)
     then Left (MO_S_QuotRem W8)
     else Right (genericIntQuotRemOp W8)
 
-  Int16QuotRemOp -> opCallishHandledLater $
-    if allowQuotRem
+  Int16QuotRemOp -> \args -> flip opCallishHandledLater args $
+    if allowQuotRem && not (quotRemCanBeOptimized args)
     then Left (MO_S_QuotRem W16)
     else Right (genericIntQuotRemOp W16)
 
-  Int32QuotRemOp -> opCallishHandledLater $
-    if allowQuotRem
+  Int32QuotRemOp -> \args -> flip opCallishHandledLater args $
+    if allowQuotRem && not (quotRemCanBeOptimized args)
     then Left (MO_S_QuotRem W32)
     else Right (genericIntQuotRemOp W32)
 
-  WordQuotRemOp -> opCallishHandledLater $
-    if allowQuotRem
+  WordQuotRemOp -> \args -> flip opCallishHandledLater args $
+    if allowQuotRem && not (quotRemCanBeOptimized args)
     then Left (MO_U_QuotRem  (wordWidth platform))
     else Right (genericWordQuotRemOp (wordWidth platform))
 
@@ -1601,18 +1610,18 @@ emitPrimOp cfg primop =
     then Left (MO_U_QuotRem2 (wordWidth platform))
     else Right (genericWordQuotRem2Op platform)
 
-  Word8QuotRemOp -> opCallishHandledLater $
-    if allowQuotRem
+  Word8QuotRemOp -> \args -> flip opCallishHandledLater args $
+    if allowQuotRem && not (quotRemCanBeOptimized args)
     then Left (MO_U_QuotRem W8)
     else Right (genericWordQuotRemOp W8)
 
-  Word16QuotRemOp -> opCallishHandledLater $
-    if allowQuotRem
+  Word16QuotRemOp -> \args -> flip opCallishHandledLater args $
+    if allowQuotRem && not (quotRemCanBeOptimized args)
     then Left (MO_U_QuotRem W16)
     else Right (genericWordQuotRemOp W16)
 
-  Word32QuotRemOp -> opCallishHandledLater $
-    if allowQuotRem
+  Word32QuotRemOp -> \args -> flip opCallishHandledLater args $
+    if allowQuotRem && not (quotRemCanBeOptimized args)
     then Left (MO_U_QuotRem W32)
     else Right (genericWordQuotRemOp W32)
 
@@ -1716,9 +1725,6 @@ emitPrimOp cfg primop =
   ReadMVarOp -> alwaysExternal
   TryReadMVarOp -> alwaysExternal
   IsEmptyMVarOp -> alwaysExternal
-  NewIOPortOp -> alwaysExternal
-  ReadIOPortOp -> alwaysExternal
-  WriteIOPortOp -> alwaysExternal
   DelayOp -> alwaysExternal
   WaitReadOp -> alwaysExternal
   WaitWriteOp -> alwaysExternal
@@ -1762,10 +1768,12 @@ emitPrimOp cfg primop =
   WhereFromOp   -> alwaysExternal
   GetApStackValOp -> alwaysExternal
   ClearCCSOp -> alwaysExternal
+  AnnotateStackOp -> alwaysExternal
   TraceEventOp -> alwaysExternal
   TraceEventBinaryOp -> alwaysExternal
   TraceMarkerOp -> alwaysExternal
   SetThreadAllocationCounter -> alwaysExternal
+  SetOtherThreadAllocationCounter -> alwaysExternal
   KeepAliveOp -> alwaysExternal
 
  where
@@ -1835,6 +1843,23 @@ emitPrimOp cfg primop =
     pure $ map (CmmReg . CmmLocal) regs
 
   alwaysExternal = \_ -> PrimopCmmEmit_External
+  -- Note [QuotRem optimization]
+  -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  -- `quot` and `rem` with constant divisor can be implemented with fast bit-ops
+  -- (shift, .&.).
+  --
+  -- Currently we only support optimization (performed in GHC.Cmm.Opt) when the
+  -- constant is a power of 2. #9041 tracks the implementation of the general
+  -- optimization.
+  --
+  -- `quotRem` can be optimized in the same way. However as it returns two values,
+  -- it is implemented as a "callish" primop which is harder to match and
+  -- to transform later on. For simplicity, the current implementation detects cases
+  -- that can be optimized (see `quotRemCanBeOptimized`) and converts STG quotRem
+  -- primop into two CMM quot and rem primops.
+  quotRemCanBeOptimized = \case
+    [_, CmmLit (CmmInt n _) ] -> isJust (exactLog2 n)
+    _                         -> False
 
   allowQuotRem  = stgToCmmAllowQuotRemInstr         cfg
   allowQuotRem2 = stgToCmmAllowQuotRem2             cfg
@@ -1843,6 +1868,7 @@ emitPrimOp cfg primop =
   allowWord2Mul = stgToCmmAllowWordMul2Instr        cfg
   allowArith64  = stgToCmmAllowArith64              cfg
   allowQuot64   = stgToCmmAllowQuot64               cfg
+  allowIntWord64X2MinMax = stgToCmmAllowIntWord64X2MinMax cfg
 
   -- a bit of a hack, for certain code generaters, e.g. PPC, and i386 we
   -- continue to use the cmm versions of these functions instead of inline
@@ -2254,17 +2280,21 @@ genericWordMul2Op [res_h, res_l] [arg_x, arg_y]
               mkAssign xhyl
                   (mul (topHalf arg_x) (bottomHalf arg_y)),
               mkAssign r
-                  (sum [topHalf    (CmmReg xlyl),
-                        bottomHalf (CmmReg xhyl),
-                        bottomHalf (CmmReg xlyh)]),
+                  (sum $
+                   topHalf    (CmmReg xlyl) :|
+                   bottomHalf (CmmReg xhyl) :
+                   bottomHalf (CmmReg xlyh) :
+                   []),
               mkAssign (CmmLocal res_l)
                   (or (bottomHalf (CmmReg xlyl))
                       (toTopHalf (CmmReg r))),
               mkAssign (CmmLocal res_h)
-                  (sum [mul (topHalf arg_x) (topHalf arg_y),
-                        topHalf (CmmReg xhyl),
-                        topHalf (CmmReg xlyh),
-                        topHalf (CmmReg r)])]
+                  (sum $
+                   mul (topHalf arg_x) (topHalf arg_y) :|
+                   topHalf (CmmReg xhyl) :
+                   topHalf (CmmReg xlyh) :
+                   topHalf (CmmReg r) :
+                   [])]
 genericWordMul2Op _ _ = panic "genericWordMul2Op"
 
 genericIntMul2Op :: GenericOp
@@ -2707,13 +2737,15 @@ doVecInsertOp ty src e idx res = do
 doShuffleOp :: CmmType -> [CmmExpr] -> LocalReg -> FCode ()
 doShuffleOp ty (v1:v2:idxs) res
   | isVecType ty
+  -- The type checker ensures that the indices have the correct length,
+  -- so we only need to check whether the indices are constants and within the valid range.
   = case mapMaybe idx_maybe idxs of
       is
         | length is == len
         -> emitAssign (CmmLocal res) (CmmMachOp (mo is) [v1,v2])
         | otherwise
-        -> pprPanic "doShuffleOp" $
-             vcat [ text "shuffle indices must be literals, 0 <= i <" <+> ppr len ]
+        -> pgmErrorDoc "Vector shuffle:" $
+             vcat [ text "shuffle indices must be literals, 0 <= i <" <+> ppr (2 * len) ]
   | otherwise
   = pprPanic "doShuffleOp" $
         vcat [ text "non-vector argument type:" <+> ppr ty ]
@@ -2935,7 +2967,7 @@ emitCopyByteArray copy src src_off dst dst_off n = do
     let byteArrayAlignment = wordAlignment platform
         srcOffAlignment = cmmExprAlignment src_off
         dstOffAlignment = cmmExprAlignment dst_off
-        align = minimum [byteArrayAlignment, srcOffAlignment, dstOffAlignment]
+        align = minimum (byteArrayAlignment :| srcOffAlignment : dstOffAlignment : [])
     dst_p <- assignTempE $ cmmOffsetExpr platform (cmmOffsetB platform dst (arrWordsHdrSize profile)) dst_off
     src_p <- assignTempE $ cmmOffsetExpr platform (cmmOffsetB platform src (arrWordsHdrSize profile)) src_off
     copy src dst dst_p src_p n align

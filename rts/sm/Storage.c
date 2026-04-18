@@ -326,10 +326,6 @@ void storageAddCapabilities (uint32_t from, uint32_t to)
         }
     }
 
-#if defined(THREADED_RTS) && defined(CC_LLVM_BACKEND) && (CC_SUPPORTS_TLS == 0)
-    newThreadLocalKey(&gctKey);
-#endif
-
     initGcThreads(from, to);
 }
 
@@ -351,9 +347,6 @@ freeStorage (bool free_heap)
     closeMutex(&sm_mutex);
 #endif
     stgFree(nurseries);
-#if defined(THREADED_RTS) && defined(CC_LLVM_BACKEND) && (CC_SUPPORTS_TLS == 0)
-    freeThreadLocalKey(&gctKey);
-#endif
     freeGcThreads();
 }
 
@@ -1065,46 +1058,31 @@ accountAllocation(Capability *cap, W_ n)
  * overwriting closures].
  */
 
-/* -----------------------------------------------------------------------------
-   StgPtr allocate (Capability *cap, W_ n)
-
-   Allocates an area of memory n *words* large, from the nursery of
-   the supplied Capability, or from the global block pool if the area
-   requested is larger than LARGE_OBJECT_THRESHOLD.  Memory is not
-   allocated from the current nursery block, so as not to interfere
-   with Hp/HpLim.
-
-   The address of the allocated memory is returned. allocate() never
-   fails; if it returns, the returned value is a valid address.  If
-   the nursery is already full, then another block is allocated from
-   the global block pool.  If we need to get memory from the OS and
-   that operation fails, then the whole process will be killed.
-   -------------------------------------------------------------------------- */
-
 /*
- * Allocate some n words of heap memory; terminating
- * on heap overflow
+ * Allocate some n words of heap memory; terminating on heap overflow.
+ *
+ * See Note [allocate and allocateMightFail].
  */
 StgPtr
 allocate (Capability *cap, W_ n)
 {
     StgPtr p = allocateMightFail(cap, n);
-    if (p == NULL) {
-        reportHeapOverflow();
-        // heapOverflow() doesn't exit (see #2592), but we aren't
+    if (RTS_UNLIKELY(p == NULL)) {
+        // reportHeapOverflow() doesn't exit (see #2592), but we aren't
         // in a position to do a clean shutdown here: we
         // either have to allocate the memory or exit now.
         // Allocating the memory would be bad, because the user
         // has requested that we not exceed maxHeapSize, so we
         // just exit.
-        stg_exit(EXIT_HEAPOVERFLOW);
+        exitHeapOverflow();
     }
     return p;
 }
 
 /*
- * Allocate some n words of heap memory; returning NULL
- * on heap overflow
+ * Allocate some n words of heap memory; returning NULL on heap overflow.
+ *
+ * See Note [allocate and allocateMightFail].
  */
 StgPtr
 allocateMightFail (Capability *cap, W_ n)
@@ -1302,6 +1280,9 @@ start_new_pinned_block(Capability *cap)
 
 /* ---------------------------------------------------------------------------
    Allocate a fixed/pinned object.
+
+   See Note [allocatePinned] for the interface. This describes the
+   implementation.
 
    We allocate small pinned objects into a single block, allocating a
    new block when the current one overflows.  The block is chained
@@ -1837,25 +1818,6 @@ StgWord calcTotalCompactW (void)
 #include <libkern/OSCacheControl.h>
 #endif
 
-/* __builtin___clear_cache is supported since GNU C 4.3.6.
- * We pick 4.4 to simplify condition a bit.
- */
-#define GCC_HAS_BUILTIN_CLEAR_CACHE (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 4))
-
-#if defined(__clang__)
-/* clang defines __clear_cache as a builtin on some platforms.
- * For example on armv7-linux-androideabi. The type slightly
- * differs from gcc.
- */
-extern void __clear_cache(void * begin, void * end);
-#elif defined(__GNUC__) && !GCC_HAS_BUILTIN_CLEAR_CACHE
-/* __clear_cache is a libgcc function.
- * It existed before __builtin___clear_cache was introduced.
- * See #8562.
- */
-extern void __clear_cache(char * begin, char * end);
-#endif /* __GNUC__ */
-
 /* On ARM and other platforms, we need to flush the cache after
    writing code into memory, so the processor reliably sees it. */
 void flushExec (W_ len, AdjustorExecutable exec_addr)
@@ -1868,26 +1830,11 @@ void flushExec (W_ len, AdjustorExecutable exec_addr)
   /* On iOS we need to use the special 'sys_icache_invalidate' call. */
   sys_icache_invalidate(exec_addr, len);
 #elif defined(wasm32_HOST_ARCH)
-#elif defined(__clang__)
-  unsigned char* begin = (unsigned char*)exec_addr;
-  unsigned char* end   = begin + len;
-# if __has_builtin(__builtin___clear_cache)
-  __builtin___clear_cache((void*)begin, (void*)end);
-# else
-  __clear_cache((void*)begin, (void*)end);
-# endif
-#elif defined(__GNUC__)
-  /* For all other platforms, fall back to a libgcc builtin. */
-  unsigned char* begin = (unsigned char*)exec_addr;
-  unsigned char* end   = begin + len;
-# if GCC_HAS_BUILTIN_CLEAR_CACHE
-  __builtin___clear_cache((void*)begin, (void*)end);
-# else
-  /* For all other platforms, fall back to a libgcc builtin. */
-  __clear_cache((void*)begin, (void*)end);
-# endif
 #else
-#error Missing support to flush the instruction cache
+  /* For all other platforms, fall back to __builtin___clear_cache. */
+  unsigned char* begin = (unsigned char*)exec_addr;
+  unsigned char* end   = begin + len;
+  __builtin___clear_cache((void*)begin, (void*)end);
 #endif
 }
 

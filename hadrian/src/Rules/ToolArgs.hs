@@ -99,7 +99,8 @@ multiSetup pkg_s = do
       writeFile' (resp_file root p) (intercalate "\n" (normalise_ghc arg_list
                                                       ++  modules cd
                                                       ++ concatMap rexp (reexportModules cd)
-                                                      ++ ["-outputdir", hidir]))
+                                                      ++ ["-outputdir", hidir,
+                                                          "-this-package-name", pkgName p]))
       return (resp_file root p)
 
 
@@ -145,6 +146,7 @@ mkToolTarget es p = do
 toolTargets :: [Package]
 toolTargets = [ cabalSyntax
               , cabal
+              , checkExact
               , compiler
               , directory
               , process
@@ -158,7 +160,7 @@ toolTargets = [ cabalSyntax
               , ghcPlatform
               , ghcToolchain
               , ghcToolchainBin
-              , ghcHeap
+              -- , ghcHeap -- # depends on ghcInternal library
               , ghci
               , ghcPkg  -- # executable
               , haddock -- # depends on ghc library

@@ -59,9 +59,15 @@ module GHC.Tc.Types(
         CompleteMatch, CompleteMatches,
 
         -- Template Haskell
-        ThStage(..), SpliceType(..), SpliceOrBracket(..), PendingStuff(..),
-        topStage, topAnnStage, topSpliceStage,
-        ThLevel, impLevel, outerLevel, thLevel,
+        ThLevel(..), SpliceType(..), SpliceOrBracket(..), PendingStuff(..),
+        topLevel, topAnnLevel, topSpliceLevel,
+        ThLevelIndex,
+        topLevelIndex,
+        spliceLevelIndex,
+        quoteLevelIndex,
+
+        thLevelIndex,
+
         ForeignSrcLang(..), THDocs, DocLoc(..),
         ThBindEnv,
 
@@ -154,7 +160,6 @@ import GHC.Types.SrcLoc
 import GHC.Types.Unique.FM
 import GHC.Types.Basic
 import GHC.Types.CostCentre.State
-import GHC.Types.HpcInfo
 
 import GHC.Data.IOEnv
 import GHC.Data.Bag
@@ -206,7 +211,11 @@ data ImportUserSpec
 
 data ImpUserList
   = ImpUserAll -- ^ no user import list
-  | ImpUserExplicit !GlobalRdrEnv
+  | ImpUserExplicit
+      { iul_avails :: ![AvailInfo]
+      , iul_non_explicit_parents :: !NameSet
+        -- ^ The @T@s in import list items of the form @T(..)@
+      }
   | ImpUserEverythingBut !NameSet
 
 -- | A 'NameShape' is a substitution on 'Name's that can be used
@@ -498,6 +507,9 @@ data TcGblEnv
         tcg_fam_inst_env :: !FamInstEnv, -- ^ Ditto for family instances
           -- NB. BangPattern is to fix a leak, see #15111
         tcg_ann_env      :: AnnEnv,     -- ^ And for annotations
+        tcg_complete_match_env :: CompleteMatches,
+        -- ^ The complete matches for all /home-package/ modules;
+        -- Includes the complete matches in tcg_complete_matches
 
                 -- Now a bunch of things about this module that are simply
                 -- accumulated, but never consulted until the end.
@@ -555,11 +567,6 @@ data TcGblEnv
           -- to emit loads of references to TH symbols.  The reference
           -- is implicit rather than explicit, so we have to zap a
           -- mutable variable.
-
-        tcg_th_splice_used :: TcRef Bool,
-          -- ^ @True@ \<=> A Template Haskell splice was used.
-          --
-          -- Splices disable recompilation avoidance (see #481)
 
         tcg_th_needed_deps :: TcRef ([Linkable], PkgsLoaded),
           -- ^ The set of runtime dependencies required by this module
@@ -646,10 +653,6 @@ data TcGblEnv
         tcg_hdr_info   :: (Maybe (LHsDoc GhcRn), Maybe (XRec GhcRn ModuleName)),
         -- ^ Maybe Haddock header docs and Maybe located module name
 
-        tcg_hpc       :: !AnyHpcUsage,       -- ^ @True@ if any part of the
-                                             --  prog uses hpc instrumentation.
-           -- NB. BangPattern is to fix a leak, see #15111
-
         tcg_self_boot :: SelfBootInfo,       -- ^ Whether this module has a
                                              -- corresponding hi-boot file
 
@@ -689,9 +692,10 @@ data TcGblEnv
           -- ^ Wanted constraints of static forms.
         -- See Note [Constraints in static forms].
         tcg_complete_matches :: !CompleteMatches,
+        -- ^ Complete matches defined in this module.
 
-        -- ^ Tracking indices for cost centre annotations
         tcg_cc_st   :: TcRef CostCentreState,
+        -- ^ Tracking indices for cost centre annotations
 
         tcg_next_wrapper_num :: TcRef (ModuleEnv Int)
         -- ^ See Note [Generating fresh names for FFI wrappers]
@@ -908,6 +912,20 @@ mkModDeps deps = S.foldl' add emptyInstalledModuleEnv deps
   where
     add env (uid, elt) = extendInstalledModuleEnv env (mkModule uid (gwib_mod elt)) elt
 
+plusDirectModDeps :: InstalledModuleEnv (S.Set ImportLevel, ModuleNameWithIsBoot)
+            -> InstalledModuleEnv (S.Set ImportLevel, ModuleNameWithIsBoot)
+            -> InstalledModuleEnv (S.Set ImportLevel, ModuleNameWithIsBoot)
+plusDirectModDeps = plusInstalledModuleEnv plus_mod_dep
+  where
+    plus_mod_dep (st1, r1@(GWIB { gwib_mod = m1, gwib_isBoot = boot1 }))
+                 (st2, r2@(GWIB {gwib_mod = m2, gwib_isBoot = boot2}))
+      | assertPpr (m1 == m2) ((ppr m1 <+> ppr m2) $$ (ppr (boot1 == IsBoot) <+> ppr (boot2 == IsBoot)))
+        boot1 == IsBoot = (st1 `S.union` st2, r2)
+      | otherwise = (st1 `S.union` st2, r1)
+      -- If either side can "see" a non-hi-boot interface, use that
+      -- Reusing existing tuples saves 10% of allocations on test
+      -- perf/compiler/MultiLayerModules
+
 plusModDeps :: InstalledModuleEnv ModuleNameWithIsBoot
             -> InstalledModuleEnv ModuleNameWithIsBoot
             -> InstalledModuleEnv ModuleNameWithIsBoot
@@ -955,7 +973,7 @@ plusImportAvails
                   imp_trust_pkgs = tpkgs2, imp_trust_own_pkg = tself2,
                   imp_orphs = orphs2, imp_finsts = finsts2 })
   = ImportAvails { imp_mods          = M.unionWith (++) mods1 mods2,
-                   imp_direct_dep_mods = ddmods1 `plusModDeps` ddmods2,
+                   imp_direct_dep_mods = ddmods1 `plusDirectModDeps` ddmods2,
                    imp_dep_direct_pkgs      = ddpkgs1 `S.union` ddpkgs2,
                    imp_trust_pkgs    = tpkgs1 `S.union` tpkgs2,
                    imp_trust_own_pkg = tself1 || tself2,

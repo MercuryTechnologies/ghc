@@ -1,9 +1,6 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE LambdaCase #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -29,13 +26,13 @@ import GHC.Data.Maybe
 import GHC.Tc.Utils.Unify    ( tcSubTypeAmbiguity )
 import GHC.Tc.Solver         ( simplifyAmbiguityCheck )
 import GHC.Tc.Instance.Class ( matchGlobalInst, ClsInstResult(..), AssocInstInfo(..) )
-import GHC.Tc.Utils.TcType
+import GHC.Tc.Instance.FunDeps
+import GHC.Tc.Instance.Family
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.Rank
 import GHC.Tc.Errors.Types
+import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
-import GHC.Tc.Instance.FunDeps
-import GHC.Tc.Instance.Family
 import GHC.Tc.Zonk.TcType
 
 import GHC.Builtin.Types
@@ -52,6 +49,7 @@ import GHC.Core.Predicate
 import GHC.Core.TyCo.FVs
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Ppr
+import GHC.Core.TyCo.Tidy
 import GHC.Core.FamInstEnv ( isDominatedBy, injectiveBranches
                            , InjectivityCheckResult(..) )
 
@@ -241,7 +239,7 @@ checkAmbiguity ctxt ty
          -- tyvars are skolemised, we can safely use tcSimplifyTop
        ; allow_ambiguous <- xoptM LangExt.AllowAmbiguousTypes
        ; unless allow_ambiguous $
-         do { (_wrap, wanted) <- addErrCtxt (mk_msg allow_ambiguous) $
+         do { (_wrap, wanted) <- addErrCtxt (AmbiguityCheckCtxt ctxt allow_ambiguous) $
                                  captureConstraints $
                                  tcSubTypeAmbiguity ctxt ty ty
                                  -- See Note [Ambiguity check and deep subsumption]
@@ -252,13 +250,6 @@ checkAmbiguity ctxt ty
 
   | otherwise
   = return ()
- where
-   mk_msg allow_ambiguous
-     = vcat [ text "In the ambiguity check for" <+> what
-            , ppUnless allow_ambiguous ambig_msg ]
-   ambig_msg = text "To defer the ambiguity check to use sites, enable AllowAmbiguousTypes"
-   what | Just n <- isSigMaybe ctxt = quotes (ppr n)
-        | otherwise                 = pprUserTypeCtxt ctxt
 
 wantAmbiguityCheck :: UserTypeCtxt -> Bool
 wantAmbiguityCheck ctxt
@@ -381,7 +372,6 @@ checkValidType ctxt ty
                = case ctxt of
                  DefaultDeclCtxt-> MustBeMonoType
                  PatSigCtxt     -> rank0
-                 RuleSigCtxt {} -> rank1
                  TySynCtxt _    -> rank0
 
                  ExprSigCtxt {} -> rank1
@@ -405,10 +395,11 @@ checkValidType ctxt ty
                  SpecInstCtxt   -> rank1
                  GhciCtxt {}    -> ArbitraryRank
 
-                 TyVarBndrKindCtxt _ -> rank0
-                 DataKindCtxt _      -> rank1
-                 TySynKindCtxt _     -> rank1
-                 TyFamResKindCtxt _  -> rank1
+                 TyVarBndrKindCtxt {} -> rank0
+                 RuleBndrTypeCtxt{}   -> rank1
+                 DataKindCtxt _       -> rank1
+                 TySynKindCtxt _      -> rank1
+                 TyFamResKindCtxt _   -> rank1
 
                  _              -> panic "checkValidType"
                                           -- Can't happen; not used for *user* sigs
@@ -542,7 +533,7 @@ typeOrKindCtxt (ExprSigCtxt {})     = OnlyTypeCtxt
 typeOrKindCtxt (TypeAppCtxt {})     = OnlyTypeCtxt
 typeOrKindCtxt (PatSynCtxt {})      = OnlyTypeCtxt
 typeOrKindCtxt (PatSigCtxt {})      = OnlyTypeCtxt
-typeOrKindCtxt (RuleSigCtxt {})     = OnlyTypeCtxt
+typeOrKindCtxt (RuleBndrTypeCtxt {})= OnlyTypeCtxt
 typeOrKindCtxt (ForSigCtxt {})      = OnlyTypeCtxt
 typeOrKindCtxt (DefaultDeclCtxt {}) = OnlyTypeCtxt
 typeOrKindCtxt (InstDeclCtxt {})    = OnlyTypeCtxt
@@ -880,10 +871,8 @@ check_syn_tc_app (ve@ValidityEnv{ ve_ctxt = ctxt, ve_expand = expand })
     check_expansion_only expand
       = assertPpr (isTypeSynonymTyCon tc) (ppr tc) $
         case coreView ty of
-         Just ty' -> let err_ctxt = text "In the expansion of type synonym"
-                                    <+> quotes (ppr tc)
-                     in addErrCtxt err_ctxt $
-                        check_type (ve{ve_expand = expand}) ty'
+         Just ty' -> addErrCtxt (TySynErrCtxt tc) $
+                     check_type (ve{ve_expand = expand}) ty'
          Nothing  -> pprPanic "check_syn_tc_app" (ppr ty)
 
 {-
@@ -1012,18 +1001,11 @@ checkVdqOK ve tvbs ty = do
 
 -- | Check for a DataKinds violation in a kind context.
 -- See @Note [Checking for DataKinds]@.
---
--- Note that emitting DataKinds errors from the typechecker is a fairly recent
--- addition to GHC (introduced in GHC 9.10), and in order to prevent these new
--- errors from breaking users' code, we temporarily downgrade these errors to
--- warnings. (This is why we use 'diagnosticTcM' below.) See
--- @Note [Checking for DataKinds] (Wrinkle: Migration story for DataKinds
--- typechecker errors)@.
 checkDataKinds :: ValidityEnv -> Type -> TcM ()
 checkDataKinds (ValidityEnv{ ve_ctxt = ctxt, ve_tidy_env = env }) ty = do
   data_kinds <- xoptM LangExt.DataKinds
-  diagnosticTcM
-    (not (data_kinds || typeLevelUserTypeCtxt ctxt)) $
+  checkTcM
+    (data_kinds || typeLevelUserTypeCtxt ctxt) $
     (env, TcRnDataKindsError KindLevel (Right (tidyType env ty)))
 
 {- Note [No constraints in kinds]
@@ -1175,28 +1157,6 @@ different places in the code:
   synonym), so we also catch a subset of kind-level violations in the renamer
   to allow for earlier reporting of these errors.
 
------
--- Wrinkle: Migration story for DataKinds typechecker errors
------
-
-As mentioned above, DataKinds is checked in two different places: the renamer
-and the typechecker. The checks in the renamer have been around since DataKinds
-was introduced. The checks in the typechecker, on the other hand, are a fairly
-recent addition, having been introduced in GHC 9.10. As such, it is possible
-that there are some programs in the wild that (1) do not enable DataKinds, and
-(2) were accepted by a previous GHC version, but would now be rejected by the
-new DataKinds checks in the typechecker.
-
-To prevent the new DataKinds checks in the typechecker from breaking users'
-code, we temporarily allow programs to compile if they violate a DataKinds
-check in the typechecker, but GHC will emit a warning if such a violation
-occurs. Users can then silence the warning by enabling DataKinds in the module
-where the affected code lives. It is fairly straightforward to distinguish
-between DataKinds violations arising from the renamer versus the typechecker,
-as TcRnDataKindsError (the error message type classifying all DataKinds errors)
-stores an Either field that is Left when the error comes from the renamer and
-Right when the error comes from the typechecker.
-
 ************************************************************************
 *                                                                      *
 \subsection{Checking a theta or source type}
@@ -1309,7 +1269,7 @@ check_pred_help under_syn env dflags ctxt pred
 check_quant_pred :: TidyEnv -> DynFlags -> UserTypeCtxt
                  -> PredType -> ThetaType -> PredType -> TcM ()
 check_quant_pred env dflags ctxt pred theta head_pred
-  = addErrCtxt (text "In the quantified constraint" <+> quotes (ppr pred)) $
+  = addErrCtxt (QuantifiedCtCtxt pred) $
     do { -- Check the instance head
          case classifyPredType head_pred of
                                  -- SigmaCtxt tells checkValidInstHead that
@@ -1466,7 +1426,7 @@ okIPCtxt (StandaloneKindSigCtxt {}) = False
 okIPCtxt (ClassSCCtxt {})       = False
 okIPCtxt (InstDeclCtxt {})      = False
 okIPCtxt (SpecInstCtxt {})      = False
-okIPCtxt (RuleSigCtxt {})       = False
+okIPCtxt (RuleBndrTypeCtxt {})  = False
 okIPCtxt DefaultDeclCtxt        = False
 okIPCtxt DerivClauseCtxt        = False
 okIPCtxt (TyVarBndrKindCtxt {}) = False
@@ -1495,11 +1455,9 @@ Flexibility check:
   generalized actually.
 -}
 
-checkThetaCtxt :: UserTypeCtxt -> ThetaType -> TidyEnv -> ZonkM (TidyEnv, SDoc)
+checkThetaCtxt :: UserTypeCtxt -> ThetaType -> TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)
 checkThetaCtxt ctxt theta env
-  = return ( env
-           , vcat [ text "In the context:" <+> pprTheta (tidyTypes env theta)
-                  , text "While checking" <+> pprUserTypeCtxt ctxt ] )
+  = return (env, ThetaCtxt ctxt (tidyTypes env theta))
 
 tyConArityErr :: TyCon -> [TcType] -> TcRnMessage
 -- For type-constructor arity errors, be careful to report
@@ -1577,7 +1535,7 @@ check_special_inst_head dflags hs_src ctxt clas cls_args
   | isAbstractClass clas
   , hs_src == HsSrcFile
   = fail_with_inst_err $ IllegalInstanceHead
-                       $ InstHeadAbstractClass clas
+                       $ InstHeadAbstractClass (noUserRdr $ className clas)
 
   -- Complain about hand-written instances of built-in classes
   -- Typeable, KnownNat, KnownSymbol, Coercible, HasField.
@@ -2124,9 +2082,10 @@ checkValidInstance ctxt hs_type ty = case tau of
         ; traceTc "End checkValidInstance }" empty }
     | otherwise
     -> failWithTc $ mk_err $ IllegalInstanceHead
-                           $ InstHeadNonClass (Just tc)
+                           $ InstHeadNonClassHead
+                           $ InstNonClassTyCon (noUserRdr $ tyConName tc) (fmap tyConName $ tyConFlavour tc)
   _ -> failWithTc $ mk_err $ IllegalInstanceHead
-                           $ InstHeadNonClass Nothing
+                           $ InstHeadNonClassHead InstNonTyCon
   where
     (theta, tau) = splitInstTyForValidity ty
 
@@ -2625,7 +2584,7 @@ checkConsistentFamInst (InClsInst { ai_class = clas
     -- The /scoped/ type variables from the class-instance header
     -- should not be alpha-renamed.  Inferred ones can be.
     no_bind_set = mkVarSet inst_tvs
-    bind_me tv _ty | tv `elemVarSet` no_bind_set = Apart
+    bind_me tv _ty | tv `elemVarSet` no_bind_set = DontBindMe
                    | otherwise                   = BindMe
 
 

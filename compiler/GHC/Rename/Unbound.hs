@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 {-
@@ -13,8 +14,8 @@ module GHC.Rename.Unbound
    , mkUnboundGRERdr
    , isUnboundName
    , reportUnboundName
-   , reportUnboundName'
    , unknownNameSuggestions
+   , unknownNameSuggestionsMessage
    , similarNameSuggestions
    , fieldSelectorSuggestions
    , WhatLooking(..)
@@ -25,7 +26,8 @@ module GHC.Rename.Unbound
    , unboundTermNameInTypes
    , IsTermInTypes(..)
    , notInScopeErr
-   , nameSpacesRelated
+   , relevantNameSpace
+   , suggestionIsRelevant
    , termNameInType
    )
 where
@@ -34,10 +36,13 @@ import GHC.Prelude
 
 import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
+import GHC.Driver.Env (hsc_units)
+import GHC.Driver.Env.Types
 
+import {-# SOURCE #-} GHC.Tc.Errors.Hole ( getHoleFitDispConfig )
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
-import GHC.Builtin.Names ( mkUnboundName, isUnboundName, getUnique)
+import GHC.Builtin.Names ( mkUnboundName, isUnboundName )
 import GHC.Utils.Misc
 import GHC.Utils.Panic (panic)
 
@@ -53,17 +58,18 @@ import GHC.Types.Hint
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Name
 import GHC.Types.Name.Reader
-import GHC.Types.Unique.DFM (udfmToList)
 
 import GHC.Unit.Module
 import GHC.Unit.Module.Imported
-import GHC.Unit.Home.ModInfo
+import GHC.Utils.Outputable
+import GHC.Runtime.Context
 
 import GHC.Data.Bag
-import GHC.Utils.Outputable (empty)
+import Language.Haskell.Syntax.ImpExp
 
-import Data.List (sortBy, partition, nub)
+import Data.List (sortBy, partition)
 import Data.List.NonEmpty ( pattern (:|), NonEmpty )
+import qualified Data.List.NonEmpty as NE ( nonEmpty )
 import Data.Function ( on )
 import qualified Data.Semigroup as S
 import qualified Data.Map as M
@@ -75,19 +81,6 @@ import qualified Data.Map as M
 *                                                                      *
 ************************************************************************
 -}
-
--- What kind of suggestion are we looking for? #19843
-data WhatLooking = WL_Anything    -- Any binding
-                 | WL_Constructor -- Constructors and pattern synonyms
-                        -- E.g. in K { f1 = True }, if K is not in scope,
-                        -- suggest only constructors
-                 | WL_RecField    -- Record fields
-                        -- E.g. in K { f1 = True, f2 = False }, if f2 is not in
-                        -- scope, suggest only constructor fields
-                 | WL_None        -- No suggestions
-                        -- WS_None is used for rebindable syntax, where there
-                        -- is no point in suggesting alternative spellings
-                 deriving Eq
 
 data WhereLooking = WL_Anywhere   -- Any binding
                   | WL_Global     -- Any top-level binding (local or imported)
@@ -113,11 +106,8 @@ mkUnboundGRE occ = mkLocalGRE UnboundGRE NoParent $ mkUnboundName occ
 mkUnboundGRERdr :: RdrName -> GlobalRdrElt
 mkUnboundGRERdr rdr = mkLocalGRE UnboundGRE NoParent $ mkUnboundNameRdr rdr
 
-reportUnboundName' :: WhatLooking -> RdrName -> RnM Name
-reportUnboundName' what_look rdr = unboundName (LF what_look WL_Anywhere) rdr
-
-reportUnboundName :: RdrName -> RnM Name
-reportUnboundName = reportUnboundName' WL_Anything
+reportUnboundName :: WhatLooking -> RdrName -> RnM Name
+reportUnboundName what_look rdr = unboundName (LF what_look WL_Anywhere) rdr
 
 unboundName :: LookingFor -> RdrName -> RnM Name
 unboundName lf rdr = unboundNameX lf rdr []
@@ -141,17 +131,23 @@ unboundNameOrTermInType if_term_in_type looking_for rdr_name hints
   = do  { dflags <- getDynFlags
         ; let show_helpful_errors = gopt Opt_HelpfulErrors dflags
         ; if not show_helpful_errors
-          then addErr $ make_error [] hints
+          then addErr =<< make_error [] hints
           else do { local_env  <- getLocalRdrEnv
                   ; global_env <- getGlobalRdrEnv
                   ; impInfo <- getImports
                   ; currmod <- getModule
-                  ; hpt <- getHpt
+                  ; ic <- hsc_IC <$> getTopEnv
                   ; let (imp_errs, suggs) =
                           unknownNameSuggestions_ looking_for
-                            dflags hpt currmod global_env local_env impInfo
+                            dflags ic currmod global_env local_env impInfo
                             rdr_name
-                  ; addErr $
+                  ; traceTc "unboundNameOrTermInType" $
+                     vcat [ text "rdr_name:" <+> ppr rdr_name
+                          , text "what_looking:" <+> text (show $ lf_which looking_for)
+                          , text "imp_errs:" <+> ppr imp_errs
+                          , text "suggs:" <+> ppr suggs
+                          ]
+                  ; addErr =<<
                       make_error imp_errs (hints ++ suggs) }
         ; return (mkUnboundNameRdr rdr_name) }
     where
@@ -162,9 +158,27 @@ unboundNameOrTermInType if_term_in_type looking_for rdr_name hints
 
       err = notInScopeErr (lf_where looking_for) name_to_search
 
-      make_error imp_errs hints = case if_term_in_type of
-        TermInTypes demoted_name -> TcRnTermNameInType demoted_name hints
-        _ -> TcRnNotInScope err name_to_search imp_errs hints
+      make_error imp_errs hints =
+        case if_term_in_type of
+          TermInTypes demoted_name ->
+            unknownNameSuggestionsMessage (TcRnTermNameInType demoted_name)
+              [] -- no import errors
+              hints
+          _ -> unknownNameSuggestionsMessage (TcRnNotInScope err name_to_search)
+                 imp_errs hints
+
+unknownNameSuggestionsMessage :: TcRnMessage -> [ImportError] -> [GhcHint] -> RnM TcRnMessage
+unknownNameSuggestionsMessage msg imp_errs hints
+  = do { unit_state <- hsc_units <$> getTopEnv
+       ; hfdc <- getHoleFitDispConfig
+       ; let supp = case NE.nonEmpty imp_errs of
+                       Nothing -> Nothing
+                       Just ne_imp_errs ->
+                         (Just (hfdc, [SupplementaryImportErrors ne_imp_errs]))
+       ; return $
+           TcRnMessageWithInfo unit_state $
+             mkDetailedMessage (ErrInfo [] supp hints) msg
+       }
 
 notInScopeErr :: WhereLooking -> RdrName -> NotInScopeError
 notInScopeErr where_look rdr_name
@@ -179,17 +193,17 @@ notInScopeErr where_look rdr_name
 unknownNameSuggestions :: LocalRdrEnv -> WhatLooking -> RdrName -> RnM ([ImportError], [GhcHint])
 unknownNameSuggestions lcl_env what_look tried_rdr_name =
   do { dflags  <- getDynFlags
-     ; hpt     <- getHpt
      ; rdr_env <- getGlobalRdrEnv
      ; imp_info <- getImports
      ; curr_mod <- getModule
+     ; interactive_context <- hsc_IC <$> getTopEnv
      ; return $
         unknownNameSuggestions_
           (LF what_look WL_Anywhere)
-          dflags hpt curr_mod rdr_env lcl_env imp_info tried_rdr_name }
+          dflags interactive_context curr_mod rdr_env lcl_env imp_info tried_rdr_name }
 
-unknownNameSuggestions_ :: LookingFor -> DynFlags
-                       -> HomePackageTable -> Module
+unknownNameSuggestions_ :: LookingFor -> DynFlags -> InteractiveContext
+                       -> Module
                        -> GlobalRdrEnv -> LocalRdrEnv -> ImportAvails
                        -> RdrName -> ([ImportError], [GhcHint])
 unknownNameSuggestions_ looking_for dflags hpt curr_mod global_env local_env
@@ -201,7 +215,7 @@ unknownNameSuggestions_ looking_for dflags hpt curr_mod global_env local_env
       , map (ImportSuggestion $ rdrNameOcc tried_rdr_name) imp_suggs
       , extensionSuggestions tried_rdr_name
       , fieldSelectorSuggestions global_env tried_rdr_name ]
-    (imp_errs, imp_suggs) = importSuggestions looking_for global_env hpt curr_mod imports tried_rdr_name
+    (imp_errs, imp_suggs) = importSuggestions looking_for hpt curr_mod imports tried_rdr_name
 
     if_ne :: (NonEmpty a -> b) -> [a] -> [b]
     if_ne _ []       = []
@@ -234,12 +248,11 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
 
     tried_occ     = rdrNameOcc tried_rdr_name
     tried_is_sym  = isSymOcc tried_occ
-    tried_ns      = occNameSpace tried_occ
     tried_is_qual = isQual tried_rdr_name
 
-    correct_name_space occ =
-      (nameSpacesRelated dflags what_look tried_ns (occNameSpace occ))
-      && isSymOcc occ == tried_is_sym
+    is_relevant sugg_occ =
+      suggestionIsRelevant dflags what_look sugg_occ
+        && isSymOcc sugg_occ == tried_is_sym
         -- Treat operator and non-operators as non-matching
         -- This heuristic avoids things like
         --      Not in scope 'f'; perhaps you meant '+' (from Prelude)
@@ -255,7 +268,8 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
       | otherwise     = [ (mkRdrUnqual occ, nameSrcSpan name)
                         | name <- localRdrEnvElts env
                         , let occ = nameOccName name
-                        , correct_name_space occ]
+                        , is_relevant occ
+                        ]
 
     global_possibilities :: GlobalRdrEnv -> [(RdrName, SimilarName)]
     global_possibilities global_env
@@ -263,7 +277,7 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
                         | gre <- globalRdrEnvElts global_env
                         , isGreOk looking_for gre
                         , let occ = greOccName gre
-                        , correct_name_space occ
+                        , is_relevant occ
                         , (mod, how) <- qualsInScope gre
                         , let rdr_qual = mkRdrQual mod occ ]
 
@@ -272,7 +286,7 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
                     , isGreOk looking_for gre
                     , let occ = greOccName gre
                           rdr_unqual = mkRdrUnqual occ
-                    , correct_name_space occ
+                    , is_relevant occ
                     , sim <- case (unquals_in_scope gre, quals_only gre) of
                                 (how:_, _)    -> [ SimilarRdrName rdr_unqual (Just how) ]
                                 ([],    pr:_) -> [ pr ]  -- See Note [Only-quals]
@@ -308,21 +322,19 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
 
 -- | Generate errors and helpful suggestions if a qualified name Mod.foo is not in scope.
 importSuggestions :: LookingFor
-                  -> GlobalRdrEnv
-                  -> HomePackageTable -> Module
+                  -> InteractiveContext -> Module
                   -> ImportAvails -> RdrName -> ([ImportError], [ImportSuggestion])
-importSuggestions looking_for global_env hpt currMod imports rdr_name
+importSuggestions looking_for ic currMod imports rdr_name
   | WL_LocalOnly <- lf_where looking_for       = ([], [])
   | WL_LocalTop  <- lf_where looking_for       = ([], [])
   | not (isQual rdr_name || isUnqual rdr_name) = ([], [])
-  | null interesting_imports
-  , Just name <- mod_name
+  | Just name <- mod_name
   , show_not_imported_line name
   = ([MissingModule name], [])
   | is_qualified
   , null helpful_imports
   , (mod : mods) <- map fst interesting_imports
-  = ([ModulesDoNotExport (mod :| mods) occ_name], [])
+  = ([ModulesDoNotExport (mod :| mods) (lf_which looking_for) occ_name], [])
   | mod : mods <- helpful_imports_non_hiding
   = ([], [CouldImportFrom (mod :| mods)])
   | mod : mods <- helpful_imports_hiding
@@ -343,6 +355,17 @@ importSuggestions looking_for global_env hpt currMod imports rdr_name
     | (mod, mod_imports) <- M.toList (imp_mods imports)
     , Just imp <- return $ pick (importedByUser mod_imports)
     ]
+
+  -- Choose the imports from the interactive context which might have provided
+  -- a module.
+  interactive_imports =
+    filter pick_interactive (ic_imports ic)
+
+  pick_interactive :: InteractiveImport -> Bool
+  pick_interactive (IIDecl d)   | mod_name == Just (unLoc (ideclName d)) = True
+                                | mod_name == fmap unLoc (ideclAs d) = True
+  pick_interactive (IIModule m) | mod_name == Just (moduleName m) = True
+  pick_interactive _ = False
 
   -- We want to keep only one for each original module; preferably one with an
   -- explicit import list (for no particularly good reason)
@@ -369,17 +392,10 @@ importSuggestions looking_for global_env hpt currMod imports rdr_name
   -- See Note [When to show/hide the module-not-imported line]
   show_not_imported_line :: ModuleName -> Bool                    -- #15611
   show_not_imported_line modnam
-      | modnam `elem` glob_mods               = False    -- #14225     -- 1
-      | moduleName currMod == modnam          = False                  -- 2.1
-      | is_last_loaded_mod modnam hpt_uniques = False                  -- 2.2
+      | not (null interactive_imports)        = False -- 1 (interactive context)
+      | not (null interesting_imports)        = False -- 1 (normal module import)
+      | moduleName currMod == modnam          = False -- 2
       | otherwise                             = True
-    where
-      hpt_uniques = map fst (udfmToList hpt)
-      is_last_loaded_mod modnam uniqs = lastMaybe uniqs == Just (getUnique modnam)
-      glob_mods = nub [ mod
-                      | gre <- globalRdrEnvElts global_env
-                      , (mod, _) <- qualsInScope gre
-                      ]
 
 extensionSuggestions :: RdrName -> [GhcHint]
 extensionSuggestions rdrName
@@ -414,41 +430,44 @@ isGreOk (LF what_look where_look) gre = what_ok && where_ok
                  WL_LocalOnly -> False
                  _            -> True
 
--- see Note [Related name spaces]
-nameSpacesRelated :: DynFlags    -- ^ to find out whether -XDataKinds is enabled
-                  -> WhatLooking -- ^ What kind of name are we looking for
-                  -> NameSpace   -- ^ Name space of the original name
-                  -> NameSpace   -- ^ Name space of a name that might have been meant
+-- | Is it OK to suggest an identifier in some other 'NameSpace',
+-- given what we are looking for?
+--
+-- See Note [Related name spaces]
+suggestionIsRelevant
+  :: DynFlags    -- ^ to find out whether -XDataKinds is enabled
+  -> WhatLooking -- ^ What kind of name are we looking for?
+  -> OccName     -- ^ The suggestion
+                 --
+                 -- We only look at the suggestion's 'NameSpace',
+                 -- but passing the whole 'OccName' is convenient
+                 -- for debugging.
+  -> Bool
+suggestionIsRelevant dflags what_looking suggestion =
+  relevantNameSpace data_kinds what_looking suggestion_ns
+    where
+      suggestion_ns = occNameSpace suggestion
+      data_kinds = xopt LangExt.DataKinds dflags
+
+-- | Is a 'NameSpace' relevant for what we are looking for?
+relevantNameSpace :: Bool        -- ^ is @-XDataKinds@ enabled?
+                  -> WhatLooking -- ^ what are we looking for?
+                  -> NameSpace   -- ^ is this 'NameSpace' relevant?
                   -> Bool
-nameSpacesRelated dflags what_looking ns ns'
-  | ns == ns'
-  = True
-  | otherwise
-  = or [ other_ns ns'
-       | (orig_ns, others) <- other_namespaces
-       , orig_ns ns
-       , (other_ns, wls) <- others
-       , what_looking `elem` WL_Anything : wls
-       ]
-  where
-    -- explanation:
-    -- [(orig_ns, [(other_ns, what_looking_possibilities)])]
-    -- A particular other_ns is related if the original namespace is orig_ns
-    -- and what_looking is either WL_Anything or is one of
-    -- what_looking_possibilities
-    other_namespaces =
-      [ (isVarNameSpace     , [(isFieldNameSpace  , [WL_RecField])
-                              ,(isDataConNameSpace, [WL_Constructor])])
-      , (isDataConNameSpace , [(isVarNameSpace    , [WL_RecField])])
-      , (isTvNameSpace      , (isTcClsNameSpace   , [WL_Constructor])
-                              : promoted_datacons)
-      , (isTcClsNameSpace   , (isTvNameSpace     , [])
-                              : promoted_datacons)
-      ]
-    -- If -XDataKinds is enabled, the data constructor name space is also
-    -- related to the type-level name spaces
-    data_kinds = xopt LangExt.DataKinds dflags
-    promoted_datacons = [(isDataConNameSpace, [WL_Constructor]) | data_kinds]
+relevantNameSpace data_kinds = \case
+  WL_Anything         -> const True
+  WL_TyCon            -> isTcClsNameSpace
+  WL_TyCon_or_TermVar -> isTcClsNameSpace <||> isTermVarOrFieldNameSpace
+  WL_TyVar            -> isTvNameSpace
+  WL_Constructor      -> isTcClsNameSpace <||> isDataConNameSpace
+  WL_ConLike          -> isDataConNameSpace
+  WL_RecField         -> isFieldNameSpace
+  WL_Term             -> isValNameSpace
+  WL_TermVariable     -> isTermVarOrFieldNameSpace
+  WL_Type             -> if data_kinds
+                         then not . isTermVarOrFieldNameSpace
+                         else not . isValNameSpace
+  WL_None             -> const False
 
 {- Note [Related name spaces]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -478,13 +497,8 @@ For the error message:
     Module X does not export Y
     No module named ‘X’ is imported:
 there are 2 cases, where we hide the last "no module is imported" line:
-1. If the module X has been imported.
-2. If the module X is the current module. There are 2 subcases:
-   2.1 If the unknown module name is in a input source file,
-       then we can use the getModule function to get the current module name.
-       (See test T15611a)
-   2.2 If the unknown module name has been entered by the user in GHCi,
-       then the getModule function returns something like "interactive:Ghci1",
-       and we have to check the current module in the last added entry of
-       the HomePackageTable. (See test T15611b)
+1. If the module X has been imported (normally or via interactive context).
+2. It is the current module we are trying to compile
+   then we can use the getModule function to get the current module name.
+   (See test T15611a)
 -}

@@ -68,6 +68,10 @@
     pointer.
    ------------------------------------------------------------------------- */
 
+static /* STATIC_INLINE */ P_
+thread_obj (const StgInfoTable *info, P_ p);
+
+
 STATIC_INLINE W_
 UNTAG_PTR(W_ p)
 {
@@ -347,6 +351,7 @@ thread_stack(P_ p, P_ stack_end)
         case STOP_FRAME:
         case CATCH_FRAME:
         case RET_SMALL:
+        case ANN_FRAME:
         {
             W_ bitmap = BITMAP_BITS(info->i.layout.bitmap);
             W_ size   = BITMAP_SIZE(info->i.layout.bitmap);
@@ -566,6 +571,13 @@ update_fwd_large( bdescr *bd )
     case ARR_WORDS:
       // nothing to follow
       continue;
+
+    // See Note [Black holes in large objects] in Evac.c for why.
+    case BLACKHOLE:
+      {
+        thread_obj(info, p);
+        continue;
+      }
 
     case MUT_ARR_PTRS_CLEAN:
     case MUT_ARR_PTRS_DIRTY:

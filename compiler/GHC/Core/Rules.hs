@@ -9,7 +9,7 @@
 -- The 'CoreRule' datatype itself is declared elsewhere.
 module GHC.Core.Rules (
         -- ** Looking up rules
-        lookupRule, matchExprs,
+        lookupRule, matchExprs, ruleLhsIsMoreSpecific,
 
         -- ** RuleBase, RuleEnv
         RuleBase, RuleEnv(..), mkRuleEnv, emptyRuleEnv,
@@ -543,7 +543,8 @@ map.
 -- supplied rules to this instance of an application in a given
 -- context, returning the rule applied and the resulting expression if
 -- successful.
-lookupRule :: RuleOpts -> InScopeEnv
+lookupRule :: HasDebugCallStack
+           => RuleOpts -> InScopeEnv
            -> (Activation -> Bool)      -- When rule is active
            -> Id -- Function head
            -> [CoreExpr] -- Args
@@ -587,8 +588,8 @@ findBest :: InScopeSet -> (Id, [CoreExpr])
 
 findBest _        _      (rule,ans)   [] = (rule,ans)
 findBest in_scope target (rule1,ans1) ((rule2,ans2):prs)
-  | isMoreSpecific in_scope rule1 rule2 = findBest in_scope target (rule1,ans1) prs
-  | isMoreSpecific in_scope rule2 rule1 = findBest in_scope target (rule2,ans2) prs
+  | ruleIsMoreSpecific in_scope rule1 rule2 = findBest in_scope target (rule1,ans1) prs
+  | ruleIsMoreSpecific in_scope rule2 rule1 = findBest in_scope target (rule2,ans2) prs
   | debugIsOn = let pp_rule rule
                       = ifPprDebug (ppr rule)
                                    (doubleQuotes (ftext (ruleName rule)))
@@ -603,15 +604,25 @@ findBest in_scope target (rule1,ans1) ((rule2,ans2):prs)
   where
     (fn,args) = target
 
-isMoreSpecific :: InScopeSet -> CoreRule -> CoreRule -> Bool
--- The call (rule1 `isMoreSpecific` rule2)
+ruleIsMoreSpecific :: InScopeSet -> CoreRule -> CoreRule -> Bool
+-- The call (rule1 `ruleIsMoreSpecific` rule2)
 -- sees if rule2 can be instantiated to look like rule1
--- See Note [isMoreSpecific]
-isMoreSpecific _        (BuiltinRule {}) _                = False
-isMoreSpecific _        (Rule {})        (BuiltinRule {}) = True
-isMoreSpecific in_scope (Rule { ru_bndrs = bndrs1, ru_args = args1 })
-                        (Rule { ru_bndrs = bndrs2, ru_args = args2 })
-  = isJust (matchExprs in_scope_env bndrs2 args2 args1)
+-- See Note [ruleIsMoreSpecific]
+ruleIsMoreSpecific in_scope rule1 rule2
+  = case rule1 of
+       BuiltinRule {} -> False
+       Rule { ru_bndrs = bndrs1, ru_args = args1 }
+                      -> ruleLhsIsMoreSpecific in_scope bndrs1 args1 rule2
+
+ruleLhsIsMoreSpecific :: InScopeSet
+                      -> [Var] -> [CoreExpr]  -- LHS of a possible new rule
+                      -> CoreRule             -- An existing rule
+                      -> Bool                 -- New one is more specific
+ruleLhsIsMoreSpecific in_scope bndrs1 args1 rule2
+  = case rule2 of
+       BuiltinRule {} -> True
+       Rule { ru_bndrs = bndrs2, ru_args = args2 }
+                      -> isJust (matchExprs in_scope_env bndrs2 args2 args1)
   where
    full_in_scope = in_scope `extendInScopeSetList` bndrs1
    in_scope_env  = ISE full_in_scope noUnfoldingFun
@@ -620,9 +631,9 @@ isMoreSpecific in_scope (Rule { ru_bndrs = bndrs1, ru_args = args1 })
 noBlackList :: Activation -> Bool
 noBlackList _ = False           -- Nothing is black listed
 
-{- Note [isMoreSpecific]
+{- Note [ruleIsMoreSpecific]
 ~~~~~~~~~~~~~~~~~~~~~~~~
-The call (rule1 `isMoreSpecific` rule2)
+The call (rule1 `ruleIsMoreSpecific` rule2)
 sees if rule2 can be instantiated to look like rule1.
 
 Wrinkle:
@@ -665,7 +676,8 @@ start, in general eta expansion wastes work.  SLPJ July 99
 -}
 
 ------------------------------------
-matchRule :: RuleOpts -> InScopeEnv -> (Activation -> Bool)
+matchRule :: HasDebugCallStack
+          => RuleOpts -> InScopeEnv -> (Activation -> Bool)
           -> Id -> [CoreExpr] -> [Maybe Name]
           -> CoreRule -> Maybe CoreExpr
 
@@ -710,7 +722,8 @@ matchRule _ rule_env is_active _ args rough_args
 
 
 ---------------------------------------
-matchN  :: InScopeEnv
+matchN  :: HasDebugCallStack
+        => InScopeEnv
         -> RuleName -> [Var] -> [CoreExpr]
         -> [CoreExpr] -> CoreExpr           -- ^ Target; can have more elements than the template
         -> Maybe CoreExpr
@@ -729,7 +742,8 @@ matchN ise _rule_name tmpl_vars tmpl_es target_es rhs
        ; return (bind_wrapper $
                  mkLams tmpl_vars rhs `mkApps` matched_es) }
 
-matchExprs :: InScopeEnv -> [Var] -> [CoreExpr] -> [CoreExpr]
+matchExprs :: HasDebugCallStack
+           => InScopeEnv -> [Var] -> [CoreExpr] -> [CoreExpr]
            -> Maybe (BindWrapper, [CoreExpr])  -- 1-1 with the [Var]
 matchExprs (ISE in_scope id_unf) tmpl_vars tmpl_es target_es
   = do  { rule_subst <- match_exprs init_menv emptyRuleSubst tmpl_es target_es
@@ -785,7 +799,8 @@ matchExprs (ISE in_scope id_unf) tmpl_vars tmpl_es target_es
               , text "Actual args:" <+> ppr target_es ]
 
 ----------------------
-match_exprs :: RuleMatchEnv -> RuleSubst
+match_exprs :: HasDebugCallStack
+            => RuleMatchEnv -> RuleSubst
             -> [CoreExpr]       -- Templates
             -> [CoreExpr]       -- Targets
             -> Maybe RuleSubst
@@ -825,7 +840,7 @@ bound on the LHS:
 
   The rule looks like
     forall (a::*) (d::Eq Char) (x :: Foo a Char).
-         f (Foo a Char) d x = True
+         f @(Foo a Char) d x = True
 
   Matching the rule won't bind 'a', and legitimately so.  We fudge by
   pretending that 'a' is bound to (Any :: *).
@@ -1001,16 +1016,16 @@ In short, it is Very Deeply Suspicious for a rule to quantify over a coercion
 variable.  And SpecConstr no longer does so: see Note [SpecConstr and casts] in
 SpecConstr.
 
-It is, however, OK for a cast to appear in a template.  For example
-    newtype N a = MkN (a,a)    -- Axiom ax:N a :: (a,a) ~R N a
-    f :: N a -> bah
-    RULE forall b x:b y:b. f @b ((x,y) |> (axN @b)) = ...
-
-When matching we can just move these casts to the other side:
-    match (tmpl |> co) tgt  -->   match tmpl (tgt |> sym co)
-See matchTemplateCast.
-
 Wrinkles:
+
+(CT0) It is, however, OK for a cast to appear in a template provided the cast mentions
+  none of the template variables.  For example
+      newtype N a = MkN (a,a)    -- Axiom ax:N a :: (a,a) ~R N a
+      f :: N a -> bah
+      RULE forall b x:b y:b. f @b ((x,y) |> (axN @b)) = ...
+  When matching we can just move these casts to the other side:
+      match (tmpl |> co) tgt  -->   match tmpl (tgt |> sym co)
+  See matchTemplateCast.
 
 (CT1) We need to be careful about scoping, and to match left-to-right, so that we
   know the substitution [a :-> b] before we meet (co :: (a,a) ~R N a), and so we
@@ -1046,7 +1061,8 @@ We really should never rely on matching the structure of a coercion
 -}
 
 ----------------------
-match :: RuleMatchEnv
+match :: HasDebugCallStack
+      => RuleMatchEnv
       -> RuleSubst              -- Substitution applies to template only
       -> CoreExpr               -- Template
       -> CoreExpr               -- Target
@@ -1282,7 +1298,7 @@ Two wrinkles:
              f (\(MkT @b (d::Num b) (x::b)) -> h @b d x) = ...
      where the HOP is (h @b d x). In principle this might be possible, but
      it seems fragile; e.g. we would still need to insist that the (invisible)
-     @b was a type variable.  And since `h` gets a polymoprhic type, that
+     @b was a type variable.  And since `h` gets a polymorphic type, that
      type would have to be declared by the programmer.
 
      Maybe one day.  But for now, we insist (in `arg_as_lcl_var`)that a HOP
@@ -1496,11 +1512,12 @@ matchTemplateCast renv subst e1 co1 e2 mco
     filterFV (`elemVarSet` rv_tmpls renv) $    -- Check that the coercion does not
     tyCoFVsOfCo substed_co                     -- mention any of the template variables
   = -- This is the good path
-    -- See Note [Casts in the template]
+    -- See Note [Casts in the template] wrinkle (CT0)
     match renv subst e1 e2 (checkReflexiveMCo (mkTransMCoL mco (mkSymCo substed_co)))
 
   | otherwise
   = -- This is the Deeply Suspicious Path
+    -- See Note [Casts in the template]
     do { let co2 = case mco of
                      MRefl   -> mkRepReflCo (exprType e2)
                      MCo co2 -> co2
@@ -1582,7 +1599,8 @@ okToFloat rn_env bind_fvs
     not_captured fv = not (inRnEnvR rn_env fv)
 
 ------------------------------------------
-match_var :: RuleMatchEnv
+match_var :: HasDebugCallStack
+          => RuleMatchEnv
           -> RuleSubst
           -> Var        -- Template
           -> CoreExpr   -- Target
@@ -1618,7 +1636,8 @@ match_var renv@(RV { rv_tmpls = tmpls, rv_lcl = rn_env, rv_fltR = flt_env })
         -- template x, so we must rename first!
 
 ------------------------------------------
-match_tmpl_var :: RuleMatchEnv
+match_tmpl_var :: HasDebugCallStack
+               => RuleMatchEnv
                -> RuleSubst
                -> Var                -- Template
                -> CoreExpr           -- Target

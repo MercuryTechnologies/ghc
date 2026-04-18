@@ -44,15 +44,11 @@ module GHC.CoreToIface
       -- * Other stuff
     , toIfaceLFInfo
     , toIfaceBooleanFormula
-      -- * CgBreakInfo
-    , dehydrateCgBreakInfo
     ) where
 
 import GHC.Prelude
 
 import GHC.StgToCmm.Types
-
-import GHC.ByteCode.Types
 
 import GHC.Core
 import GHC.Core.TyCon hiding ( pprPromotionQuote )
@@ -63,7 +59,7 @@ import GHC.Core.Multiplicity
 import GHC.Core.PatSyn
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Compare( eqType )
-import GHC.Core.TyCo.Tidy ( tidyCo )
+import GHC.Core.TyCo.Tidy
 
 import GHC.Builtin.Types.Prim ( eqPrimTyCon, eqReprPrimTyCon )
 import GHC.Builtin.Types ( heqTyCon )
@@ -435,7 +431,7 @@ toIfaceBang env (HsUnpack (Just co)) = IfUnpackCo (toIfaceCoercion (tidyCo env c
 toIfaceBang _   (HsStrict _)         = IfStrict
 
 toIfaceSrcBang :: HsSrcBang -> IfaceSrcBang
-toIfaceSrcBang (HsSrcBang _ (HsBang unpk bang)) = IfSrcBang unpk bang
+toIfaceSrcBang (HsSrcBang _ unpk bang) = IfSrcBang unpk bang
 
 toIfaceLetBndr :: Id -> IfaceLetBndr
 toIfaceLetBndr id  = IfLetBndr (mkIfLclName (occNameFS (getOccName id)))
@@ -586,8 +582,8 @@ toIfaceTickish (ProfNote cc tick push) = IfaceSCC cc tick push
 toIfaceTickish (HpcTick modl ix)       = IfaceHpcTick modl ix
 toIfaceTickish (SourceNote src (LexicalFastString names)) =
   IfaceSource src names
-toIfaceTickish (Breakpoint _ ix fv m) =
-  IfaceBreakpoint ix (toIfaceVar <$> fv) m
+toIfaceTickish (Breakpoint _ ix fv) =
+  IfaceBreakpoint ix (toIfaceVar <$> fv)
 
 ---------------------
 toIfaceBind :: Bind Id -> IfaceBinding IfaceLetBndr
@@ -702,15 +698,6 @@ toIfaceLFInfo nm lfi = case lfi of
     LFLetNoEscape ->
       panic "toIfaceLFInfo: LFLetNoEscape"
 
--- Dehydrating CgBreakInfo
-
-dehydrateCgBreakInfo :: [TyVar] -> [Maybe (Id, Word)] -> Type -> CgBreakInfo
-dehydrateCgBreakInfo ty_vars idOffSets tick_ty =
-          CgBreakInfo
-            { cgb_tyvars = map toIfaceTvBndr ty_vars
-            , cgb_vars = map (fmap (\(i, offset) -> (toIfaceIdBndr i, offset))) idOffSets
-            , cgb_resty = toIfaceType tick_ty
-            }
 
 {- Note [Inlining and hs-boot files]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

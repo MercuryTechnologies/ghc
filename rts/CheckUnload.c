@@ -166,7 +166,7 @@ ObjectCode *loaded_objects;
 static OCSectionIndices *global_s_indices = NULL;
 
 // Is it safe for us to unload code?
-static bool safeToUnload(void)
+static bool tryToUnload(void)
 {
     if (RtsFlags.ProfFlags.doHeapProfile != NO_HEAP_PROFILING) {
         // We mustn't unload anything as the heap census may contain
@@ -174,7 +174,8 @@ static bool safeToUnload(void)
         // See #24512.
         return false;
     }
-    return true;
+
+    return global_s_indices != NULL;
 }
 
 static OCSectionIndices *createOCSectionIndices(void)
@@ -432,7 +433,7 @@ static bool markObjectLive(void *data STG_UNUSED, StgWord key, const void *value
 
 void markObjectCode(const void *addr)
 {
-    if (global_s_indices == NULL) {
+    if (!tryToUnload()) {
         return;
     }
 
@@ -450,7 +451,7 @@ void markObjectCode(const void *addr)
 // unloading.
 bool prepareUnloadCheck(void)
 {
-    if (global_s_indices == NULL) {
+    if (!tryToUnload()) {
         return false;
     }
 
@@ -467,48 +468,44 @@ bool prepareUnloadCheck(void)
 
 void checkUnload(void)
 {
-    if (global_s_indices == NULL) {
-        return;
-    } else if (!safeToUnload()) {
-        return;
-    }
-
     // At this point we've marked all dynamically loaded static objects
     // (including their dependencies) during GC, but not the root set of object
     // code (loaded_objects). Mark the roots first, then unload any unmarked
     // objects.
 
-    OCSectionIndices *s_indices = global_s_indices;
-    ASSERT(s_indices->sorted);
+    if (tryToUnload()) {
+        OCSectionIndices *s_indices = global_s_indices;
+        ASSERT(s_indices->sorted);
 
-    // Mark roots
-    for (ObjectCode *oc = loaded_objects; oc != NULL; oc = oc->next_loaded_object) {
-        markObjectLive(NULL, (W_)oc, NULL);
-    }
+        // Mark roots
+        for (ObjectCode *oc = loaded_objects; oc != NULL; oc = oc->next_loaded_object) {
+            markObjectLive(NULL, (W_)oc, NULL);
+        }
 
-    // Free unmarked objects
-    ObjectCode *next = NULL;
-    for (ObjectCode *oc = old_objects; oc != NULL; oc = next) {
-        next = oc->next;
-        ASSERT(oc->status == OBJECT_UNLOADED);
+        // Free unmarked objects
+        ObjectCode *next = NULL;
+        for (ObjectCode *oc = old_objects; oc != NULL; oc = next) {
+            next = oc->next;
+            ASSERT(oc->status == OBJECT_UNLOADED);
 
-        // Symbols should be removed by unloadObj_.
-        // NB (osa): If this assertion doesn't hold then freeObjectCode below
-        // will corrupt symhash as keys of that table live in ObjectCodes. If
-        // you see a segfault in a hash table operation in linker (in non-debug
-        // RTS) then it's probably because this assertion did not hold.
-        ASSERT(oc->symbols == NULL);
+            // Symbols should be removed by unloadObj_.
+            // NB (osa): If this assertion doesn't hold then freeObjectCode below
+            // will corrupt symhash as keys of that table live in ObjectCodes. If
+            // you see a segfault in a hash table operation in linker (in non-debug
+            // RTS) then it's probably because this assertion did not hold.
+            ASSERT(oc->symbols == NULL);
 
-        if (oc->unloadable) {
-            removeOCSectionIndices(s_indices, oc);
-            freeObjectCode(oc);
-            n_unloaded_objects -= 1;
-        } else {
-            // If we don't have enough information to
-            // accurately determine the reachability of
-            // the object then hold onto it.
-            oc->next = objects;
-            objects = oc;
+            if (oc->unloadable) {
+                removeOCSectionIndices(s_indices, oc);
+                freeObjectCode(oc);
+                n_unloaded_objects -= 1;
+            } else {
+                // If we don't have enough information to
+                // accurately determine the reachability of
+                // the object then hold onto it.
+                oc->next = objects;
+                objects = oc;
+            }
         }
     }
 

@@ -71,7 +71,7 @@ linkBinary = linkBinary' False
 linkBinary' :: Bool -> Logger -> TmpFs -> DynFlags -> UnitEnv -> [FilePath] -> [UnitId] -> IO ()
 linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
     let platform   = ue_platform unit_env
-        unit_state = ue_units unit_env
+        unit_state = ue_homeUnitState unit_env
         toolSettings' = toolSettings dflags
         verbFlags = getVerbFlags dflags
         arch_os   = platformArchOS platform
@@ -250,6 +250,13 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
                       ++ pkg_lib_path_opts
                       ++ extraLinkObj
                       ++ noteLinkObjs
+                      -- See Note [RTS/ghc-internal interface]
+                      -- (-u<sym> must come before -lghc-internal...!)
+                      ++ (if ghcInternalUnitId `elem` map unitId pkgs
+                          then [concat [ "-Wl,-u,"
+                                       , ['_' | platformLeadingUnderscore platform]
+                                       , "init_ghc_hs_iface" ]]
+                          else [])
                       ++ pkg_link_opts
                       ++ pkg_framework_opts
                       ++ (if platformOS platform == OSDarwin
@@ -259,7 +266,7 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
                           --  libraries during runInjectRpaths phase.
                           --
                           --  See Note [Dynamic linking on macOS].
-                          then [ "-Wl,-dead_strip_dylibs", "-Wl,-headerpad,8000" ]
+                          then [ "-Wl,-dead_strip_dylibs", "-Wl,-headerpad,16000" ]
                           else [])
                     ))
 

@@ -24,13 +24,14 @@ module GHC.Core.Subst (
         extendIdSubstWithClone,
         extendSubst, extendSubstList, extendSubstWithVar,
         extendSubstInScope, extendSubstInScopeList, extendSubstInScopeSet,
-        isInScope, setInScope, getSubstInScope,
+        isInScope, setInScope, substInScopeSet,
         extendTvSubst, extendCvSubst,
         delBndr, delBndrs, zapSubst,
 
         -- ** Substituting and cloning binders
         substBndr, substBndrs, substRecBndrs, substTyVarBndr, substCoVarBndr,
         cloneBndr, cloneBndrs, cloneIdBndr, cloneIdBndrs, cloneRecIdBndrs,
+        cloneBndrsM, cloneRecIdBndrsM,
 
     ) where
 
@@ -162,12 +163,14 @@ extendIdSubstList (Subst in_scope ids tvs cvs) prs
 -- | Add a substitution appropriate to the thing being substituted
 --   (whether an expression, type, or coercion). See also
 --   'extendIdSubst', 'extendTvSubst', 'extendCvSubst'
-extendSubst :: Subst -> Var -> CoreArg -> Subst
+extendSubst :: HasDebugCallStack => Subst -> Var -> CoreArg -> Subst
 extendSubst subst var arg
   = case arg of
-      Type ty     -> assert (isTyVar var) $ extendTvSubst subst var ty
-      Coercion co -> assert (isCoVar var) $ extendCvSubst subst var co
-      _           -> assert (isId    var) $ extendIdSubst subst var arg
+      Type ty     -> assertPpr (isTyVar var) doc $ extendTvSubst subst var ty
+      Coercion co -> assertPpr (isCoVar var) doc $ extendCvSubst subst var co
+      _           -> assertPpr (isId    var) doc $ extendIdSubst subst var arg
+  where
+   doc = ppr var <+> text ":=" <+> ppr arg
 
 extendSubstWithVar :: Subst -> Var -> Var -> Subst
 extendSubstWithVar subst v1 v2
@@ -238,8 +241,7 @@ substExprSC :: HasDebugCallStack => Subst -> CoreExpr -> CoreExpr
 -- their canonical representatives in the in-scope set
 substExprSC subst orig_expr
   | isEmptySubst subst = orig_expr
-  | otherwise          = -- pprTrace "enter subst-expr" (doc $$ ppr orig_expr) $
-                         substExpr subst orig_expr
+  | otherwise          = substExpr subst orig_expr
 
 -- | substExpr applies a substitution to an entire 'CoreExpr'. Remember,
 -- you may only apply the substitution /once/:
@@ -418,12 +420,16 @@ cloneIdBndrs :: Subst -> UniqSupply -> [Id] -> (Subst, [Id])
 cloneIdBndrs subst us ids
   = mapAccumL (clone_id subst) subst (ids `zip` uniqsFromSupply us)
 
-cloneBndrs :: MonadUnique m => Subst -> [Var] -> m (Subst, [Var])
+cloneBndrs :: Subst -> UniqSupply -> [Var] -> (Subst, [Var])
 -- Works for all kinds of variables (typically case binders)
 -- not just Ids
-cloneBndrs subst vs
-  = do us <- getUniquesM
-       pure $ mapAccumL (\subst (v, u) -> cloneBndr subst u v) subst (vs `zip` us)
+cloneBndrs subst us vs
+  = mapAccumL (\subst (v, u) -> cloneBndr subst u v) subst (vs `zip` uniqsFromSupply us)
+
+cloneBndrsM :: MonadUnique m => Subst -> [Var] -> m (Subst, [Var])
+-- Works for all kinds of variables (typically case binders)
+-- not just Ids
+cloneBndrsM subst vs = cloneBndrs subst `flip` vs <$> getUniqueSupplyM
 
 cloneBndr :: Subst -> Unique -> Var -> (Subst, Var)
 cloneBndr subst uniq v
@@ -431,11 +437,14 @@ cloneBndr subst uniq v
   | otherwise = clone_id subst subst (v,uniq)  -- Works for coercion variables too
 
 -- | Clone a mutually recursive group of 'Id's
-cloneRecIdBndrs :: MonadUnique m => Subst -> [Id] -> m (Subst, [Id])
-cloneRecIdBndrs subst ids
-  = do us <- getUniquesM
-       let (subst', ids') = mapAccumL (clone_id subst') subst (ids `zip` us)
-       pure (subst', ids')
+cloneRecIdBndrs :: Subst -> UniqSupply -> [Id] -> (Subst, [Id])
+cloneRecIdBndrs subst us ids =
+    let x@(subst', _) = mapAccumL (clone_id subst') subst (ids `zip` uniqsFromSupply us)
+    in x
+
+-- | Clone a mutually recursive group of 'Id's
+cloneRecIdBndrsM :: MonadUnique m => Subst -> [Id] -> m (Subst, [Id])
+cloneRecIdBndrsM subst ids = cloneRecIdBndrs subst `flip` ids <$> getUniqueSupplyM
 
 -- Just like substIdBndr, except that it always makes a new unique
 -- It is given the unique to use
@@ -590,13 +599,13 @@ substDVarSet subst@(Subst _ _ tv_env cv_env) fvs
      = tyCoFVsOfCo fv_co (const True) emptyVarSet $! acc
      | otherwise
      , let fv_expr = lookupIdSubst subst fv
-     = exprFVs fv_expr (const True) emptyVarSet $! acc
+     = exprLocalFVs fv_expr (const True) emptyVarSet $! acc
 
 ------------------
 -- | Drop free vars from the breakpoint if they have a non-variable substitution.
 substTickish :: Subst -> CoreTickish -> CoreTickish
-substTickish subst (Breakpoint ext n ids modl)
-   = Breakpoint ext n (mapMaybe do_one ids) modl
+substTickish subst (Breakpoint ext bid ids)
+   = Breakpoint ext bid (mapMaybe do_one ids)
  where
     do_one = getIdFromTrivialExpr_maybe . lookupIdSubst subst
 

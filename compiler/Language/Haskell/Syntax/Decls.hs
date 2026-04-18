@@ -98,7 +98,7 @@ import Language.Haskell.Syntax.Basic (Role, LexicalFixity)
 import Language.Haskell.Syntax.Specificity (Specificity)
 
 import GHC.Types.Basic (TopLevelFlag, OverlapMode, RuleName, Activation
-                       ,TyConFlavour(..), TypeOrData(..))
+                       ,TyConFlavour(..), TypeOrData(..), NewOrData(..))
 import GHC.Types.ForeignCall (CType, CCallConv, Safety, Header, CLabelString, CCallTarget, CExportSpec)
 
 import GHC.Unit.Module.Warnings (WarningTxt)
@@ -108,7 +108,6 @@ import GHC.Hs.Doc (LHsDoc) -- ROMES:TODO Discuss in #21592 whether this is parse
 import Control.Monad
 import Control.Exception (assert)
 import Data.Data        hiding (TyCon, Fixity, Infix)
-import Data.Void
 import Data.Maybe
 import Data.String
 import Data.Eq
@@ -622,25 +621,26 @@ NOTE THAT
 
 {- Note [TyClGroups and dependency analysis]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A TyClGroup represents a strongly connected components of type/class/instance
-decls, together with the role annotations for the type/class declarations.
+A TyClGroup represents a strongly connected component of type/class/instance
+decls, together with the role annotations and standalone kind signatures for the
+type/class declarations.
 
 The hs_tyclds :: [TyClGroup] field of a HsGroup is a dependency-order
 sequence of strongly-connected components.
 
 Invariants
- * The type and class declarations, group_tyclds, may depend on each
-   other, or earlier TyClGroups, but not on later ones
+ * The type and class declarations, group_tyclds, may lexically depend
+   on each other, or earlier TyClGroups, but not on later ones
 
  * The role annotations, group_roles, are role-annotations for some or
    all of the types and classes in group_tyclds (only).
 
  * The instance declarations, group_instds, may (and usually will)
-   depend on group_tyclds, or on earlier TyClGroups, but not on later
-   ones.
+   lexically depend on group_tyclds, or on earlier TyClGroups, but
+   not on later ones.
 
-See Note [Dependency analysis of type, class, and instance decls]
-in GHC.Rename.Module for more info.
+See Note [Dependency analysis of type and class decls] in GHC.Rename.Module
+for more info.
 -}
 
 -- | Type or Class Group
@@ -780,7 +780,7 @@ familyInfoTyConFlavour
   -> TyConFlavour tc
 familyInfoTyConFlavour mb_parent_tycon info =
   case info of
-    DataFamily         -> OpenFamilyFlavour IAmData mb_parent_tycon
+    DataFamily         -> OpenFamilyFlavour (IAmData DataType) mb_parent_tycon
     OpenTypeFamily     -> OpenFamilyFlavour IAmType mb_parent_tycon
     ClosedTypeFamily _ -> assert (isNothing mb_parent_tycon)
                           -- See Note [Closed type family mb_parent_tycon]
@@ -915,12 +915,6 @@ terms. However, partial standalone kind signatures are not a proper replacement
 for CUSKs, so this would be a separate feature.
 -}
 
--- | When we only care whether a data-type declaration is `data` or `newtype`, but not what constructors it has
-data NewOrData
-  = NewType                     -- ^ @newtype Blah ...@
-  | DataType                    -- ^ @data Blah ...@
-  deriving ( Eq, Data )                -- Needed because Demand derives Eq
-
 -- | Whether a data-type declaration is @data@ or @newtype@, and its constructors.
 data DataDefnCons a
   = NewTypeCon          -- @newtype N x = MkN blah@
@@ -935,8 +929,8 @@ data DataDefnCons a
 
 dataDefnConsNewOrData :: DataDefnCons a -> NewOrData
 dataDefnConsNewOrData = \ case
-    NewTypeCon _ -> NewType
-    DataTypeCons _ _ -> DataType
+    NewTypeCon   {} -> NewType
+    DataTypeCons {} -> DataType
 
 -- | Are the constructors within a @type data@ declaration?
 -- See Note [Type data declarations] in GHC.Rename.Module.
@@ -975,10 +969,13 @@ data ConDecl pass
       , con_names   :: NonEmpty (LIdP pass)
       -- The following fields describe the type after the '::'
       -- See Note [GADT abstract syntax]
-      , con_bndrs   :: XRec pass (HsOuterSigTyVarBndrs pass)
-        -- ^ The outermost type variable binders, be they explicit or
-        --   implicit.  The 'XRec' is used to anchor exact print
-        --   annotations, AnnForall and AnnDot.
+      , con_outer_bndrs :: XRec pass (HsOuterSigTyVarBndrs pass)
+        -- ^ The outermost type variable binders, be they explicit or implicit;
+        --   cf. HsSigType that also stores the outermost sig_bndrs separately
+        --   from the forall telescopes in sig_body.
+        --   See Note [Representing type signatures] in Language.Haskell.Syntax.Type
+      , con_inner_bndrs :: [HsForAllTelescope pass]
+        -- ^ The forall telescopes other than the outermost invisible forall.
       , con_mb_cxt  :: Maybe (LHsContext pass)   -- ^ User-written context (if any)
       , con_g_args  :: HsConDeclGADTDetails pass -- ^ Arguments; never infix
       , con_res_ty  :: LHsType pass              -- ^ Result type
@@ -1122,7 +1119,7 @@ or contexts in two parts:
 
 -- | The arguments in a Haskell98-style data constructor.
 type HsConDeclH98Details pass
-   = HsConDetails Void (HsScaled pass (LBangType pass)) (XRec pass [LConDeclField pass])
+   = HsConDetails (HsConDeclField pass) (XRec pass [LHsConDeclRecField pass])
 -- The Void argument to HsConDetails here is a reflection of the fact that
 -- type applications are not allowed in data constructor declarations.
 
@@ -1133,8 +1130,8 @@ type HsConDeclH98Details pass
 -- derived Show instances—see Note [Infix GADT constructors] in
 -- GHC.Tc.TyCl—but that is an orthogonal concern.)
 data HsConDeclGADTDetails pass
-   = PrefixConGADT !(XPrefixConGADT pass) [HsScaled pass (LBangType pass)]
-   | RecConGADT !(XRecConGADT pass) (XRec pass [LConDeclField pass])
+   = PrefixConGADT !(XPrefixConGADT pass) [HsConDeclField pass]
+   | RecConGADT !(XRecConGADT pass) (XRec pass [LHsConDeclRecField pass])
    | XConDeclGADTDetails !(XXConDeclGADTDetails pass)
 
 type family XPrefixConGADT       p
@@ -1484,28 +1481,12 @@ data RuleDecl pass
            -- ^ After renamer, free-vars from the LHS and RHS
        , rd_name :: XRec pass RuleName
            -- ^ Note [Pragma source text] in "GHC.Types.SourceText"
-       , rd_act  :: Activation
-       , rd_tyvs :: Maybe [LHsTyVarBndr () (NoGhcTc pass)]
-           -- ^ Forall'd type vars
-       , rd_tmvs :: [LRuleBndr pass]
-           -- ^ Forall'd term vars, before typechecking; after typechecking
-           --    this includes all forall'd vars
-       , rd_lhs  :: XRec pass (HsExpr pass)
-       , rd_rhs  :: XRec pass (HsExpr pass)
+       , rd_act   :: Activation
+       , rd_bndrs :: RuleBndrs pass
+       , rd_lhs   :: XRec pass (HsExpr pass)
+       , rd_rhs   :: XRec pass (HsExpr pass)
        }
   | XRuleDecl !(XXRuleDecl pass)
-
--- | Located Rule Binder
-type LRuleBndr pass = XRec pass (RuleBndr pass)
-
--- | Rule Binder
-data RuleBndr pass
-  = RuleBndr (XCRuleBndr pass)  (LIdP pass)
-  | RuleBndrSig (XRuleBndrSig pass) (LIdP pass) (HsPatSigType pass)
-  | XRuleBndr !(XXRuleBndr pass)
-
-collectRuleBndrSigTys :: [RuleBndr pass] -> [HsPatSigType pass]
-collectRuleBndrSigTys bndrs = [ty | RuleBndrSig _ _ ty <- bndrs]
 
 {-
 ************************************************************************

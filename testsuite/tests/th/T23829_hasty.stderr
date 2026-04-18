@@ -1,6 +1,4 @@
-
-T23829_hasty.hs:8:26: error: [GHC-18157]
-    • GHC stage restriction:
-        ‘ty’ is used in a top-level splice, quasi-quote, or annotation,
-        and must be imported, not defined locally
+T23829_hasty.hs:8:26: error: [GHC-28914]
+    • Level error: ‘ty’ is bound at level 0 but used at level -1
     • In the untyped splice: $ty
+

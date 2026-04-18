@@ -1,4 +1,6 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE RecordWildCards #-}
 
 -- | Types used by the runtime interpreter
 module GHC.Runtime.Interpreter.Types
@@ -10,6 +12,21 @@ module GHC.Runtime.Interpreter.Types
    , ExtInterpInstance (..)
    , ExtInterpState (..)
    , InterpStatus(..)
+   -- * InterpSymbolCache
+   , InterpSymbolCache(..)
+   , mkInterpSymbolCache
+   , lookupInterpSymbolCache
+   , updateInterpSymbolCache
+   , purgeInterpSymbolCache
+   , InterpSymbol(..)
+   , SuffixOrInterpreted(..)
+   , interpSymbolName
+   , interpSymbolSuffix
+   , eliminateInterpSymbol
+   , interpretedInterpSymbol
+   , interpreterProfiled
+   , interpreterDynamic
+
    -- * IServ
    , IServ
    , IServConfig(..)
@@ -30,11 +47,11 @@ import GHC.Linker.Types
 
 import GHCi.RemoteTypes
 import GHCi.Message         ( Pipe )
-import GHC.Types.Unique.FM
-import GHC.Data.FastString ( FastString )
-import Foreign
 
 import GHC.Platform
+#if defined(HAVE_INTERNAL_INTERPRETER)
+import GHC.Platform.Ways
+#endif
 import GHC.Utils.TmpFs
 import GHC.Utils.Logger
 import GHC.Unit.Env
@@ -42,6 +59,7 @@ import GHC.Unit.State
 import GHC.Unit.Types
 import GHC.StgToJS.Types
 import GHC.StgToJS.Linker.Types
+import GHC.Runtime.Interpreter.Types.SymbolCache
 
 import Control.Concurrent
 import System.Process   ( ProcessHandle, CreateProcess )
@@ -56,7 +74,7 @@ data Interp = Interp
   , interpLoader   :: !Loader
       -- ^ Interpreter loader
 
-  , interpLookupSymbolCache :: !(MVar (UniqFM FastString (Ptr ())))
+  , interpSymbolCache :: !InterpSymbolCache
       -- ^ LookupSymbol cache
   }
 
@@ -122,6 +140,28 @@ data ExtInterpInstance c = ExtInterpInstance
       -- ^ Instance specific extra fields
   }
 
+-- | Interpreter uses Profiling way
+interpreterProfiled :: Interp -> Bool
+interpreterProfiled interp = case interpInstance interp of
+#if defined(HAVE_INTERNAL_INTERPRETER)
+  InternalInterp     -> hostIsProfiled
+#endif
+  ExternalInterp ext -> case ext of
+    ExtIServ i -> iservConfProfiled (interpConfig i)
+    ExtJS {}   -> False -- we don't support profiling yet in the JS backend
+    ExtWasm i -> wasmInterpProfiled $ interpConfig i
+
+-- | Interpreter uses Dynamic way
+interpreterDynamic :: Interp -> Bool
+interpreterDynamic interp = case interpInstance interp of
+#if defined(HAVE_INTERNAL_INTERPRETER)
+  InternalInterp     -> hostIsDynamic
+#endif
+  ExternalInterp ext -> case ext of
+    ExtIServ i -> iservConfDynamic (interpConfig i)
+    ExtJS {}   -> False -- dynamic doesn't make sense for JS
+    ExtWasm {} -> True  -- wasm dyld can only load dynamic code
+
 ------------------------
 -- JS Stuff
 ------------------------
@@ -176,6 +216,16 @@ data WasmInterpConfig = WasmInterpConfig
   { wasmInterpDyLD           :: !FilePath  -- ^ Location of dyld.mjs script
   , wasmInterpLibDir         ::  FilePath  -- ^ wasi-sdk sysroot libdir containing libc.so, etc
   , wasmInterpOpts           :: ![String]  -- ^ Additional command line arguments for iserv
+
+  -- wasm ghci browser mode
+  , wasmInterpBrowser                      :: !Bool
+  , wasmInterpBrowserHost                  :: !String
+  , wasmInterpBrowserPort                  :: !Int
+  , wasmInterpBrowserRedirectWasiConsole   :: !Bool
+  , wasmInterpBrowserPuppeteerLaunchOpts   :: !(Maybe String)
+  , wasmInterpBrowserPlaywrightBrowserType :: !(Maybe String)
+  , wasmInterpBrowserPlaywrightLaunchOpts  :: !(Maybe String)
+
   , wasmInterpTargetPlatform :: !Platform
   , wasmInterpProfiled       :: !Bool      -- ^ Are we profiling yet?
   , wasmInterpHsSoSuffix     :: !String    -- ^ Shared lib filename common suffix sans .so, e.g. p-ghc9.13.20241001

@@ -20,6 +20,13 @@
 -- @since 4.9.0.0
 ----------------------------------------------------------------------------
 
+-- Function implementations in this module adhere to the following principle:
+--
+-- For every NonEmpty function that is different from a corresponding
+-- List function only in the presence of NonEmpty in its type, both
+-- the List and NonEmpty functions should have the same strictness
+-- properties. Same applies to the class instances.
+
 module Data.List.NonEmpty (
    -- * The type of non-empty streams
      NonEmpty(..)
@@ -116,7 +123,7 @@ import qualified GHC.Internal.Data.Foldable       as Foldable
 import           GHC.Internal.Data.Function       (on)
 import           GHC.Internal.Data.Ord            (comparing)
 import           GHC.Internal.Stack.Types     (HasCallStack)
-import           GHC.Internal.Data.List.NonEmpty
+import           GHC.Internal.Data.List.NonEmpty (NonEmpty (..), map, zip, zipWith)
 
 infixr 5 <|
 
@@ -185,7 +192,7 @@ nonEmpty (a:as) = Just (a :| as)
 -- | 'uncons' produces the first element of the stream, and a stream of the
 -- remaining elements, if any.
 uncons :: NonEmpty a -> (a, Maybe (NonEmpty a))
-uncons ~(a :| as) = (a, nonEmpty as)
+uncons (a :| as) = (a, nonEmpty as)
 
 -- | The 'unfoldr' function is analogous to "Data.List"'s
 -- 'GHC.Internal.Data.List.unfoldr' operation.
@@ -222,7 +229,7 @@ singleton a = a :| []
 
 -- | Prepend an element to the stream.
 (<|) :: a -> NonEmpty a -> NonEmpty a
-a <| ~(b :| bs) = a :| b : bs
+a <| bs = a :| toList bs
 
 -- | Synonym for '<|'.
 cons :: a -> NonEmpty a -> NonEmpty a
@@ -274,7 +281,7 @@ fromList [] = error "NonEmpty.fromList: empty list"
 
 -- | Convert a stream to a normal list efficiently.
 toList :: NonEmpty a -> [a]
-toList ~(a :| as) = a : as
+toList (a :| as) = a : as
 
 -- | Lift list operations to work on a 'NonEmpty' stream.
 --
@@ -282,10 +289,6 @@ toList ~(a :| as) = a : as
 -- this will raise an error.
 lift :: Foldable f => ([a] -> [b]) -> f a -> NonEmpty b
 lift f = fromList . f . Foldable.toList
-
--- | Map a function over a 'NonEmpty' stream.
-map :: (a -> b) -> NonEmpty a -> NonEmpty b
-map f ~(a :| as) = f a :| fmap f as
 
 -- | The 'inits' function takes a stream @xs@ and returns all the
 -- finite prefixes of @xs@, starting with the shortest. The result is
@@ -360,17 +363,17 @@ scanr f z = fromList . List.scanr f z . Foldable.toList
 --
 -- > scanl1 f [x1, x2, ...] == x1 :| [x1 `f` x2, x1 `f` (x2 `f` x3), ...]
 scanl1 :: (a -> a -> a) -> NonEmpty a -> NonEmpty a
-scanl1 f ~(a :| as) = fromList (List.scanl f a as)
+scanl1 f (a :| as) = fromList (List.scanl f a as)
 
 -- | 'scanr1' is a variant of 'scanr' that has no starting value argument.
 scanr1 :: (a -> a -> a) -> NonEmpty a -> NonEmpty a
-scanr1 f ~(a :| as) = fromList (List.scanr1 f (a:as))
+scanr1 f (a :| as) = fromList (List.scanr1 f (a:as))
 
 -- | 'intersperse x xs' alternates elements of the list with copies of @x@.
 --
 -- > intersperse 0 (1 :| [2,3]) == 1 :| [0,2,0,3]
 intersperse :: a -> NonEmpty a -> NonEmpty a
-intersperse a ~(b :| bs) = b :| case bs of
+intersperse a (b :| bs) = b :| case bs of
     [] -> []
     _ -> a : List.intersperse a bs
 
@@ -533,7 +536,7 @@ isPrefixOf (y:ys) (x :| xs) = (y == x) && List.isPrefixOf ys xs
 --
 -- /Beware/: a negative or out-of-bounds index will cause an error.
 (!!) :: HasCallStack => NonEmpty a -> Int -> a
-(!!) ~(x :| xs) n
+(!!) (x :| xs) n
   | n == 0 = x
   | n > 0  = xs List.!! (n - 1)
   | otherwise = error "NonEmpty.!! negative index"
@@ -541,7 +544,9 @@ infixl 9 !!
 
 -- | The 'unzip' function is the inverse of the 'zip' function.
 unzip :: NonEmpty (a, b) -> (NonEmpty a, NonEmpty b)
-unzip xs = (fst <$> xs, snd <$> xs)
+unzip ((a, b) :| asbs) = (a :| as, b :| bs)
+  where
+    (as, bs) = List.unzip asbs
 
 -- | The 'nub' function removes duplicate elements from a list. In
 -- particular, it keeps only the first occurrence of each element.

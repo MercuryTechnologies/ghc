@@ -17,7 +17,6 @@ module GHC.Linker.Loader
    , showLoaderState
    , getLoaderState
    -- * Load & Unload
-   , loadExpr
    , loadDecls
    , loadPackages
    , loadModule
@@ -29,6 +28,7 @@ module GHC.Linker.Loader
    , extendLoadedEnv
    , deleteFromLoadedEnv
    -- * Internals
+   , allocateBreakArrays
    , rmDupLinkables
    , modifyLoaderState
    , initLinkDepsOpts
@@ -53,14 +53,17 @@ import GHC.Driver.Config.Finder
 import GHC.Tc.Utils.Monad
 
 import GHC.Runtime.Interpreter
+import GHCi.BreakArray
 import GHCi.RemoteTypes
 import GHC.Iface.Load
-import GHCi.Message (LoadedDLL)
+import GHCi.Message (ConInfoTable(..), LoadedDLL)
 
+import GHC.ByteCode.Breakpoints
 import GHC.ByteCode.Linker
 import GHC.ByteCode.Asm
 import GHC.ByteCode.Types
 
+import GHC.Stack.CCS
 import GHC.SysTools
 
 import GHC.Types.Basic
@@ -77,8 +80,12 @@ import GHC.Utils.Logger
 import GHC.Utils.TmpFs
 
 import GHC.Unit.Env
-import GHC.Unit.External (ExternalPackageState (EPS, eps_iface_bytecode))
+import GHC.Unit.Home.ModInfo
+import GHC.Unit.External (ExternalPackageState (..))
 import GHC.Unit.Module
+import GHC.Unit.Module.ModNodeKey
+import GHC.Unit.Module.Graph
+import GHC.Unit.Module.ModIface
 import GHC.Unit.State as Packages
 
 import qualified GHC.Data.ShortText as ST
@@ -92,12 +99,15 @@ import GHC.Linker.Types
 -- Standard libraries
 import Control.Monad
 
+import Data.Array
+import Data.ByteString (ByteString)
 import qualified Data.Set as Set
 import Data.Char (isSpace)
 import qualified Data.Foldable as Foldable
 import Data.IORef
 import Data.List (intercalate, isPrefixOf, nub, partition)
 import Data.Maybe
+import Data.Either
 import Control.Concurrent.MVar
 import qualified Control.Monad.Catch as MC
 import qualified Data.List.NonEmpty as NE
@@ -112,6 +122,12 @@ import System.Win32.Info (getSystemDirectory)
 #endif
 
 import GHC.Utils.Exception
+import GHC.Unit.Home.Graph (lookupHug, unitEnv_foldWithKey)
+import GHC.Driver.Downsweep
+import qualified GHC.Runtime.Interpreter as GHCi
+import qualified Data.IntMap.Strict as IM
+import qualified Data.Map.Strict as M
+import Foreign.Ptr (nullPtr)
 
 -- Note [Linkers and loaders]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -170,6 +186,10 @@ emptyLoaderState = LoaderState
    , bcos_loaded = emptyModuleEnv
    , objs_loaded = emptyModuleEnv
    , temp_sos = []
+   , linked_breaks = LinkedBreaks
+     { breakarray_env = emptyModuleEnv
+     , ccs_env        = emptyModuleEnv
+     }
    }
   -- Packages that don't need loading, because the compiler
   -- shares them with the interpreted program.
@@ -210,12 +230,12 @@ loadName interp hsc_env name = do
     case lookupNameEnv (closure_env (linker_env pls)) name of
       Just (_,aa) -> return (pls,(aa, links, pkgs))
       Nothing     -> assertPpr (isExternalName name) (ppr name) $
-                     do let sym_to_find = nameToCLabel name "closure"
-                        m <- lookupClosure interp (unpackFS sym_to_find)
+                     do let sym_to_find = IClosureSymbol name
+                        m <- lookupClosure interp sym_to_find
                         r <- case m of
                           Just hvref -> mkFinalizedHValue interp hvref
                           Nothing -> linkFail "GHC.Linker.Loader.loadName"
-                                       (unpackFS sym_to_find)
+                                       (ppr sym_to_find)
                         return (pls,(r, links, pkgs))
 
 loadDependencies
@@ -589,60 +609,12 @@ preloadLib interp hsc_env lib_paths framework_paths pls lib_spec = do
           , "Try using a dynamic library instead."
           ]
 
-
-{- **********************************************************************
-
-                        Link a byte-code expression
-
-  ********************************************************************* -}
-
--- | Load a single expression, /including/ first loading packages and
--- modules that this expression depends on.
---
--- Raises an IO exception ('ProgramError') if it can't find a compiled
--- version of the dependents to load.
---
-loadExpr :: Interp -> HscEnv -> SrcSpan -> UnlinkedBCO -> IO ForeignHValue
-loadExpr interp hsc_env span root_ul_bco = do
-  -- Initialise the linker (if it's not been done already)
-  initLoaderState interp hsc_env
-
-  -- Take lock for the actual work.
-  modifyLoaderState interp $ \pls0 -> do
-    -- Load the packages and modules required
-    (pls, ok, _, _) <- loadDependencies interp hsc_env pls0 span needed_mods
-    if failed ok
-      then throwGhcExceptionIO (ProgramError "")
-      else do
-        -- Load the expression itself
-        -- Load the necessary packages and linkables
-        let le = linker_env pls
-            bco_ix = mkNameEnv [(unlinkedBCOName root_ul_bco, 0)]
-        resolved <- linkBCO interp (pkgs_loaded pls) le bco_ix root_ul_bco
-        [root_hvref] <- createBCOs interp [resolved]
-        fhv <- mkFinalizedHValue interp root_hvref
-        return (pls, fhv)
-  where
-     free_names = uniqDSetToList (bcoFreeNames root_ul_bco)
-
-     needed_mods :: [Module]
-     needed_mods = [ nameModule n | n <- free_names,
-                     isExternalName n,      -- Names from other modules
-                     not (isWiredInName n)  -- Exclude wired-in names
-                   ]                        -- (see note below)
-        -- Exclude wired-in names because we may not have read
-        -- their interface files, so getLinkDeps will fail
-        -- All wired-in names are in the base package, which we link
-        -- by default, so we can safely ignore them here.
-
 initLinkDepsOpts :: HscEnv -> LinkDepsOpts
 initLinkDepsOpts hsc_env = opts
   where
     opts = LinkDepsOpts
             { ldObjSuffix   = objectSuf dflags
             , ldForceDyn    = sTargetRTSLinkerOnlySupportsSharedLibs $ settings dflags
-            , ldOneShotMode = isOneShot (ghcMode dflags)
-            , ldModuleGraph = hsc_mod_graph hsc_env
             , ldUnitEnv     = hsc_unit_env hsc_env
             , ldPprOpts     = initSDocContext dflags defaultUserStyle
             , ldFinderCache = hsc_FC hsc_env
@@ -650,17 +622,58 @@ initLinkDepsOpts hsc_env = opts
             , ldUseByteCode = gopt Opt_UseBytecodeRatherThanObjects dflags
             , ldMsgOpts     = initIfaceMessageOpts dflags
             , ldWays        = ways dflags
-            , ldLoadIface
+            , ldGetDependencies = get_reachable_nodes hsc_env
             , ldLoadByteCode
             }
     dflags = hsc_dflags hsc_env
-    ldLoadIface msg mod = initIfaceCheck (text "loader") hsc_env
-                          $ loadInterface msg mod (ImportByUser NotBoot)
 
     ldLoadByteCode mod = do
+      _ <- initIfaceLoad hsc_env $
+             loadInterface (text "get_reachable_nodes" <+> parens (ppr mod))
+                 mod ImportBySystem
       EPS {eps_iface_bytecode} <- hscEPS hsc_env
       sequence (lookupModuleEnv eps_iface_bytecode mod)
 
+
+get_reachable_nodes :: HscEnv -> [Module] -> IO ([Module], UniqDSet UnitId)
+get_reachable_nodes hsc_env mods
+
+  -- Fallback case if the ModuleGraph has not been initialised by the user.
+  -- This can happen if is the user is loading plugins or doing something else very
+  -- early in the compiler pipeline.
+  | isEmptyMG (hsc_mod_graph hsc_env)
+  = do
+      mg <- downsweepInstalledModules hsc_env mods
+      go mg
+
+  | otherwise
+  = go (hsc_mod_graph hsc_env)
+
+  where
+    unit_env = hsc_unit_env hsc_env
+    mkModuleNk m = ModNodeKeyWithUid (GWIB (moduleName m) NotBoot) (moduleUnitId m)
+
+    hmgModKey mg m
+      | let k = NodeKey_Module (mkModuleNk m)
+      , mgMember mg k = k
+      | otherwise = NodeKey_ExternalUnit (moduleUnitId m)
+
+    -- The main driver for getting dependencies, which calls the given
+    -- functions to compute the reachable nodes.
+    go :: ModuleGraph -> IO ([Module], UniqDSet UnitId)
+    go mg = do
+        let mod_keys = map (hmgModKey mg) mods
+            all_reachable = mod_keys ++ map mkNodeKey (mgReachableLoop mg mod_keys)
+        (mods_s, pkgs_s) <- partitionEithers <$> mapMaybeM get_mod_info all_reachable
+        return (mods_s, mkUniqDSet pkgs_s)
+
+    get_mod_info :: NodeKey -> IO (Maybe (Either Module UnitId))
+    get_mod_info (NodeKey_Module m@(ModNodeKeyWithUid gwib uid)) =
+      lookupHug (ue_home_unit_graph unit_env) uid (gwib_mod gwib) >>= \case
+        Just hmi -> return $ Just (Left  (mi_module (hm_iface hmi)))
+        Nothing -> return (Just (Left (mnkToModule m)))
+    get_mod_info (NodeKey_ExternalUnit uid) = return (Just (Right uid))
+    get_mod_info _ = return Nothing
 
 
 {- **********************************************************************
@@ -687,14 +700,22 @@ loadDecls interp hsc_env span linkable = do
         else do
           -- Link the expression itself
           let le  = linker_env pls
-              le2 = le { itbl_env = foldl' (\acc cbc -> plusNameEnv acc (bc_itbls cbc)) (itbl_env le) cbcs
-                       , addr_env = foldl' (\acc cbc -> plusNameEnv acc (bc_strs cbc)) (addr_env le) cbcs }
+          let lb  = linked_breaks pls
+          le2_itbl_env <- linkITbls interp (itbl_env le) (concat $ map bc_itbls cbcs)
+          le2_addr_env <- foldlM (\env cbc -> allocateTopStrings interp (bc_strs cbc) env) (addr_env le) cbcs
+          le2_breakarray_env <- allocateBreakArrays interp (breakarray_env lb) (catMaybes $ map bc_breaks cbcs)
+          le2_ccs_env        <- allocateCCS         interp (ccs_env lb)        (catMaybes $ map bc_breaks cbcs)
+          let le2 = le { itbl_env = le2_itbl_env
+                       , addr_env = le2_addr_env }
+          let lb2 = lb { breakarray_env = le2_breakarray_env
+                       , ccs_env = le2_ccs_env }
 
           -- Link the necessary packages and linkables
-          new_bindings <- linkSomeBCOs interp (pkgs_loaded pls) le2 cbcs
+          new_bindings <- linkSomeBCOs interp (pkgs_loaded pls) le2 lb2 cbcs
           nms_fhvs <- makeForeignNamedHValueRefs interp new_bindings
           let ce2  = extendClosureEnv (closure_env le2) nms_fhvs
-              !pls2 = pls { linker_env = le2 { closure_env = ce2 } }
+              !pls2 = pls { linker_env = le2 { closure_env = ce2 }
+                          , linked_breaks = lb2 }
           return (pls2, (nms_fhvs, links_needed, units_needed))
   where
     cbcs = linkableBCOs linkable
@@ -873,7 +894,7 @@ dynLoadObjs interp hsc_env pls@LoaderState{..} objs = do
     m <- loadDLL interp soFile
     case m of
       Right _ -> return $! pls { temp_sos = (libPath, libName) : temp_sos }
-      Left err -> linkFail msg err
+      Left err -> linkFail msg (text err)
   where
     msg = "GHC.Linker.Loader.dynLoadObjs: Loading temp shared object failed"
 
@@ -910,11 +931,15 @@ dynLinkBCOs interp pls bcos = do
 
 
             le1 = linker_env pls
-            ie2 = foldr plusNameEnv (itbl_env le1) (map bc_itbls cbcs)
-            ae2 = foldr plusNameEnv (addr_env le1) (map bc_strs cbcs)
-            le2 = le1 { itbl_env = ie2, addr_env = ae2 }
+            lb1 = linked_breaks pls
+        ie2 <- linkITbls interp (itbl_env le1) (concatMap bc_itbls cbcs)
+        ae2 <- foldlM (\env cbc -> allocateTopStrings interp (bc_strs cbc) env) (addr_env le1) cbcs
+        be2 <- allocateBreakArrays interp (breakarray_env lb1) (catMaybes $ map bc_breaks cbcs)
+        ce2 <- allocateCCS         interp (ccs_env lb1)        (catMaybes $ map bc_breaks cbcs)
+        let le2 = le1 { itbl_env = ie2, addr_env = ae2 }
+        let lb2 = lb1 { breakarray_env = be2, ccs_env = ce2 }
 
-        names_and_refs <- linkSomeBCOs interp (pkgs_loaded pls) le2 cbcs
+        names_and_refs <- linkSomeBCOs interp (pkgs_loaded pls) le2 lb2 cbcs
 
         -- We only want to add the external ones to the ClosureEnv
         let (to_add, to_drop) = partition (isExternalName.fst) names_and_refs
@@ -925,19 +950,21 @@ dynLinkBCOs interp pls bcos = do
         new_binds <- makeForeignNamedHValueRefs interp to_add
 
         let ce2 = extendClosureEnv (closure_env le2) new_binds
-        return $! pls1 { linker_env = le2 { closure_env = ce2 } }
+        return $! pls1 { linker_env = le2 { closure_env = ce2 }
+                       , linked_breaks = lb2 }
 
 -- Link a bunch of BCOs and return references to their values
 linkSomeBCOs :: Interp
              -> PkgsLoaded
              -> LinkerEnv
+             -> LinkedBreaks
              -> [CompiledByteCode]
              -> IO [(Name,HValueRef)]
                         -- The returned HValueRefs are associated 1-1 with
                         -- the incoming unlinked BCOs.  Each gives the
                         -- value of the corresponding unlinked BCO
 
-linkSomeBCOs interp pkgs_loaded le mods = foldr fun do_link mods []
+linkSomeBCOs interp pkgs_loaded le lb mods = foldr fun do_link mods []
  where
   fun CompiledByteCode{..} inner accum =
     inner (Foldable.toList bc_bcos : accum)
@@ -947,7 +974,7 @@ linkSomeBCOs interp pkgs_loaded le mods = foldr fun do_link mods []
     let flat = [ bco | bcos <- mods, bco <- bcos ]
         names = map unlinkedBCOName flat
         bco_ix = mkNameEnv (zip names [0..])
-    resolved <- sequence [ linkBCO interp pkgs_loaded le bco_ix bco | bco <- flat ]
+    resolved <- sequence [ linkBCO interp pkgs_loaded le lb bco_ix bco | bco <- flat ]
     hvrefs <- createBCOs interp resolved
     return (zip names hvrefs)
 
@@ -956,6 +983,11 @@ makeForeignNamedHValueRefs
   :: Interp -> [(Name,HValueRef)] -> IO [(Name,ForeignHValue)]
 makeForeignNamedHValueRefs interp bindings =
   mapM (\(n, hvref) -> (n,) <$> mkFinalizedHValue interp hvref) bindings
+
+linkITbls :: Interp -> ItblEnv -> [(Name, ConInfoTable)] -> IO ItblEnv
+linkITbls interp = foldlM $ \env (nm, itbl) -> do
+  r <- interpCmd interp $ MkConInfoTable itbl
+  evaluate $ extendNameEnv env nm (nm, ItblPtr r)
 
 {- **********************************************************************
 
@@ -1040,9 +1072,13 @@ unload_wkr interp keep_linkables pls@LoaderState{..}  = do
       keep_name n = isExternalName n &&
                     nameModule n `elemModuleEnv` remaining_bcos_loaded
 
-      !new_pls = pls { linker_env = filterLinkerEnv keep_name linker_env,
-                       bcos_loaded = remaining_bcos_loaded,
-                       objs_loaded = remaining_objs_loaded }
+      keep_mod :: Module -> Bool
+      keep_mod m = m `elemModuleEnv` remaining_bcos_loaded
+
+      !new_pls = pls { linker_env    = filterLinkerEnv keep_name linker_env,
+                       linked_breaks = filterLinkedBreaks keep_mod linked_breaks,
+                       bcos_loaded   = remaining_bcos_loaded,
+                       objs_loaded   = remaining_objs_loaded }
 
   return new_pls
   where
@@ -1613,3 +1649,84 @@ maybePutStr logger s = maybePutSDoc logger (text s)
 
 maybePutStrLn :: Logger -> String -> IO ()
 maybePutStrLn logger s = maybePutSDoc logger (text s <> text "\n")
+
+-- | see Note [Generating code for top-level string literal bindings]
+allocateTopStrings ::
+  Interp -> [(Name, ByteString)] -> AddrEnv -> IO AddrEnv
+allocateTopStrings interp topStrings prev_env = do
+  let (bndrs, strings) = unzip topStrings
+  ptrs <- interpCmd interp $ MallocStrings strings
+  evaluate $ extendNameEnvList prev_env (zipWith mk_entry bndrs ptrs)
+  where
+    mk_entry nm ptr = (nm, (nm, AddrPtr ptr))
+
+-- | Given a list of 'InternalModBreaks' collected from a list of
+-- 'CompiledByteCode', allocate the 'BreakArray' used to trigger breakpoints.
+allocateBreakArrays ::
+  Interp ->
+  ModuleEnv (ForeignRef BreakArray) ->
+  [InternalModBreaks] ->
+  IO (ModuleEnv (ForeignRef BreakArray))
+allocateBreakArrays interp =
+  foldlM
+    ( \be0 InternalModBreaks{imodBreaks_breakInfo, imodBreaks_modBreaks=ModBreaks {..}} -> do
+        -- If no BreakArray is assigned to this module yet, create one
+        if not $ elemModuleEnv modBreaks_module be0 then do
+          let count = maybe 0 ((+1) . fst) $ IM.lookupMax imodBreaks_breakInfo
+          breakArray <- GHCi.newBreakArray interp count
+          evaluate $ extendModuleEnv be0 modBreaks_module breakArray
+        else
+          return be0
+    )
+
+-- | Given a list of 'InternalModBreaks' collected from a list
+-- of 'CompiledByteCode', allocate the 'CostCentre' arrays when profiling is
+-- enabled.
+--
+-- Note that the resulting arrays are indexed by 'BreakInfoIndex' (internal
+-- breakpoint index), not by tick index
+allocateCCS ::
+  Interp ->
+  ModuleEnv (Array BreakInfoIndex (RemotePtr CostCentre)) ->
+  [InternalModBreaks] ->
+  IO (ModuleEnv (Array BreakInfoIndex (RemotePtr CostCentre)))
+allocateCCS interp ce mbss
+  | interpreterProfiled interp = do
+      -- 1. Create a mapping from source BreakpointId to CostCentre ptr
+      ccss <- M.unions <$> mapM
+        ( \InternalModBreaks{imodBreaks_modBreaks=ModBreaks{..}} -> do
+            ccs <- {- one ccs ptr per tick index -}
+              mkCostCentres
+                interp
+                (moduleNameString $ moduleName modBreaks_module)
+                (elems modBreaks_ccs)
+            return $ M.fromList $
+              zipWith (\el ix -> (BreakpointId modBreaks_module ix, el)) ccs [0..]
+        )
+        mbss
+      -- 2. Create an array with one element for every InternalBreakpointId,
+      --    where every element has the CCS for the corresponding BreakpointId
+      foldlM
+        (\ce0 InternalModBreaks{imodBreaks_breakInfo, imodBreaks_modBreaks=ModBreaks{..}} -> do
+            if not $ elemModuleEnv modBreaks_module ce then do
+              let count = maybe 0 ((+1) . fst) $ IM.lookupMax imodBreaks_breakInfo
+              let ccs = IM.map
+                    (\info ->
+                        fromMaybe (toRemotePtr nullPtr)
+                          (M.lookup (either internalBreakLoc id (cgb_tick_id info)) ccss)
+                    )
+                    imodBreaks_breakInfo
+              assertPpr (count == length ccs)
+                (text "expected CgBreakInfo map to have one entry per valid ix") $
+                evaluate $
+                  extendModuleEnv ce0 modBreaks_module $
+                    listArray
+                      (0, count)
+                      (IM.elems ccs)
+            else
+              return ce0
+        )
+        ce
+        mbss
+
+  | otherwise = pure ce

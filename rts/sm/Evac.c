@@ -857,9 +857,6 @@ loop:
   //
   case CONSTR_0_1:
   {
-#if defined(COMPILING_WINDOWS_DLL)
-      copy_tag_nolock(p,info,q,sizeofW(StgHeader)+1,gen_no,tag);
-#else
       StgWord w = (StgWord)q->payload[0];
       if (info == Czh_con_info &&
           // unsigned, so always true:  (StgChar)w >= MIN_CHARLIKE &&
@@ -879,7 +876,6 @@ loop:
       else {
           copy_tag_nolock(p,info,q,sizeofW(StgHeader)+1,gen_no,tag);
       }
-#endif
       return;
   }
 
@@ -996,6 +992,7 @@ loop:
   case CATCH_STM_FRAME:
   case CATCH_RETRY_FRAME:
   case ATOMICALLY_FRAME:
+  case ANN_FRAME:
     // shouldn't see these
     barf("evacuate: stack frame at %p\n", q);
 
@@ -1112,6 +1109,8 @@ evacuate_BLACKHOLE(StgClosure **p)
         return;
     }
 
+    // Note [Black holes in large objects]
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // blackholes *can* be in a large object: when raiseAsync() creates an
     // AP_STACK the payload might be large enough to create a large object.
     // See #14497.

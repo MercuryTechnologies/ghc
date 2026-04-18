@@ -32,7 +32,6 @@ import Prelude
 import Data.Data hiding (Fixity(..))
 import Data.IORef
 import System.IO.Unsafe ( unsafePerformIO )
-import GHC.IO.Unsafe    ( unsafeDupableInterleaveIO )
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Fix (MonadFix (..))
 import Control.Exception (BlockedIndefinitelyOnMVar (..), catch, throwIO)
@@ -42,16 +41,18 @@ import System.IO        ( hPutStrLn, stderr )
 import Data.Char        ( isAlpha, isAlphaNum, isUpper )
 import Data.List.NonEmpty ( NonEmpty(..) )
 import Data.Word
-import GHC.Generics     ( Generic )
 import qualified Data.Kind as Kind (Type)
-import GHC.Ptr          ( Ptr, plusPtr )
 import Foreign.ForeignPtr
 import Foreign.C.String
 import Foreign.C.Types
+import GHC.IO.Unsafe    ( unsafeDupableInterleaveIO )
+import GHC.Ptr          ( Ptr, plusPtr )
+import GHC.Generics     ( Generic )
 import GHC.Types        (TYPE, RuntimeRep(..))
 #else
-import GHC.Internal.Base hiding (Type, Module, sequence)
+import GHC.Internal.Base hiding (NonEmpty(..),Type, Module, sequence)
 import GHC.Internal.Data.Data hiding (Fixity(..))
+import GHC.Internal.Data.NonEmpty (NonEmpty(..))
 import GHC.Internal.Data.Traversable
 import GHC.Internal.Word
 import GHC.Internal.Generics (Generic)
@@ -76,7 +77,7 @@ import GHC.Internal.List (dropWhile, break, replicate, reverse, last)
 import GHC.Internal.MVar
 import GHC.Internal.IO.Exception
 import GHC.Internal.Unicode
-import qualified GHC.Types as Kind (Type)
+import qualified GHC.Internal.Types as Kind (Type)
 #endif
 import GHC.Internal.ForeignSrcLang
 import GHC.Internal.LanguageExtensions
@@ -429,8 +430,8 @@ newtype Code m a = Code
 -- expressions:
 --
 -- >>> fmap ppr $ runQ (unTypeCode [| True == $( [| "foo" |] ) |])
--- GHC.Types.True GHC.Classes.== "foo"
--- >>> GHC.Types.True GHC.Classes.== "foo"
+-- GHC.Internal.Types.True GHC.Internal.Classes.== "foo"
+-- >>> GHC.Internal.Types.True GHC.Internal.Classes.== "foo"
 -- <interactive> error:
 --     • Couldn't match expected type ‘Bool’ with actual type ‘[Char]’
 --     • In the second argument of ‘(==)’, namely ‘"foo"’
@@ -846,12 +847,6 @@ addTempFile suffix = Q (qAddTempFile suffix)
 addTopDecls :: [Dec] -> Q ()
 addTopDecls ds = Q (qAddTopDecls ds)
 
--- |
-addForeignFile :: ForeignSrcLang -> String -> Q ()
-addForeignFile = addForeignSource
-{-# DEPRECATED addForeignFile
-               "Use 'Language.Haskell.TH.Syntax.addForeignSource' instead"
-  #-} -- deprecated in 8.6
 
 -- | Emit a foreign file which will be compiled and linked to the object for
 -- the current module. Currently only languages that can be compiled with
@@ -1000,10 +995,10 @@ sequenceQ :: forall m . Monad m => forall a . [m a] -> m [a]
 sequenceQ = sequence
 
 oneName, manyName :: Name
--- | Synonym for @''GHC.Types.One'@, from @ghc-prim@.
-oneName  = mkNameG DataName "ghc-prim" "GHC.Types" "One"
--- | Synonym for @''GHC.Types.Many'@, from @ghc-prim@.
-manyName = mkNameG DataName "ghc-prim" "GHC.Types" "Many"
+-- | Synonym for @''GHC.Internal.Types.One'@, from @ghc-internal@.
+oneName  = mkNameG DataName "ghc-internal" "GHC.Internal.Types" "One"
+-- | Synonym for @''GHC.Internal.Types.Many'@, from @ghc-internal@.
+manyName = mkNameG DataName "ghc-internal" "GHC.Internal.Types" "Many"
 
 
 -----------------------------------------------------
@@ -1401,7 +1396,7 @@ unboxedTupleTypeName n = mk_tup_name n TcClsName False
 
 mk_tup_name :: Int -> NameSpace -> Bool -> Name
 mk_tup_name n space boxed
-  = Name (mkOccName tup_occ) (NameG space (mkPkgName "ghc-prim") tup_mod)
+  = Name (mkOccName tup_occ) (NameG space (mkPkgName "ghc-internal") tup_mod)
   where
     withParens thing
       | boxed     = "("  ++ thing ++ ")"
@@ -1411,7 +1406,7 @@ mk_tup_name n space boxed
             | space == TcClsName = "Tuple" ++ show n ++ if boxed then "" else "#"
             | otherwise = withParens (replicate n_commas ',')
     n_commas = n - 1
-    tup_mod  = mkModName (if boxed then "GHC.Tuple" else "GHC.Types")
+    tup_mod  = mkModName (if boxed then "GHC.Internal.Tuple" else "GHC.Internal.Types")
     solo
       | space == DataName = "MkSolo"
       | otherwise = "Solo"
@@ -1436,7 +1431,7 @@ unboxedSumDataName alt arity
 
   | otherwise
   = Name (mkOccName sum_occ)
-         (NameG DataName (mkPkgName "ghc-prim") (mkModName "GHC.Types"))
+         (NameG DataName (mkPkgName "ghc-internal") (mkModName "GHC.Internal.Types"))
 
   where
     prefix     = "unboxedSumDataName: "
@@ -1455,7 +1450,7 @@ unboxedSumTypeName arity
 
   | otherwise
   = Name (mkOccName sum_occ)
-         (NameG TcClsName (mkPkgName "ghc-prim") (mkModName "GHC.Types"))
+         (NameG TcClsName (mkPkgName "ghc-internal") (mkModName "GHC.Internal.Types"))
 
   where
     -- Synced with the definition of mkSumTyConOcc in GHC.Builtin.Types
@@ -2163,8 +2158,8 @@ data Pragma = InlineP         Name Inline RuleMatch Phases
             -- 'Inline' and 'RuleMatch'.
             | OpaqueP         Name
             -- ^ @{ {\-\# OPAQUE T #-} }@
-            | SpecialiseP     Name Type (Maybe Inline) Phases
-            -- ^ @{ {\-\# SPECIALISE [INLINE] [phases] T #-} }@
+            | SpecialiseEP    (Maybe [TyVarBndr ()]) [RuleBndr] Exp (Maybe Inline) Phases
+            -- ^ @{ {\-\# SPECIALISE [forall t_1 ... t_i]. [forall b_1 ... b_j] [INLINE] [phases] exp #-} }@
             | SpecialiseInstP Type
             -- ^ @{ {\-\# SPECIALISE instance I #-} }@
             | RuleP           String (Maybe [TyVarBndr ()]) [RuleBndr] Exp Exp Phases

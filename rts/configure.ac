@@ -56,7 +56,7 @@ AC_PROG_CC([cc gcc clang])
 dnl make extensions visible to allow feature-tests to detect them lateron
 AC_USE_SYSTEM_EXTENSIONS
 
-dnl ** Used to determine how to compile ghc-prim's atomics.c, used by
+dnl ** Used to determine how to compile ghc-internal's atomics.c, used by
 dnl    unregisterised, Sparc, and PPC backends. Also determines whether
 dnl    linking to libatomic is required for atomic operations, e.g. on
 dnl    RISCV64 GCC.
@@ -204,8 +204,6 @@ if test "$CABAL_FLAG_leading_underscore" = 1; then
    AC_DEFINE([LEADING_UNDERSCORE], [1], [Define to 1 if C symbols have a leading underscore added by the compiler.])
 fi
 
-FP_VISIBILITY_HIDDEN
-
 FP_MUSTTAIL
 
 dnl ** check for librt
@@ -233,19 +231,6 @@ AC_CHECK_HEADERS([sys/eventfd.h])
 AC_CHECK_FUNCS([eventfd])
 
 AC_CHECK_FUNCS([getpid getuid raise])
-
-dnl ** Check for __thread support in the compiler
-AC_MSG_CHECKING(for __thread support)
-AC_COMPILE_IFELSE(
-  [ AC_LANG_SOURCE([[__thread int tester = 0;]]) ],
-  [
-   AC_MSG_RESULT(yes)
-   AC_DEFINE([CC_SUPPORTS_TLS],[1],[Define to 1 if __thread is supported])
-  ],
-  [
-   AC_MSG_RESULT(no)
-   AC_DEFINE([CC_SUPPORTS_TLS],[0],[Define to 1 if __thread is supported])
-  ])
 
 dnl large address space support (see rts/include/rts/storage/MBlock.h)
 dnl
@@ -478,45 +463,4 @@ cat ghcautoconf.h.autoconf | sed \
    -e '/REMOVE ME/d' \
    >> include/ghcautoconf.h
 echo "#endif /* __GHCAUTOCONF_H__ */" >> include/ghcautoconf.h
-]
-
-dnl ######################################################################
-dnl Generate external symbol flags (-Wl,-u...)
-dnl ######################################################################
-
-dnl See Note [Undefined symbols in the RTS]
-
-[
-symbolExtraDefs=''
-if [ "$CABAL_FLAG_find_ptr" = 1 ]; then
-    symbolExtraDefs+=' -DFIND_PTR'
-fi
-
-cat $srcdir/external-symbols.list.in \
-    | "$CC" $symbolExtraDefs -E -P -traditional -Iinclude - -o - \
-    | sed -e '/^ *$/d' \
-    > external-symbols.list \
-    || exit 1
-
-if [ "$CABAL_FLAG_leading_underscore" = 1 ]; then
-    sedExpr='s/^(.*)$/  "-Wl,-u,_\1"/'
-else
-    sedExpr='s/^(.*)$/  "-Wl,-u,\1"/'
-fi
-sed -E -e "${sedExpr}" external-symbols.list > external-symbols.flags
-unset sedExpr
-rm -f external-symbols.list
-]
-
-dnl ######################################################################
-dnl Generate build-info
-dnl ######################################################################
-
-[
-cat $srcdir/rts.buildinfo.in \
-    | "$CC" -E -P -traditional - -o - \
-    | sed -e '/^ *$/d' \
-    > rts.buildinfo \
-    || exit 1
-rm -f external-symbols.flags
 ]

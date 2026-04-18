@@ -29,6 +29,7 @@ module GHC.Driver.Flags
    , minusWcompatOpts
    , unusedBindsFlags
 
+   , OnOff(..)
    , TurnOnFlag
    , turnOn
    , turnOff
@@ -75,7 +76,18 @@ instance Binary Language where
   get bh = toEnum <$> get bh
 
 instance NFData Language where
-  rnf x = x `seq` ()
+  rnf Haskell98 = ()
+  rnf Haskell2010 = ()
+  rnf GHC2021 = ()
+  rnf GHC2024 = ()
+
+data OnOff a = On a
+             | Off a
+  deriving (Eq, Show)
+
+instance Outputable a => Outputable (OnOff a) where
+  ppr (On x)  = text "On" <+> ppr x
+  ppr (Off x) = text "Off" <+> ppr x
 
 type TurnOnFlag = Bool   -- True  <=> we are turning the flag on
                          -- False <=> we are turning the flag off
@@ -247,6 +259,8 @@ extensionName = \case
   LangExt.ExtendedLiterals -> "ExtendedLiterals"
   LangExt.ListTuplePuns -> "ListTuplePuns"
   LangExt.MultilineStrings -> "MultilineStrings"
+  LangExt.ExplicitLevelImports -> "ExplicitLevelImports"
+  LangExt.ImplicitStagePersistence -> "ImplicitStagePersistence"
 
 -- | Is this extension known by any other names? For example
 -- -XGeneralizedNewtypeDeriving is accepted
@@ -269,78 +283,79 @@ extensionNames ext = mk (extensionDeprecation ext)     (extensionName ext : exte
                   ++ mk (ExtensionDeprecatedFor [ext]) (extensionDeprecatedNames ext)
   where mk depr = map (\name -> (depr, name))
 
-
-impliedXFlags :: [(LangExt.Extension, TurnOnFlag, LangExt.Extension)]
+impliedXFlags :: [(LangExt.Extension, OnOff LangExt.Extension)]
 impliedXFlags
 -- See Note [Updating flag description in the User's Guide]
-  = [ (LangExt.RankNTypes,                turnOn, LangExt.ExplicitForAll)
-    , (LangExt.QuantifiedConstraints,     turnOn, LangExt.ExplicitForAll)
-    , (LangExt.ScopedTypeVariables,       turnOn, LangExt.ExplicitForAll)
-    , (LangExt.LiberalTypeSynonyms,       turnOn, LangExt.ExplicitForAll)
-    , (LangExt.ExistentialQuantification, turnOn, LangExt.ExplicitForAll)
-    , (LangExt.FlexibleInstances,         turnOn, LangExt.TypeSynonymInstances)
-    , (LangExt.FunctionalDependencies,    turnOn, LangExt.MultiParamTypeClasses)
-    , (LangExt.MultiParamTypeClasses,     turnOn, LangExt.ConstrainedClassMethods)  -- c.f. #7854
-    , (LangExt.TypeFamilyDependencies,    turnOn, LangExt.TypeFamilies)
+  = [ (LangExt.RankNTypes,                On LangExt.ExplicitForAll)
+    , (LangExt.QuantifiedConstraints,     On LangExt.ExplicitForAll)
+    , (LangExt.ScopedTypeVariables,       On LangExt.ExplicitForAll)
+    , (LangExt.LiberalTypeSynonyms,       On LangExt.ExplicitForAll)
+    , (LangExt.ExistentialQuantification, On LangExt.ExplicitForAll)
+    , (LangExt.FlexibleInstances,         On LangExt.TypeSynonymInstances)
+    , (LangExt.FunctionalDependencies,    On LangExt.MultiParamTypeClasses)
+    , (LangExt.MultiParamTypeClasses,     On LangExt.ConstrainedClassMethods)  -- c.f. #7854
+    , (LangExt.TypeFamilyDependencies,    On LangExt.TypeFamilies)
 
-    , (LangExt.RebindableSyntax, turnOff, LangExt.ImplicitPrelude)      -- NB: turn off!
+    , (LangExt.RebindableSyntax, Off LangExt.ImplicitPrelude)      -- NB: turn off!
 
-    , (LangExt.DerivingVia, turnOn, LangExt.DerivingStrategies)
+    , (LangExt.DerivingVia, On LangExt.DerivingStrategies)
 
-    , (LangExt.GADTs,            turnOn, LangExt.GADTSyntax)
-    , (LangExt.GADTs,            turnOn, LangExt.MonoLocalBinds)
-    , (LangExt.TypeFamilies,     turnOn, LangExt.MonoLocalBinds)
+    , (LangExt.GADTs,            On LangExt.GADTSyntax)
+    , (LangExt.GADTs,            On LangExt.MonoLocalBinds)
+    , (LangExt.TypeFamilies,     On LangExt.MonoLocalBinds)
 
-    , (LangExt.TypeFamilies,     turnOn, LangExt.KindSignatures)  -- Type families use kind signatures
-    , (LangExt.PolyKinds,        turnOn, LangExt.KindSignatures)  -- Ditto polymorphic kinds
+    , (LangExt.TypeFamilies,     On LangExt.KindSignatures)  -- Type families use kind signatures
+    , (LangExt.PolyKinds,        On LangExt.KindSignatures)  -- Ditto polymorphic kinds
 
     -- TypeInType is now just a synonym for a couple of other extensions.
-    , (LangExt.TypeInType,       turnOn, LangExt.DataKinds)
-    , (LangExt.TypeInType,       turnOn, LangExt.PolyKinds)
-    , (LangExt.TypeInType,       turnOn, LangExt.KindSignatures)
+    , (LangExt.TypeInType,       On LangExt.DataKinds)
+    , (LangExt.TypeInType,       On LangExt.PolyKinds)
+    , (LangExt.TypeInType,       On LangExt.KindSignatures)
 
     -- Standalone kind signatures are a replacement for CUSKs.
-    , (LangExt.StandaloneKindSignatures, turnOff, LangExt.CUSKs)
+    , (LangExt.StandaloneKindSignatures, Off LangExt.CUSKs)
 
     -- AutoDeriveTypeable is not very useful without DeriveDataTypeable
-    , (LangExt.AutoDeriveTypeable, turnOn, LangExt.DeriveDataTypeable)
+    , (LangExt.AutoDeriveTypeable, On LangExt.DeriveDataTypeable)
 
     -- We turn this on so that we can export associated type
     -- type synonyms in subordinates (e.g. MyClass(type AssocType))
-    , (LangExt.TypeFamilies,     turnOn, LangExt.ExplicitNamespaces)
-    , (LangExt.TypeOperators, turnOn, LangExt.ExplicitNamespaces)
+    , (LangExt.TypeFamilies,     On LangExt.ExplicitNamespaces)
+    , (LangExt.TypeOperators, On LangExt.ExplicitNamespaces)
 
-    , (LangExt.ImpredicativeTypes,  turnOn, LangExt.RankNTypes)
+    , (LangExt.ImpredicativeTypes,  On LangExt.RankNTypes)
 
         -- Record wild-cards implies field disambiguation
         -- Otherwise if you write (C {..}) you may well get
         -- stuff like " 'a' not in scope ", which is a bit silly
         -- if the compiler has just filled in field 'a' of constructor 'C'
-    , (LangExt.RecordWildCards,     turnOn, LangExt.DisambiguateRecordFields)
+    , (LangExt.RecordWildCards,     On LangExt.DisambiguateRecordFields)
 
-    , (LangExt.ParallelArrays, turnOn, LangExt.ParallelListComp)
+    , (LangExt.ParallelArrays, On LangExt.ParallelListComp)
+    , (LangExt.MonadComprehensions, On LangExt.ParallelListComp)
+    , (LangExt.JavaScriptFFI, On LangExt.InterruptibleFFI)
 
-    , (LangExt.JavaScriptFFI, turnOn, LangExt.InterruptibleFFI)
-
-    , (LangExt.DeriveTraversable, turnOn, LangExt.DeriveFunctor)
-    , (LangExt.DeriveTraversable, turnOn, LangExt.DeriveFoldable)
+    , (LangExt.DeriveTraversable, On LangExt.DeriveFunctor)
+    , (LangExt.DeriveTraversable, On LangExt.DeriveFoldable)
 
     -- Duplicate record fields require field disambiguation
-    , (LangExt.DuplicateRecordFields, turnOn, LangExt.DisambiguateRecordFields)
+    , (LangExt.DuplicateRecordFields, On LangExt.DisambiguateRecordFields)
 
-    , (LangExt.TemplateHaskell, turnOn, LangExt.TemplateHaskellQuotes)
-    , (LangExt.Strict, turnOn, LangExt.StrictData)
+    , (LangExt.TemplateHaskell, On LangExt.TemplateHaskellQuotes)
+    , (LangExt.Strict, On LangExt.StrictData)
 
     -- Historically only UnboxedTuples was required for unboxed sums to work.
     -- To avoid breaking code, we make UnboxedTuples imply UnboxedSums.
-    , (LangExt.UnboxedTuples, turnOn, LangExt.UnboxedSums)
+    , (LangExt.UnboxedTuples, On LangExt.UnboxedSums)
 
     -- The extensions needed to declare an H98 unlifted data type
-    , (LangExt.UnliftedDatatypes, turnOn, LangExt.DataKinds)
-    , (LangExt.UnliftedDatatypes, turnOn, LangExt.StandaloneKindSignatures)
+    , (LangExt.UnliftedDatatypes, On LangExt.DataKinds)
+    , (LangExt.UnliftedDatatypes, On LangExt.StandaloneKindSignatures)
 
-    -- See Note [Non-variable pattern bindings aren't linear] in GHC.Tc.Gen.Bind
-    , (LangExt.LinearTypes, turnOn, LangExt.MonoLocalBinds)
+    -- See (NVP3) in Note [Non-variable pattern bindings aren't linear] in GHC.Tc.Gen.Bind
+    , (LangExt.LinearTypes, On LangExt.MonoLocalBinds)
+
+    , (LangExt.ExplicitLevelImports, Off LangExt.ImplicitStagePersistence)
   ]
 
 
@@ -352,7 +367,7 @@ validHoleFitsImpliedGFlags
     , (Opt_ShowTypeAppVarsOfHoleFits, turnOff, Opt_ShowTypeAppOfHoleFits)
     , (Opt_UnclutterValidHoleFits, turnOff, Opt_ShowProvOfHoleFits) ]
 
--- General flags that are switched on/off when other general flags are switched
+-- | General flags that are switched on/off when other general flags are switched
 -- on
 impliedGFlags :: [(GeneralFlag, TurnOnFlag, GeneralFlag)]
 impliedGFlags = [(Opt_DeferTypeErrors, turnOn, Opt_DeferTypedHoles)
@@ -365,12 +380,12 @@ impliedGFlags = [(Opt_DeferTypeErrors, turnOn, Opt_DeferTypedHoles)
                 ,(Opt_InfoTableMap, turnOn, Opt_InfoTableMapWithFallback)
                 ] ++ validHoleFitsImpliedGFlags
 
--- General flags that are switched on/off when other general flags are switched
+-- | General flags that are switched on/off when other general flags are switched
 -- off
 impliedOffGFlags :: [(GeneralFlag, TurnOnFlag, GeneralFlag)]
 impliedOffGFlags = [(Opt_Strictness, turnOff, Opt_WorkerWrapper)]
 
--- Please keep what_glasgow_exts_does.rst up to date with this list
+-- Please keep @docs/users_guide/what_glasgow_exts_does.rst@ up to date with this list.
 glasgowExtsFlags :: [LangExt.Extension]
 glasgowExtsFlags = [
              LangExt.ConstrainedClassMethods
@@ -418,7 +433,7 @@ data DumpFlag
    -- enabled if you run -ddump-cmm-verbose-by-proc
    -- Each flag corresponds to exact stage of Cmm pipeline.
    | Opt_D_dump_cmm_verbose
-   -- same as -ddump-cmm-verbose-by-proc but writes each stage
+   -- ^ same as -ddump-cmm-verbose-by-proc but writes each stage
    -- to a separate file (if used with -ddump-to-file)
    | Opt_D_dump_cmm_cfg
    | Opt_D_dump_cmm_cbe
@@ -492,9 +507,9 @@ data DumpFlag
    | Opt_D_dump_rn_stats
    | Opt_D_dump_opt_cmm
    | Opt_D_dump_simpl_stats
-   | Opt_D_dump_cs_trace -- Constraint solver in type checker
+   | Opt_D_dump_cs_trace -- ^ Constraint solver in type checker
    | Opt_D_dump_tc_trace
-   | Opt_D_dump_ec_trace -- Pattern match exhaustiveness checker
+   | Opt_D_dump_ec_trace -- ^ Pattern match exhaustiveness checker
    | Opt_D_dump_if_trace
    | Opt_D_dump_splices
    | Opt_D_th_dec_file
@@ -573,6 +588,7 @@ data GeneralFlag
    | Opt_DoAsmLinting
    | Opt_DoAnnotationLinting
    | Opt_DoBoundsChecking
+   | Opt_AddBcoName
    | Opt_NoLlvmMangler                  -- hidden flag
    | Opt_FastLlvm                       -- hidden flag
    | Opt_NoTypeableBinds
@@ -582,9 +598,13 @@ data GeneralFlag
    | Opt_InfoTableMapWithFallback
    | Opt_InfoTableMapWithStack
 
-   | Opt_WarnIsError                    -- -Werror; makes warnings fatal
-   | Opt_ShowWarnGroups                 -- Show the group a warning belongs to
-   | Opt_HideSourcePaths                -- Hide module source/object paths
+   | Opt_WarnIsError
+   -- ^ @-Werror@; makes all warnings fatal.
+   -- See 'wopt_set_fatal' for making individual warnings fatal as in @-Werror=foo@.
+   | Opt_ShowWarnGroups
+   -- ^ Show the group a warning belongs to.
+   | Opt_HideSourcePaths
+   -- ^ @-fhide-source-paths@; hide module source/object paths.
 
    | Opt_PrintExplicitForalls
    | Opt_PrintExplicitKinds
@@ -632,15 +652,15 @@ data GeneralFlag
    | Opt_IgnoreAsserts
    | Opt_DoEtaReduction
    | Opt_CaseMerge
-   | Opt_CaseFolding                    -- Constant folding through case-expressions
+   | Opt_CaseFolding                    -- ^ Constant folding through case-expressions
    | Opt_UnboxStrictFields
    | Opt_UnboxSmallStrictFields
    | Opt_DictsCheap
-   | Opt_EnableRewriteRules             -- Apply rewrite rules during simplification
-   | Opt_EnableThSpliceWarnings         -- Enable warnings for TH splices
-   | Opt_RegsGraph                      -- do graph coloring register allocation
-   | Opt_RegsIterative                  -- do iterative coalescing graph coloring register allocation
-   | Opt_PedanticBottoms                -- Be picky about how we treat bottom
+   | Opt_EnableRewriteRules             -- ^ Apply rewrite rules during simplification
+   | Opt_EnableThSpliceWarnings         -- ^ Enable warnings for TH splices
+   | Opt_RegsGraph                      -- ^ Do graph coloring register allocation
+   | Opt_RegsIterative                  -- ^ Do iterative coalescing graph coloring register allocation
+   | Opt_PedanticBottoms                -- ^ Be picky about how we treat bottom
    | Opt_LlvmFillUndefWithGarbage       -- Testing for undef bugs (hidden flag)
    | Opt_IrrefutableTuples
    | Opt_CmmSink
@@ -648,28 +668,32 @@ data GeneralFlag
    | Opt_CmmElimCommonBlocks
    | Opt_CmmControlFlow
    | Opt_AsmShortcutting
+   | Opt_InterModuleFarJumps
    | Opt_OmitYields
-   | Opt_FunToThunk               -- deprecated
-   | Opt_DictsStrict                     -- be strict in argument dictionaries
+   | Opt_FunToThunk                -- deprecated
+   | Opt_DictsStrict               -- ^ Be strict in argument dictionaries
    | Opt_DmdTxDictSel              -- ^ deprecated, no effect and behaviour is now default.
                                    -- Allowed switching of a special demand transformer for dictionary selectors
-   | Opt_Loopification                  -- See Note [Self-recursive tail calls]
-   | Opt_CfgBlocklayout             -- ^ Use the cfg based block layout algorithm.
-   | Opt_WeightlessBlocklayout         -- ^ Layout based on last instruction per block.
+   | Opt_Loopification             -- See Note [Self-recursive tail calls]
+   | Opt_CfgBlocklayout            -- ^ Use the cfg based block layout algorithm.
+   | Opt_WeightlessBlocklayout     -- ^ Layout based on last instruction per block.
    | Opt_CprAnal
    | Opt_WorkerWrapper
    | Opt_WorkerWrapperUnlift  -- ^ Do W/W split for unlifting even if we won't unbox anything.
    | Opt_SolveConstantDicts
    | Opt_AlignmentSanitisation
    | Opt_CatchNonexhaustiveCases
-   | Opt_NumConstantFolding
+   | Opt_NumConstantFolding   -- ^ See Note [Constant folding through nested expressions] in GHC.Core.Opt.ConstantFold
    | Opt_CoreConstantFolding
    | Opt_FastPAPCalls                  -- #6084
+   | Opt_SpecEval
+   | Opt_SpecEvalDictFun   -- See Note [Controlling Speculative Evaluation]
+
 
    -- Inference flags
    | Opt_DoTagInferenceChecks
 
-   -- PreInlining is on by default. The option is there just to see how
+   -- | PreInlining is on by default. The option is there just to see how
    -- bad things get if you turn it off!
    | Opt_SimplPreInlining
 
@@ -678,13 +702,15 @@ data GeneralFlag
    | Opt_OmitInterfacePragmas
    | Opt_ExposeAllUnfoldings
    | Opt_ExposeOverloadedUnfoldings
-   | Opt_KeepAutoRules -- ^Keep auto-generated rules even if they seem to have become useless
-   | Opt_WriteInterface -- forces .hi files to be written even with -fno-code
-   | Opt_WriteHie -- generate .hie files
+   | Opt_KeepAutoRules -- ^ Keep auto-generated rules even if they seem to have become useless
+   | Opt_WriteInterface -- ^ Forces .hi files to be written even with -fno-code
+   | Opt_WriteSelfRecompInfo
+   | Opt_WriteSelfRecompFlags -- ^ Include detailed flag information for self-recompilation debugging
+   | Opt_WriteHie -- ^ Generate .hie files
 
    -- JavaScript opts
-   | Opt_DisableJsMinifier -- ^ render JavaScript pretty-printed instead of minified (compacted)
-   | Opt_DisableJsCsources -- ^ don't link C sources (compiled to JS) with Haskell code (compiled to JS)
+   | Opt_DisableJsMinifier -- ^ Render JavaScript pretty-printed instead of minified (compacted)
+   | Opt_DisableJsCsources -- ^ Don't link C sources (compiled to JS) with Haskell code (compiled to JS)
 
    -- profiling opts
    | Opt_AutoSccsOnIndividualCafs
@@ -727,6 +753,14 @@ data GeneralFlag
    | Opt_ValidateHie
    | Opt_LocalGhciHistory
    | Opt_NoIt
+
+   -- wasm ghci browser mode
+   | Opt_GhciBrowser
+   | Opt_GhciBrowserRedirectWasiConsole
+
+   -- | Instruct GHCi to load all targets on startup
+   | Opt_GhciDoLoadTargets
+
    | Opt_HelpfulErrors
    | Opt_DeferTypeErrors             -- Since 7.6
    | Opt_DeferTypedHoles             -- Since 7.10
@@ -767,11 +801,11 @@ data GeneralFlag
    | Opt_LinkRts
 
    -- output style opts
-   | Opt_ErrorSpans -- Include full span info in error messages,
+   | Opt_ErrorSpans -- ^ Include full span info in error messages,
                     -- instead of just the start position.
    | Opt_DeferDiagnostics
    | Opt_DiagnosticsAsJSON  -- ^ Dump diagnostics as JSON
-   | Opt_DiagnosticsShowCaret -- Show snippets of offending code
+   | Opt_DiagnosticsShowCaret -- ^ Show snippets of offending code
    | Opt_PprCaseAsLet
    | Opt_PprShowTicks
    | Opt_ShowHoleConstraints
@@ -794,29 +828,29 @@ data GeneralFlag
    | Opt_ShowLoadedModules
    | Opt_HexWordLiterals -- See Note [Print Hexadecimal Literals]
 
-   -- Suppress a coercions inner structure, replacing it with '...'
+   -- | Suppress a coercions inner structure, replacing it with '...'
    | Opt_SuppressCoercions
-   -- Suppress the type of a coercion as well
+   -- | Suppress the type of a coercion as well
    | Opt_SuppressCoercionTypes
    | Opt_SuppressVarKinds
-   -- Suppress module id prefixes on variables.
+   -- | Suppress module id prefixes on variables.
    | Opt_SuppressModulePrefixes
-   -- Suppress type applications.
+   -- | Suppress type applications.
    | Opt_SuppressTypeApplications
-   -- Suppress info such as arity and unfoldings on identifiers.
+   -- | Suppress info such as arity and unfoldings on identifiers.
    | Opt_SuppressIdInfo
-   -- Suppress separate type signatures in core, but leave types on
+   -- | Suppress separate type signatures in core, but leave types on
    -- lambda bound vars
    | Opt_SuppressUnfoldings
-   -- Suppress the details of even stable unfoldings
+   -- | Suppress the details of even stable unfoldings
    | Opt_SuppressTypeSignatures
-   -- Suppress unique ids on variables.
+   -- | Suppress unique ids on variables.
    -- Except for uniques, as some simplifier phases introduce new
    -- variables that have otherwise identical names.
    | Opt_SuppressUniques
    | Opt_SuppressStgExts
    | Opt_SuppressStgReps
-   | Opt_SuppressTicks     -- Replaces Opt_PprShowTicks
+   | Opt_SuppressTicks      -- ^ Replaces Opt_PprShowTicks
    | Opt_SuppressTimestamps -- ^ Suppress timestamps in dumps
    | Opt_SuppressCoreSizes  -- ^ Suppress per binding Core size stats in dumps
 
@@ -894,6 +928,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CmmSink
    , Opt_CmmElimCommonBlocks
    , Opt_AsmShortcutting
+   , Opt_InterModuleFarJumps
    , Opt_FunToThunk
    , Opt_DmdTxDictSel
    , Opt_Loopification
@@ -903,6 +938,8 @@ optimisationFlags = EnumSet.fromList
    , Opt_WorkerWrapper
    , Opt_WorkerWrapperUnlift
    , Opt_SolveConstantDicts
+   , Opt_SpecEval
+   , Opt_SpecEvalDictFun
    ]
 
 -- | The set of flags which affect code generation and can change a program's
@@ -1014,55 +1051,62 @@ data WarningFlag =
    | Opt_WarnDerivingTypeable
    | Opt_WarnDeferredTypeErrors
    | Opt_WarnDeferredOutOfScopeVariables
-   | Opt_WarnNonCanonicalMonadInstances              -- since 8.0
-   | Opt_WarnNonCanonicalMonadFailInstances          -- since 8.0, removed 8.8
-   | Opt_WarnNonCanonicalMonoidInstances             -- since 8.0
-   | Opt_WarnMissingPatternSynonymSignatures         -- since 8.0
-   | Opt_WarnUnrecognisedWarningFlags                -- since 8.0
-   | Opt_WarnSimplifiableClassConstraints            -- Since 8.2
-   | Opt_WarnCPPUndef                                -- Since 8.2
-   | Opt_WarnUnbangedStrictPatterns                  -- Since 8.2
-   | Opt_WarnMissingHomeModules                      -- Since 8.2
-   | Opt_WarnPartialFields                           -- Since 8.4
+   | Opt_WarnNonCanonicalMonadInstances              -- ^ @since 8.0
+   | Opt_WarnNonCanonicalMonadFailInstances          -- ^ @since 8.0, has no effect since 8.8
+   | Opt_WarnNonCanonicalMonoidInstances             -- ^ @since 8.0
+   | Opt_WarnMissingPatternSynonymSignatures         -- ^ @since 8.0
+   | Opt_WarnUnrecognisedWarningFlags                -- ^ @since 8.0
+   | Opt_WarnSimplifiableClassConstraints            -- ^ @since 8.2
+   | Opt_WarnCPPUndef                                -- ^ @since 8.2
+   | Opt_WarnUnbangedStrictPatterns                  -- ^ @since 8.2
+   | Opt_WarnMissingHomeModules                      -- ^ @since 8.2
+   | Opt_WarnPartialFields                           -- ^ @since 8.4
    | Opt_WarnMissingExportList
    | Opt_WarnInaccessibleCode
-   | Opt_WarnStarIsType                              -- Since 8.6
-   | Opt_WarnStarBinder                              -- Since 8.6
-   | Opt_WarnImplicitKindVars                        -- Since 8.6
+   | Opt_WarnStarIsType                              -- ^ @since 8.6
+   | Opt_WarnStarBinder                              -- ^ @since 8.6
+   | Opt_WarnImplicitKindVars                        -- ^ @since 8.6
    | Opt_WarnSpaceAfterBang
-   | Opt_WarnMissingDerivingStrategies               -- Since 8.8
-   | Opt_WarnPrepositiveQualifiedModule              -- Since 8.10
-   | Opt_WarnUnusedPackages                          -- Since 8.10
-   | Opt_WarnInferredSafeImports                     -- Since 8.10
-   | Opt_WarnMissingSafeHaskellMode                  -- Since 8.10
-   | Opt_WarnCompatUnqualifiedImports                -- Since 8.10
+   | Opt_WarnMissingDerivingStrategies               -- ^ @since 8.8
+   | Opt_WarnPrepositiveQualifiedModule              -- ^ @since 8.10
+   | Opt_WarnUnusedPackages                          -- ^ @since 8.10
+   | Opt_WarnInferredSafeImports                     -- ^ @since 8.10
+   | Opt_WarnMissingSafeHaskellMode                  -- ^ @since 8.10
+   | Opt_WarnCompatUnqualifiedImports                -- ^ @since 8.10
    | Opt_WarnDerivingDefaults
-   | Opt_WarnInvalidHaddock                          -- Since 9.0
-   | Opt_WarnOperatorWhitespaceExtConflict           -- Since 9.2
-   | Opt_WarnOperatorWhitespace                      -- Since 9.2
-   | Opt_WarnAmbiguousFields                         -- Since 9.2
-   | Opt_WarnImplicitLift                            -- Since 9.2
-   | Opt_WarnMissingKindSignatures                   -- Since 9.2
-   | Opt_WarnMissingPolyKindSignatures               -- Since 9.8
-   | Opt_WarnMissingExportedPatternSynonymSignatures -- since 9.2
-   | Opt_WarnRedundantStrictnessFlags                -- Since 9.4
-   | Opt_WarnForallIdentifier                        -- Since 9.4
-   | Opt_WarnUnicodeBidirectionalFormatCharacters    -- Since 9.0.2
-   | Opt_WarnGADTMonoLocalBinds                      -- Since 9.4
-   | Opt_WarnTypeEqualityOutOfScope                  -- Since 9.4
-   | Opt_WarnTypeEqualityRequiresOperators           -- Since 9.4
-   | Opt_WarnLoopySuperclassSolve                    -- Since 9.6, has no effect since 9.10
-   | Opt_WarnTermVariableCapture                     -- Since 9.8
-   | Opt_WarnMissingRoleAnnotations                  -- Since 9.8
-   | Opt_WarnImplicitRhsQuantification               -- Since 9.8
-   | Opt_WarnIncompleteExportWarnings                -- Since 9.8
-   | Opt_WarnIncompleteRecordSelectors               -- Since 9.10
-   | Opt_WarnBadlyStagedTypes                        -- Since 9.10
-   | Opt_WarnInconsistentFlags                       -- Since 9.8
-   | Opt_WarnDataKindsTC                             -- Since 9.10
-   | Opt_WarnDeprecatedTypeAbstractions              -- Since 9.10
-   | Opt_WarnDefaultedExceptionContext               -- Since 9.10
-   | Opt_WarnViewPatternSignatures                   -- Since 9.12
+   | Opt_WarnInvalidHaddock                          -- ^ @since 9.0
+   | Opt_WarnOperatorWhitespaceExtConflict           -- ^ @since 9.2
+   | Opt_WarnOperatorWhitespace                      -- ^ @since 9.2
+   | Opt_WarnAmbiguousFields                         -- ^ @since 9.2
+   | Opt_WarnImplicitLift                            -- ^ @since 9.2
+   | Opt_WarnMissingKindSignatures                   -- ^ @since 9.2
+   | Opt_WarnMissingPolyKindSignatures               -- ^ @since 9.8
+   | Opt_WarnMissingExportedPatternSynonymSignatures -- ^ @since 9.2
+   | Opt_WarnRedundantStrictnessFlags                -- ^ @since 9.4
+   | Opt_WarnForallIdentifier                        -- ^ @since 9.4
+   | Opt_WarnUnicodeBidirectionalFormatCharacters    -- ^ @since 9.0.2
+   | Opt_WarnGADTMonoLocalBinds                      -- ^ @since 9.4
+   | Opt_WarnTypeEqualityOutOfScope                  -- ^ @since 9.4
+   | Opt_WarnTypeEqualityRequiresOperators           -- ^ @since 9.4
+   | Opt_WarnLoopySuperclassSolve                    -- ^ @since 9.6, has no effect since 9.10
+   | Opt_WarnTermVariableCapture                     -- ^ @since 9.8
+   | Opt_WarnMissingRoleAnnotations                  -- ^ @since 9.8
+   | Opt_WarnImplicitRhsQuantification               -- ^ @since 9.8
+   | Opt_WarnIncompleteExportWarnings                -- ^ @since 9.8
+   | Opt_WarnIncompleteRecordSelectors               -- ^ @since 9.10
+   | Opt_WarnBadlyLevelledTypes                      -- ^ @since 9.10
+   | Opt_WarnInconsistentFlags                       -- ^ @since 9.8
+   | Opt_WarnDataKindsTC                             -- ^ @since 9.10
+   | Opt_WarnDefaultedExceptionContext               -- ^ @since 9.10
+   | Opt_WarnViewPatternSignatures                   -- ^ @since 9.12
+   | Opt_WarnUselessSpecialisations                  -- ^ @since 9.14
+   | Opt_WarnDeprecatedPragmas                       -- ^ @since 9.14
+   | Opt_WarnRuleLhsEqualities
+       -- ^ @since 9.14, scheduled to be removed in 9.18
+       --
+       -- See Note [Quantifying over equalities in RULES] in GHC.Tc.Gen.Sig
+   | Opt_WarnUnusableUnpackPragmas                   -- Since 9.14
+   | Opt_WarnPatternNamespaceSpecifier               -- Since 9.14
    deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | Return the names of a WarningFlag
@@ -1174,12 +1218,16 @@ warnFlagNames wflag = case wflag of
   Opt_WarnImplicitRhsQuantification               -> "implicit-rhs-quantification" :| []
   Opt_WarnIncompleteExportWarnings                -> "incomplete-export-warnings" :| []
   Opt_WarnIncompleteRecordSelectors               -> "incomplete-record-selectors" :| []
-  Opt_WarnBadlyStagedTypes                        -> "badly-staged-types" :| []
+  Opt_WarnBadlyLevelledTypes                      -> "badly-levelled-types" :| []
   Opt_WarnInconsistentFlags                       -> "inconsistent-flags" :| []
   Opt_WarnDataKindsTC                             -> "data-kinds-tc" :| []
-  Opt_WarnDeprecatedTypeAbstractions              -> "deprecated-type-abstractions" :| []
   Opt_WarnDefaultedExceptionContext               -> "defaulted-exception-context" :| []
   Opt_WarnViewPatternSignatures                   -> "view-pattern-signatures" :| []
+  Opt_WarnUselessSpecialisations                  -> "useless-specialisations" :| ["useless-specializations"]
+  Opt_WarnDeprecatedPragmas                       -> "deprecated-pragmas" :| []
+  Opt_WarnRuleLhsEqualities                       -> "rule-lhs-equalities" :| []
+  Opt_WarnUnusableUnpackPragmas                   -> "unusable-unpack-pragmas" :| []
+  Opt_WarnPatternNamespaceSpecifier               -> "pattern-namespace-specifier" :| []
 
 -- -----------------------------------------------------------------------------
 -- Standard sets of warning options
@@ -1239,7 +1287,7 @@ warningGroupIncludesExtendedWarnings W_everything        = True
 
 -- | Warning groups.
 --
--- As all warnings are in the Weverything set, it is ignored when
+-- As all warnings are in the 'W_everything' set, it is ignored when
 -- displaying to the user which group a warning is in.
 warningGroups :: [WarningGroup]
 warningGroups = [minBound..maxBound]
@@ -1254,7 +1302,7 @@ warningGroups = [minBound..maxBound]
 -- Separating this from 'warningGroups' allows for multiple
 -- hierarchies with no inherent relation to be defined.
 --
--- The special-case Weverything group is not included.
+-- The special-case 'W_everything' group is not included.
 warningHierarchies :: [[WarningGroup]]
 warningHierarchies = hierarchies ++ map (:[]) rest
   where
@@ -1316,15 +1364,19 @@ standardWarnings -- see Note [Documenting warning flags]
         Opt_WarnOperatorWhitespaceExtConflict,
         Opt_WarnUnicodeBidirectionalFormatCharacters,
         Opt_WarnGADTMonoLocalBinds,
-        Opt_WarnBadlyStagedTypes,
+        Opt_WarnBadlyLevelledTypes,
         Opt_WarnTypeEqualityRequiresOperators,
         Opt_WarnInconsistentFlags,
-        Opt_WarnDataKindsTC,
         Opt_WarnTypeEqualityOutOfScope,
-        Opt_WarnViewPatternSignatures
+        Opt_WarnImplicitRhsQuantification, -- was in -Wcompat since 9.8, enabled by default since 9.14, to turn into a hard error in 9.16
+        Opt_WarnViewPatternSignatures,
+        Opt_WarnUselessSpecialisations,
+        Opt_WarnDeprecatedPragmas,
+        Opt_WarnRuleLhsEqualities,
+        Opt_WarnUnusableUnpackPragmas
       ]
 
--- | Things you get with -W
+-- | Things you get with @-W@.
 minusWOpts :: [WarningFlag]
 minusWOpts
     = standardWarnings ++
@@ -1340,7 +1392,7 @@ minusWOpts
         Opt_WarnUnbangedStrictPatterns
       ]
 
--- | Things you get with -Wall
+-- | Things you get with @-Wall@.
 minusWallOpts :: [WarningFlag]
 minusWallOpts
     = minusWOpts ++
@@ -1361,22 +1413,21 @@ minusWallOpts
         Opt_WarnDerivingTypeable
       ]
 
--- | Things you get with -Weverything, i.e. *all* known warnings flags
+-- | Things you get with @-Weverything@, i.e. *all* known warnings flags.
 minusWeverythingOpts :: [WarningFlag]
 minusWeverythingOpts = [ toEnum 0 .. ]
 
--- | Things you get with -Wcompat.
+-- | Things you get with @-Wcompat@.
 --
 -- This is intended to group together warnings that will be enabled by default
 -- at some point in the future, so that library authors eager to make their
 -- code future compatible to fix issues before they even generate warnings.
 minusWcompatOpts :: [WarningFlag]
 minusWcompatOpts
-    = [ Opt_WarnImplicitRhsQuantification
-      , Opt_WarnDeprecatedTypeAbstractions
+    = [ Opt_WarnPatternNamespaceSpecifier
       ]
 
--- | Things you get with -Wunused-binds
+-- | Things you get with @-Wunused-binds@.
 unusedBindsFlags :: [WarningFlag]
 unusedBindsFlags = [ Opt_WarnUnusedTopBinds
                    , Opt_WarnUnusedLocalBinds

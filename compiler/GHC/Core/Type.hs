@@ -69,8 +69,6 @@ module GHC.Core.Type (
         mkCharLitTy, isCharLitTy,
         isLitTy,
 
-        isPredTy,
-
         getRuntimeRep, splitRuntimeRep_maybe, kindRep_maybe, kindRep,
         getLevity, levityType_maybe,
 
@@ -121,7 +119,7 @@ module GHC.Core.Type (
         mkTYPEapp, mkTYPEapp_maybe,
         mkCONSTRAINTapp, mkCONSTRAINTapp_maybe,
         mkBoxedRepApp_maybe, mkTupleRepApp_maybe,
-        typeOrConstraintKind,
+        typeOrConstraintKind, liftedTypeOrConstraintKind,
 
         -- *** Levity and boxity
         sORTKind_maybe, typeTypeOrConstraint,
@@ -134,7 +132,7 @@ module GHC.Core.Type (
         kindBoxedRepLevity_maybe,
         mightBeLiftedType, mightBeUnliftedType,
         definitelyLiftedType, definitelyUnliftedType,
-        isAlgType, isDataFamilyAppType,
+        isAlgType, isDataFamilyApp, isSatTyFamApp,
         isPrimitiveType, isStrictType, isTerminatingType,
         isLevityTy, isLevityVar,
         isRuntimeRepTy, isRuntimeRepVar, isRuntimeRepKindedTy,
@@ -177,10 +175,6 @@ module GHC.Core.Type (
         closeOverKindsDSet, closeOverKindsList,
         closeOverKinds,
 
-        -- * Well-scoped lists of variables
-        scopedSort, tyCoVarsOfTypeWellScoped,
-        tyCoVarsOfTypesWellScoped,
-
         -- * Forcing evaluation of types
         seqType, seqTypes,
 
@@ -201,7 +195,7 @@ module GHC.Core.Type (
         zipTCvSubst,
         notElemSubst,
         getTvSubstEnv,
-        zapSubst, getSubstInScope, setInScope, getSubstRangeTyCoFVs,
+        zapSubst, substInScopeSet, setInScope, getSubstRangeTyCoFVs,
         extendSubstInScope, extendSubstInScopeList, extendSubstInScopeSet,
         extendTCvSubst, extendCvSubst,
         extendTvSubst, extendTvSubstList, extendTvSubstAndInScope,
@@ -222,20 +216,10 @@ module GHC.Core.Type (
         substTyCoBndr, substTyVarToTyVar,
         cloneTyVarBndr, cloneTyVarBndrs, lookupTyVar,
 
-        -- * Tidying type related things up for printing
-        tidyType,      tidyTypes,
-        tidyOpenType,  tidyOpenTypes,
-        tidyOpenTypeX, tidyOpenTypesX,
-        tidyVarBndr, tidyVarBndrs,
-        tidyFreeTyCoVars,
-        tidyFreeTyCoVarX, tidyFreeTyCoVarsX,
-        tidyTyCoVarOcc,
-        tidyTopType,
-        tidyForAllTyBinder, tidyForAllTyBinders,
-
         -- * Kinds
         isTYPEorCONSTRAINT,
-        isConcreteType, isFixedRuntimeRepKind,
+        isConcreteType,
+        isFixedRuntimeRepKind
     ) where
 
 import GHC.Prelude
@@ -247,7 +231,6 @@ import GHC.Types.Basic
 
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Subst
-import GHC.Core.TyCo.Tidy
 import GHC.Core.TyCo.FVs
 
 -- friends:
@@ -576,11 +559,7 @@ expandTypeSynonyms ty
     go_co _ (HoleCo h)
       = pprPanic "expandTypeSynonyms hit a hole" (ppr h)
 
-      -- the "False" and "const" are to accommodate the type of
-      -- substForAllCoBndrUsing, which is general enough to
-      -- handle coercion optimization (which sometimes swaps the
-      -- order of a coercion)
-    go_cobndr subst = substForAllCoBndrUsing NotSwapped (go_co subst) subst
+    go_cobndr subst = substForAllCoBndrUsing (go_co subst) subst
 
 {- Notes on type synonyms
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2312,6 +2291,21 @@ isFamFreeTy (ForAllTy _ ty)   = isFamFreeTy ty
 isFamFreeTy (CastTy ty _)     = isFamFreeTy ty
 isFamFreeTy (CoercionTy _)    = False  -- Not sure about this
 
+-- | Check whether a type is a data family type
+isDataFamilyApp :: Type -> Bool
+isDataFamilyApp ty = case tyConAppTyCon_maybe ty of
+                           Just tc -> isDataFamilyTyCon tc
+                           _       -> False
+
+isSatTyFamApp :: Type -> Maybe (TyCon, [Type])
+-- Return the argument if we have a saturated type family application
+-- Why saturated?  See (ATF4) in Note [Apartness and type families]
+isSatTyFamApp (TyConApp tc tys)
+  |  isTypeFamilyTyCon tc
+  && not (tys `lengthExceeds` tyConArity tc)  -- Not over-saturated
+  = Just (tc, tys)
+isSatTyFamApp _ = Nothing
+
 buildSynTyCon :: Name -> [KnotTied TyConBinder] -> Kind   -- ^ /result/ kind
               -> [Role] -> KnotTied Type -> TyCon
 -- This function is here because here is where we have
@@ -2479,12 +2473,6 @@ isAlgType ty
                             isAlgTyCon tc
       _other             -> False
 
--- | Check whether a type is a data family type
-isDataFamilyAppType :: Type -> Bool
-isDataFamilyAppType ty = case tyConAppTyCon_maybe ty of
-                           Just tc -> isDataFamilyTyCon tc
-                           _       -> False
-
 -- | Computes whether an argument (or let right hand side) should
 -- be computed strictly or lazily, based only on its type.
 -- Currently, it's just 'isUnliftedType'.
@@ -2499,7 +2487,9 @@ isTerminatingType :: HasDebugCallStack => Type -> Bool
 -- NB: unlifted types are not terminating types!
 --     e.g. you can write a term (loop 1)::Int# that diverges.
 isTerminatingType ty = case tyConAppTyCon_maybe ty of
-    Just tc -> isClassTyCon tc && not (isNewTyCon tc)
+    Just tc -> isClassTyCon tc && not (isUnaryClassTyCon tc)
+               -- A non-unary class TyCon is terminating
+               -- See (UCM3) in Note [Unary class magic] in GHC.Core.TyCon
     _       -> False
 
 isPrimitiveType :: Type -> Bool
@@ -2685,9 +2675,7 @@ typeKind :: HasDebugCallStack => Type -> Kind
 -- No need to expand synonyms
 typeKind (TyConApp tc tys)      = piResultTys (tyConKind tc) tys
 typeKind (LitTy l)              = typeLiteralKind l
-typeKind (FunTy { ft_af = af }) = case funTyFlagResultTypeOrConstraint af of
-                                     TypeLike       -> liftedTypeKind
-                                     ConstraintLike -> constraintKind
+typeKind (FunTy { ft_af = af }) = liftedTypeOrConstraintKind (funTyFlagResultTypeOrConstraint af)
 typeKind (TyVarTy tyvar)        = tyVarKind tyvar
 typeKind (CastTy _ty co)        = coercionRKind co
 typeKind (CoercionTy co)        = coercionType co
@@ -2719,9 +2707,9 @@ typeKind ty@(ForAllTy {})
 
     lifted_kind_from_body  -- Implements (FORALL2)
       = case sORTKind_maybe body_kind of
-          Just (ConstraintLike, _) -> constraintKind
-          Just (TypeLike,       _) -> liftedTypeKind
-          Nothing -> pprPanic "typeKind" (ppr body_kind)
+          Just (torc, _) -> liftedTypeOrConstraintKind torc
+          Nothing        -> pprPanic "typeKind" (ppr body_kind)
+
 
 ---------------------------------------------
 
@@ -2760,14 +2748,6 @@ typeTypeOrConstraint ty
           -> torc
           | otherwise
           -> pprPanic "typeOrConstraint" (ppr ty <+> dcolon <+> ppr (typeKind ty))
-
-isPredTy :: HasDebugCallStack => Type -> Bool
--- Precondition: expects a type that classifies values
--- See Note [Types for coercions, predicates, and evidence] in GHC.Core.TyCo.Rep
--- Returns True for types of kind (CONSTRAINT _), False for ones of kind (TYPE _)
-isPredTy ty = case typeTypeOrConstraint ty of
-                  TypeLike       -> False
-                  ConstraintLike -> True
 
 -- | Does this classify a type allowed to have values? Responds True to things
 -- like *, TYPE Lifted, TYPE IntRep, TYPE v, Constraint.
@@ -2871,12 +2851,14 @@ isFixedRuntimeRepKind k
 isConcreteType :: Type -> Bool
 isConcreteType = isConcreteTypeWith emptyVarSet
 
-isConcreteTypeWith :: TyVarSet -> Type -> Bool
+-- | Like 'isConcreteType', but allows passing in a set of 'TyVar's that
+-- should be considered concrete.
+--
 -- See Note [Concrete types] in GHC.Tc.Utils.Concrete.
--- For this "With" version we pass in a set of TyVars to be considered
--- concrete.  This supports mkSynonymTyCon, which needs to test the RHS
--- for concreteness, under the assumption that the binders are instantiated
--- to concrete types
+isConcreteTypeWith :: TyVarSet -> Type -> Bool
+-- This version, with a 'TyVarSet' argument, supports 'mkSynonymTyCon',
+-- which needs to test the RHS for concreteness, under the assumption that
+-- the binders are instantiated to concrete types
 isConcreteTypeWith conc_tvs = go
   where
     go (TyVarTy tv)        = isConcreteTyVar tv || tv `elemVarSet` conc_tvs
@@ -2890,6 +2872,7 @@ isConcreteTypeWith conc_tvs = go
     go CastTy{}            = False
     go CoercionTy{}        = False
 
+    go_tc :: TyCon -> [Type] -> Bool
     go_tc tc tys
       | isForgetfulSynTyCon tc  -- E.g. type S a = Int
                                 -- Then (S x) is concrete even if x isn't
@@ -2904,7 +2887,6 @@ isConcreteTypeWith conc_tvs = go
 
       | otherwise  -- E.g. type families
       = False
-
 
 {-
 %************************************************************************
@@ -3450,3 +3432,7 @@ mkTupleRepApp_maybe _ = Nothing
 typeOrConstraintKind :: TypeOrConstraint -> RuntimeRepType -> Kind
 typeOrConstraintKind TypeLike       rep = mkTYPEapp       rep
 typeOrConstraintKind ConstraintLike rep = mkCONSTRAINTapp rep
+
+liftedTypeOrConstraintKind :: TypeOrConstraint -> Kind
+liftedTypeOrConstraintKind TypeLike       = liftedTypeKind
+liftedTypeOrConstraintKind ConstraintLike = constraintKind

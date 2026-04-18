@@ -312,6 +312,15 @@ typedef struct {
     StgClosure *result;
 } StgDeadThreadFrame;
 
+// Stack frame annotating an execution context with a Haskell value
+// for backtrace purposes.
+//
+// Closure types: ANN_FRAME
+typedef struct {
+    StgHeader header;
+    StgClosure *ann;
+} StgAnnFrame;
+
 // A function return stack frame: used when saving the state for a
 // garbage collection at a function entry point.  The function
 // arguments are on the stack, and we also save the function (its
@@ -427,7 +436,7 @@ typedef struct {
     StgArrBytes   *literals; // literals used by the instructions
     StgMutArrPtrs *ptrs; // free variables
     StgHalfWord   arity; // arity of this BCO
-    StgHalfWord   size;  // size of the bitmap
+    StgHalfWord   size;  // size of the closure and bitmap
     StgWord       bitmap[]; // an StgLargeBitmap
 } StgBCO;
 
@@ -699,3 +708,4 @@ typedef struct {
       // Number of words of captured stack
     StgWord stack[];
 } StgContinuation;
+

@@ -1,8 +1,6 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE TypeFamilies #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1999
@@ -736,13 +734,14 @@ updateRoleEnv :: Name -> Int -> Role -> RoleM ()
 updateRoleEnv name n role
   = RM $ \_ _ _ state@(RIS { role_env = role_env }) -> ((),
          case lookupNameEnv role_env name of
-           Nothing -> pprPanic "updateRoleEnv" (ppr name)
-           Just roles -> let (before, old_role : after) = splitAt n roles in
-                         if role `ltRole` old_role
+           Just roles
+             | (before, old_role : after) <- splitAt n roles
+             ->          if role `ltRole` old_role
                          then let roles' = before ++ role : after
                                   role_env' = extendNameEnv role_env name roles' in
                               RIS { role_env = role_env', update = True }
-                         else state )
+                         else state
+           _ -> pprPanic "updateRoleEnv" (ppr name))
 
 
 {- *********************************************************************
@@ -802,14 +801,6 @@ mkDefaultMethodType cls _   (GenericDM dm_ty) = mkSigmaTy tv_bndrs [pred] dm_ty
      --     (#13998)
 
 {-
-************************************************************************
-*                                                                      *
-                Building record selectors
-*                                                                      *
-************************************************************************
--}
-
-{-
 Note [Default method Ids and Template Haskell]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider this (#4169):
@@ -835,6 +826,21 @@ when typechecking the [d| .. |] quote, and typecheck them later.
 ************************************************************************
 -}
 
+{- Note [Record selectors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Record selectors are injected as ordianry functions definitions, very
+early in the pipeline.
+
+* `mkRecSelBinds` produces /un-typechecked/ bindings, rather like 'deriving'
+   This makes life easier, because the later type checking will add
+   all necessary type abstractions and applications; and handling for
+   UNPACK pragmas etc
+
+* Record selectors are not treated as "implicit".  See
+  See Note [Implicit TyThings] in GHC.Types.TyThing and
+      Note [Injecting implicit bindings] in GHC.CoreToStg.AddImplicitBinds
+-}
+
 tcRecSelBinds :: [(Id, LHsBind GhcRn)] -> TcM TcGblEnv
 tcRecSelBinds sel_bind_prs
   = tcExtendGlobalValEnv [sel_id | (L _ (XSig (IdSig sel_id))) <- sigs] $
@@ -850,9 +856,7 @@ tcRecSelBinds sel_bind_prs
     binds = [(NonRecursive, [bind]) | (_, bind) <- sel_bind_prs]
 
 mkRecSelBinds :: [TyCon] -> [(Id, LHsBind GhcRn)]
--- NB We produce *un-typechecked* bindings, rather like 'deriving'
---    This makes life easier, because the later type checking will add
---    all necessary type abstractions and applications
+-- See Note [Record selectors]
 mkRecSelBinds tycons
   = map mkRecSelBind [ (tc,fld) | tc <- tycons
                                 , fld <- tyConFieldLabels tc ]
@@ -918,7 +922,7 @@ mkOneRecordSelector all_cons idDetails fl has_sel
                                                   -- A slight hack!
 
     sel_ty | is_naughty = unitTy  -- See Note [Naughty record selectors]
-           | otherwise  = mkForAllTys (tyVarSpecToBinders sel_tvbs) $
+           | otherwise  = mkForAllTys sel_tvbs $
                           -- Urgh! See Note [The stupid context] in GHC.Core.DataCon
                           mkPhiTy (conLikeStupidTheta con1) $
                           -- req_theta is empty for normal DataCon
@@ -938,8 +942,10 @@ mkOneRecordSelector all_cons idDetails fl has_sel
              | otherwise =  map mk_match cons_w_field ++ deflt
     mk_match con = mkSimpleMatch match_ctxt
                                  (L (l2l loc') [L loc' (mk_sel_pat con)])
-                                 (L loc' (HsVar noExtField (L locn field_var)))
-    mk_sel_pat con = ConPat NoExtField (L locn (getName con)) (RecCon rec_fields)
+                                 (L loc' (mkHsVar (L locn field_var)))
+    mk_sel_pat con =
+      let con_lname = L locn (noUserRdr (getName con))
+      in ConPat NoExtField con_lname (RecCon rec_fields)
     rec_fields = HsRecFields { rec_ext = noExtField, rec_flds = [rec_field], rec_dotdot = Nothing }
     rec_field  = noLocA (HsFieldBind
                         { hfbAnn = noAnn

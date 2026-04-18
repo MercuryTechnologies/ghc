@@ -89,11 +89,11 @@ stage0Packages = do
              , ghc
              , ghcBoot
              , ghcBootThNext
-             , ghcHeap
              , ghcPkg
              , ghcPlatform
              , ghcToolchain
              , ghci
+             , haskeline
              , haddockApi
              , haddockLibrary
              , haddock
@@ -106,6 +106,8 @@ stage0Packages = do
              , runGhc
              , semaphoreCompat -- depends on
              , time -- depends on win32
+             , thLift -- new library not yet present for boot compilers
+             , thQuasiquoter -- new library not yet present for boot compilers
              , unlit
              , if windowsHost then win32 else unix
              -- We must use the in-tree `Win32` as the version
@@ -150,11 +152,13 @@ stage1Packages = do
         , ghc
         , ghcBignum
         , ghcBootTh
+        , ghcHeap
         , ghcCompact
         , ghcExperimental
         , ghcInternal
         , ghcPkg
         , ghcPrim
+        , haddock
         , haskeline
         , hp2ps
         , hsc2hs
@@ -173,8 +177,7 @@ stage1Packages = do
         , if winTarget then win32 else unix
         ]
       , when (not cross)
-        [ haddock
-        , hpcBin
+        [ hpcBin
         , iserv
         , runGhc
         , ghcToolchainBin
@@ -281,7 +284,9 @@ defaultFlavour = Flavour
     , ghcThreaded        = const True
     , ghcDebugAssertions = const False
     , ghcSplitSections   = False
-    , ghcDocs            = cmdDocsArgs }
+    , ghcDocs            = cmdDocsArgs
+    , ghcHieFiles        = const False
+    , hashUnitIds        = False }
 
 -- | Default logic for determining whether to build
 --   dynamic GHC programs.

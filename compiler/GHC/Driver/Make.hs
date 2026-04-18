@@ -7,6 +7,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- -----------------------------------------------------------------------------
 --
@@ -17,9 +18,8 @@
 --
 -- -----------------------------------------------------------------------------
 module GHC.Driver.Make (
-        depanal, depanalE, depanalPartial, checkHomeUnitsClosed,
+        depanal, depanalE, depanalPartial,
         load, loadWithCache, load', AnyGhcDiagnostic, LoadHowMuch(..), ModIfaceCache(..), noIfaceCache, newIfaceCache,
-        instantiationNodes,
 
         downsweep,
 
@@ -27,9 +27,6 @@ module GHC.Driver.Make (
 
         ms_home_srcimps, ms_home_imps,
 
-        summariseModule,
-        SummariseResult(..),
-        summariseFile,
         hscSourceToIsBoot,
         findExtraSigImports,
         implicitRequirementsShallow,
@@ -39,7 +36,16 @@ module GHC.Driver.Make (
         IsBootInterface(..), mkNodeKey,
 
         ModNodeKey, ModNodeKeyWithUid(..),
-        ModNodeMap(..), emptyModNodeMap, modNodeMapElems, modNodeMapLookup, modNodeMapInsert, modNodeMapSingleton, modNodeMapUnionWith
+        ModNodeMap(..), emptyModNodeMap, modNodeMapElems, modNodeMapLookup, modNodeMapInsert, modNodeMapSingleton, modNodeMapUnionWith,
+
+        -- * Re-exports from Downsweep
+        checkHomeUnitsClosed,
+        summariseModule,
+        summariseModuleInterface,
+        SummariseResult(..),
+        summariseFile,
+
+        instantiationNodes,
         ) where
 
 import GHC.Prelude
@@ -52,37 +58,29 @@ import GHC.Runtime.Interpreter
 import qualified GHC.Linker.Loader as Linker
 import GHC.Linker.Types
 
-import GHC.Platform.Ways
 
-import GHC.Driver.Config.Finder (initFinderOpts)
-import GHC.Driver.Config.Parser (initParserOpts)
 import GHC.Driver.Config.Diagnostic
-import GHC.Driver.Phases
 import GHC.Driver.Pipeline
 import GHC.Driver.Session
 import GHC.Driver.DynFlags (ReexportedModule(..))
-import GHC.Driver.Backend
 import GHC.Driver.Monad
 import GHC.Driver.Env
 import GHC.Driver.Errors
 import GHC.Driver.Errors.Types
 import GHC.Driver.Main
 import GHC.Driver.MakeSem
+import GHC.Driver.Downsweep
+import GHC.Driver.MakeAction
 
-import GHC.Parser.Header
 import GHC.ByteCode.Types
 
-import GHC.Iface.Load      ( cannotFindModule )
+import GHC.Iface.Load      ( cannotFindModule, readIface )
 import GHC.IfaceToCore     ( typecheckIface )
 import GHC.Iface.Recomp    ( RecompileRequired(..), CompileReason(..) )
 
 import GHC.Data.Bag        ( listToBag )
 import GHC.Data.Graph.Directed
-import GHC.Data.FastString
 import GHC.Data.Maybe      ( expectJust )
-import GHC.Data.OsPath     ( unsafeEncodeUtf )
-import GHC.Data.StringBuffer
-import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Utils.Exception ( throwIO, SomeAsyncException )
 import GHC.Utils.Outputable
@@ -90,7 +88,6 @@ import GHC.Utils.Panic
 import GHC.Utils.Misc
 import GHC.Utils.Error
 import GHC.Utils.Logger
-import GHC.Utils.Fingerprint
 import GHC.Utils.TmpFs
 
 import GHC.Types.Basic
@@ -99,7 +96,6 @@ import GHC.Types.Target
 import GHC.Types.SourceFile
 import GHC.Types.SourceError
 import GHC.Types.SrcLoc
-import GHC.Types.Unique.Map
 import GHC.Types.PkgQual
 
 import GHC.Unit
@@ -111,44 +107,35 @@ import GHC.Unit.Module.Graph
 import GHC.Unit.Home.ModInfo
 import GHC.Unit.Module.ModDetails
 
-import Data.Either ( rights, partitionEithers, lefts )
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
-import Control.Concurrent ( newQSem, waitQSem, signalQSem, ThreadId, killThread, forkIOWithUnmask )
-import qualified GHC.Conc as CC
 import Control.Concurrent.MVar
 import Control.Monad
-import Control.Monad.Trans.Except ( ExceptT(..), runExceptT, throwE )
 import qualified Control.Monad.Catch as MC
 import Data.IORef
 import Data.Maybe
-import Data.Time
-import Data.List (sortOn, unfoldr)
-import Data.Bifunctor (first)
-import System.Directory
+import Data.List (sortOn, groupBy, sortBy)
+import qualified Data.List as List
 import System.FilePath
-import System.IO        ( fixIO )
 
-import GHC.Conc ( getNumProcessors, getNumCapabilities, setNumCapabilities )
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Reader
-import GHC.Driver.Pipeline.LogQueue
 import qualified Data.Map.Strict as M
 import GHC.Types.TypeEnv
 import Control.Monad.Trans.State.Lazy
 import Control.Monad.Trans.Class
 import GHC.Driver.Env.KnotVars
-import Control.Concurrent.STM
 import Control.Monad.Trans.Maybe
 import GHC.Runtime.Loader
-import GHC.Rename.Names
 import GHC.Utils.Constants
-import GHC.Types.Unique.DFM (udfmRestrictKeysSet)
-import GHC.Types.Unique
 import GHC.Iface.Errors.Types
+import Data.Function
+import qualified GHC.Data.Maybe as M
 
-import qualified GHC.Data.Word64Set as W
+import GHC.Data.Graph.Directed.Reachability
+import qualified GHC.Unit.Home.Graph as HUG
+import GHC.Unit.Home.PackageTable
 
 -- -----------------------------------------------------------------------------
 -- Loading the program
@@ -202,14 +189,14 @@ depanalE diag_wrapper msg excluded_mods allow_dup_roots = do
                           `unionMessages` unused_pkg_err
                           `unionMessages` unknown_module_err
 
-        all_errs <- liftIO $ unitEnv_foldWithKey one_unit_messages (return emptyMessages) (hsc_HUG hsc_env)
+        all_errs <- liftIO $ HUG.unitEnv_foldWithKey one_unit_messages (return emptyMessages) (hsc_HUG hsc_env)
         logDiagnostics (GhcDriverMessage <$> all_errs)
-        setSession hsc_env { hsc_mod_graph = mod_graph }
+        setSession (setModuleGraph mod_graph hsc_env)
         pure (emptyMessages, mod_graph)
       else do
         -- We don't have a complete module dependency graph,
         -- The graph may be disconnected and is unusable.
-        setSession hsc_env { hsc_mod_graph = emptyMG }
+        setSession (setModuleGraph emptyMG hsc_env)
         pure (errs, emptyMG)
 
 
@@ -248,63 +235,11 @@ depanalPartial diag_wrapper msg excluded_mods allow_dup_roots = do
     -- cached finder data.
     liftIO $ flushFinderCaches (hsc_FC hsc_env) (hsc_unit_env hsc_env)
 
-    (errs, graph_nodes) <- liftIO $ downsweep
+    (errs, mod_graph) <- liftIO $ downsweep
       hsc_env diag_wrapper msg (mgModSummaries old_graph)
       excluded_mods allow_dup_roots
-    let
-      mod_graph = mkModuleGraph graph_nodes
     return (unionManyMessages errs, mod_graph)
 
--- | Collect the instantiations of dependencies to create 'InstantiationNode' work graph nodes.
--- These are used to represent the type checking that is done after
--- all the free holes (sigs in current package) relevant to that instantiation
--- are compiled. This is necessary to catch some instantiation errors.
---
--- In the future, perhaps more of the work of instantiation could be moved here,
--- instead of shoved in with the module compilation nodes. That could simplify
--- backpack, and maybe hs-boot too.
-instantiationNodes :: UnitId -> UnitState -> [ModuleGraphNode]
-instantiationNodes uid unit_state = InstantiationNode uid <$> iuids_to_check
-  where
-    iuids_to_check :: [InstantiatedUnit]
-    iuids_to_check =
-      nubSort $ concatMap (goUnitId . fst) (explicitUnits unit_state)
-     where
-      goUnitId uid =
-        [ recur
-        | VirtUnit indef <- [uid]
-        , inst <- instUnitInsts indef
-        , recur <- (indef :) $ goUnitId $ moduleUnit $ snd inst
-        ]
-
--- The linking plan for each module. If we need to do linking for a home unit
--- then this function returns a graph node which depends on all the modules in the home unit.
-
--- At the moment nothing can depend on these LinkNodes.
-linkNodes :: [ModuleGraphNode] -> UnitId -> HomeUnitEnv -> Maybe (Either (Messages DriverMessage) ModuleGraphNode)
-linkNodes summaries uid hue =
-  let dflags = homeUnitEnv_dflags hue
-      ofile = outputFile_ dflags
-
-      unit_nodes :: [NodeKey]
-      unit_nodes = map mkNodeKey (filter ((== uid) . moduleGraphNodeUnitId) summaries)
-  -- Issue a warning for the confusing case where the user
-  -- said '-o foo' but we're not going to do any linking.
-  -- We attempt linking if either (a) one of the modules is
-  -- called Main, or (b) the user said -no-hs-main, indicating
-  -- that main() is going to come from somewhere else.
-  --
-      no_hs_main = gopt Opt_NoHsMain dflags
-
-      main_sum = any (== NodeKey_Module (ModNodeKeyWithUid (GWIB (mainModuleNameIs dflags) NotBoot) uid)) unit_nodes
-
-      do_linking =  main_sum || no_hs_main || ghcLink dflags == LinkDynLib || ghcLink dflags == LinkStaticLib
-
-  in if | ghcLink dflags == LinkBinary && isJust ofile && not do_linking ->
-            Just (Left $ singleMessage $ mkPlainErrorMsgEnvelope noSrcSpan (DriverRedirectedNoMain $ mainModuleNameIs dflags))
-        -- This should be an error, not a warning (#10895).
-        | ghcLink dflags /= NoLink, do_linking -> Just (Right (LinkNode unit_nodes uid))
-        | otherwise  -> Nothing
 
 -- Note [Missing home modules]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -409,8 +344,9 @@ warnUnknownModules hsc_env dflags mod_graph = do
 data LoadHowMuch
    = LoadAllTargets
      -- ^ Load all targets and its dependencies.
-   | LoadUpTo HomeUnitModule
-     -- ^ Load only the given module and its dependencies.
+   | LoadUpTo [HomeUnitModule]
+     -- ^ Load only the given modules and its dependencies.
+     -- If empty, we load none of the targets
    | LoadDependenciesOf HomeUnitModule
      -- ^ Load only the dependencies of the given module, but not the module
      -- itself.
@@ -494,7 +430,6 @@ mkBatchMsg hsc_env =
     then batchMultiMsg
     else batchMsg
 
-type AnyGhcDiagnostic = UnknownDiagnostic (DiagnosticOpts GhcMessage)
 
 loadWithCache :: GhcMonad m => Maybe ModIfaceCache -- ^ Instructions about how to cache interfaces as we create them.
                             -> (GhcMessage -> AnyGhcDiagnostic) -- ^ How to wrap error messages before they are displayed to a user.
@@ -525,13 +460,10 @@ warnUnusedPackages us dflags mod_graph =
 
     -- Only need non-source imports here because SOURCE imports are always HPT
         loadedPackages = concat $
-          mapMaybe (\(fs, mn) -> lookupModulePackage us (unLoc mn) fs)
+          mapMaybe (\(_st, fs, mn) -> lookupModulePackage us (unLoc mn) fs)
             $ concatMap ms_imps home_mod_sum
 
-        any_import_ghc_prim = any ms_ghc_prim_import home_mod_sum
-
         used_args = Set.fromList (map unitId loadedPackages)
-                      `Set.union` Set.fromList [ primUnitId |  any_import_ghc_prim ]
 
         resolve (u,mflag) = do
                   -- The units which we depend on via the command line explicitly
@@ -587,16 +519,17 @@ countMods (ResolvedCycle ns) = length ns
 countMods (UnresolvedCycle ns) = length ns
 
 -- See Note [Upsweep] for a high-level description.
-createBuildPlan :: ModuleGraph -> Maybe HomeUnitModule -> [BuildPlan]
+createBuildPlan :: ModuleGraph -> Maybe [HomeUnitModule] -> [BuildPlan]
 createBuildPlan mod_graph maybe_top_mod =
     let -- Step 1: Compute SCCs without .hi-boot files, to find the cycles
-        cycle_mod_graph = topSortModuleGraph True mod_graph maybe_top_mod
+        cycle_mod_graph   = topSortModuleGraph True  mod_graph maybe_top_mod
+        acyclic_mod_graph = topSortModuleGraph False mod_graph maybe_top_mod
 
         -- Step 2: Reanalyse loops, with relevant boot modules, to solve the cycles.
         build_plan :: [BuildPlan]
         build_plan
           -- Fast path, if there are no boot modules just do a normal toposort
-          | isEmptyModuleEnv boot_modules = collapseAcyclic $ topSortModuleGraph False mod_graph maybe_top_mod
+          | isEmptyModuleEnv boot_modules = collapseAcyclic acyclic_mod_graph
           | otherwise = toBuildPlan cycle_mod_graph []
 
         toBuildPlan :: [SCC ModuleGraphNode] -> [ModuleGraphNode] -> [BuildPlan]
@@ -610,33 +543,39 @@ createBuildPlan mod_graph maybe_top_mod =
               mresolved_cycle = collapseSCC (topSortWithBoot nodes)
           in acyclic ++ [either UnresolvedCycle ResolvedCycle mresolved_cycle] ++ toBuildPlan sccs []
 
-        (mg, lookup_node) = moduleGraphNodes False (mgModSummaries' mod_graph)
-        trans_deps_map = allReachable mg (mkNodeKey . node_payload)
         -- Compute the intermediate modules between a file and its hs-boot file.
         -- See Step 2a in Note [Upsweep]
         boot_path mn uid =
-          map (summaryNodeSummary . expectJust "toNode" . lookup_node) $ Set.toList $
+          Set.toList $
           -- Don't include the boot module itself
-          Set.delete (NodeKey_Module (key IsBoot))  $
+          Set.filter ((/= NodeKey_Module (key IsBoot)) . mkNodeKey)  $
           -- Keep intermediate dependencies: as per Step 2a in Note [Upsweep], these are
           -- the transitive dependencies of the non-boot file which transitively depend
           -- on the boot file.
-          Set.filter (\nk -> nodeKeyUnitId nk == uid  -- Cheap test
-                              && (NodeKey_Module (key IsBoot)) `Set.member` expectJust "dep_on_boot" (M.lookup nk trans_deps_map)) $
-          expectJust "not_boot_dep" (M.lookup (NodeKey_Module (key NotBoot)) trans_deps_map)
+          Set.filter (\(mkNodeKey -> nk) ->
+            nodeKeyUnitId nk == uid  -- Cheap test
+              && mgQuery mod_graph nk (NodeKey_Module (key IsBoot))) $
+          Set.fromList $
+          expectJust (mgReachable mod_graph (NodeKey_Module (key NotBoot)))
           where
             key ib = ModNodeKeyWithUid (GWIB mn ib) uid
 
 
         -- An environment mapping a module to its hs-boot file and all nodes on the path between the two, if one exists
         boot_modules = mkModuleEnv
-          [ (ms_mod ms, (m, boot_path (ms_mod_name ms) (ms_unitid ms))) | m@(ModuleNode _ ms) <- (mgModSummaries' mod_graph), isBootSummary ms == IsBoot]
+          [ (mn, (m, boot_path (moduleName mn) (moduleUnitId mn)))
+            | m@(ModuleNode _ ms) <- mgModSummaries' mod_graph
+            , let mn = moduleNodeInfoModule ms
+            , isBootModuleNodeInfo ms == IsBoot]
 
         select_boot_modules :: [ModuleGraphNode] -> [ModuleGraphNode]
         select_boot_modules = mapMaybe (fmap fst . get_boot_module)
 
         get_boot_module :: ModuleGraphNode -> Maybe (ModuleGraphNode, [ModuleGraphNode])
-        get_boot_module m = case m of ModuleNode _ ms | HsSrcFile <- ms_hsc_src ms -> lookupModuleEnv boot_modules (ms_mod ms); _ -> Nothing
+        get_boot_module (ModuleNode _ ms)
+          | NotBoot <- isBootModuleNodeInfo ms
+          = lookupModuleEnv boot_modules (moduleNodeInfoModule ms)
+        get_boot_module _ = Nothing
 
         -- Any cycles should be resolved now
         collapseSCC :: [SCC ModuleGraphNode] -> Either [ModuleGraphNode] [(Either ModuleGraphNode ModuleGraphNodeWithBootFile)]
@@ -662,37 +601,17 @@ createBuildPlan mod_graph maybe_top_mod =
         collapseAcyclic [] = []
 
         topSortWithBoot nodes = topSortModules False (select_boot_modules nodes ++ nodes) Nothing
-
-
   in
-
-    assertPpr (sum (map countMods build_plan) == length (mgModSummaries' mod_graph))
-              (vcat [text "Build plan missing nodes:", (text "PLAN:" <+> ppr (sum (map countMods build_plan))), (text "GRAPH:" <+> ppr (length (mgModSummaries' mod_graph )))])
+    -- We need to use 'acyclic_mod_graph', since if 'maybe_top_mod' is 'Just', then the resulting module
+    -- graph is pruned, reducing the number of 'build_plan' elements.
+    -- We don't use the size of 'cycle_mod_graph', as it removes @.hi-boot@ modules. These are added
+    -- later in the processing.
+    assertPpr (sum (map countMods build_plan) == lengthMGWithSCC acyclic_mod_graph)
+              (vcat [text "Build plan missing nodes:", (text "PLAN:" <+> ppr (sum (map countMods build_plan))), (text "GRAPH:" <+> ppr (lengthMGWithSCC acyclic_mod_graph))])
               build_plan
-
-mkWorkerLimit :: DynFlags -> IO WorkerLimit
-mkWorkerLimit dflags =
-  case parMakeCount dflags of
-    Nothing -> pure $ num_procs 1
-    Just (ParMakeSemaphore h) -> pure (JSemLimit (SemaphoreName h))
-    Just ParMakeNumProcessors -> num_procs <$> getNumProcessors
-    Just (ParMakeThisMany n) -> pure $ num_procs n
   where
-    num_procs x = NumProcessorsLimit (max 1 x)
-
-isWorkerLimitSequential :: WorkerLimit -> Bool
-isWorkerLimitSequential (NumProcessorsLimit x) = x <= 1
-isWorkerLimitSequential (JSemLimit {})         = False
-
--- | This describes what we use to limit the number of jobs, either we limit it
--- ourselves to a specific number or we have an external parallelism semaphore
--- limit it for us.
-data WorkerLimit
-  = NumProcessorsLimit Int
-  | JSemLimit
-    SemaphoreName
-      -- ^ Semaphore name to use
-  deriving Eq
+    lengthMGWithSCC :: [SCC a] -> Int
+    lengthMGWithSCC = List.foldl' (\acc scc -> length scc + acc) 0
 
 -- | Generalized version of 'load' which also supports a custom
 -- 'Messager' (for reporting progress) and 'ModuleGraph' (generally
@@ -703,7 +622,7 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
     -- for any client who might interact with GHC via load'.
     -- See Note [Timing of plugin initialization]
     initializeSessionPlugins
-    modifySession $ \hsc_env -> hsc_env { hsc_mod_graph = mod_graph }
+    modifySession (setModuleGraph mod_graph)
     guessOutputFile
     hsc_env <- getSession
 
@@ -727,16 +646,20 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
 
     -- check that the module given in HowMuch actually exists, otherwise
     -- topSortModuleGraph will bomb later.
-    let checkHowMuch (LoadUpTo m)           = checkMod m
-        checkHowMuch (LoadDependenciesOf m) = checkMod m
+    let checkHowMuch (LoadUpTo ms)          = checkMods ms
+        checkHowMuch (LoadDependenciesOf m) = checkMods [m]
         checkHowMuch _ = id
 
-        checkMod m and_then
-            | m `Set.member` all_home_mods = and_then
-            | otherwise = do
-                    throwOneError $ mkPlainErrorMsgEnvelope noSrcSpan
-                                  $ GhcDriverMessage
-                                  $ DriverModuleNotFound (moduleName m)
+        checkMods ms and_then =
+          case List.partition (`Set.member` all_home_mods) ms of
+            (_, []) -> and_then
+            (_, not_found_mods) -> do
+              let
+                mkModuleNotFoundError m =
+                  mkPlainErrorMsgEnvelope noSrcSpan
+                  $ GhcDriverMessage
+                  $ DriverModuleNotFound (moduleUnit m) (moduleName m)
+              throwErrors $ mkMessages $ listToBag [mkModuleNotFoundError not_found | not_found <- not_found_mods]
 
     checkHowMuch how_much $ do
 
@@ -749,12 +672,12 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
     -- are definitely unnecessary, then emit a warning.
     warnUnnecessarySourceImports (filterToposortToModules mg2_with_srcimps)
 
-    let maybe_top_mod = case how_much of
+    let maybe_top_mods = case how_much of
                           LoadUpTo m           -> Just m
-                          LoadDependenciesOf m -> Just m
+                          LoadDependenciesOf m -> Just [m]
                           _                    -> Nothing
 
-        build_plan = createBuildPlan mod_graph maybe_top_mod
+        build_plan = createBuildPlan mod_graph maybe_top_mods
 
 
     cache <- liftIO $ maybe (return []) iface_clearCache mhmi_cache
@@ -762,15 +685,20 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
         -- prune the HPT so everything is not retained when doing an
         -- upsweep.
         !pruned_cache = pruneCache cache
-                            (flattenSCCs (filterToposortToModules  mg2_with_srcimps))
+                            [ms | (ModuleNodeCompile ms) <- (flattenSCCs (filterToposortToModules  mg2_with_srcimps))]
+
 
 
     -- before we unload anything, make sure we don't leave an old
     -- interactive context around pointing to dead bindings.  Also,
     -- write an empty HPT to allow the old HPT to be GC'd.
 
-    let pruneHomeUnitEnv hme = hme { homeUnitEnv_hpt = emptyHomePackageTable }
-    setSession $ discardIC $ hscUpdateHUG (unitEnv_map pruneHomeUnitEnv) hsc_env
+    let pruneHomeUnitEnv hme = do
+          emptyHPT <- liftIO emptyHomePackageTable
+          pure $! hme{ homeUnitEnv_hpt = emptyHPT }
+    hug' <- traverse pruneHomeUnitEnv (ue_home_unit_graph $ hsc_unit_env hsc_env)
+    let ue' = (hsc_unit_env hsc_env){ ue_home_unit_graph = hug' }
+    setSession $ discardIC hsc_env{hsc_unit_env = ue' }
     hsc_env <- getSession
 
     -- Unload everything
@@ -784,7 +712,10 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
     (upsweep_ok, new_deps) <- withDeferredDiagnostics $ do
       hsc_env <- getSession
       liftIO $ upsweep worker_limit hsc_env mhmi_cache diag_wrapper mHscMessage (toCache pruned_cache) build_plan
-    modifySession (addDepsToHscEnv new_deps)
+
+    -- At this point, all the HPT variables will be populated, but we don't want
+    -- to leak the contents of a failed session.
+    liftIO $ restrictDepsHscEnv new_deps hsc_env
     case upsweep_ok of
       Failed -> loadFinish upsweep_ok
       Succeeded -> do
@@ -809,13 +740,13 @@ guessOutputFile = modifySession $ \env ->
     -- Force mod_graph to avoid leaking env
     let !mod_graph = hsc_mod_graph env
         new_home_graph =
-          flip unitEnv_map (hsc_HUG env) $ \hue ->
+          flip fmap (hsc_HUG env) $ \hue ->
             let dflags = homeUnitEnv_dflags hue
                 platform = targetPlatform dflags
                 mainModuleSrcPath :: Maybe String
                 mainModuleSrcPath = do
                   ms <- mgLookupModule mod_graph (mainModIs hue)
-                  ml_hs_file (ms_location ms)
+                  ml_hs_file (moduleNodeInfoLocation ms)
                 name = fmap dropExtension mainModuleSrcPath
 
                 -- MP: This exception is quite sensitive to being forced, if you
@@ -871,10 +802,10 @@ pruneCache hpt summ
            modl = miKey iface
            linkable'
                 | Just ms <- M.lookup modl ms_map
-                , mi_src_hash iface /= ms_hs_hash ms
-                = emptyHomeModInfoLinkable
-                | otherwise
+                , mi_src_hash iface == Just (ms_hs_hash ms)
                 = linkable
+                | otherwise
+                = emptyHomeModInfoLinkable
 
         -- Using UFM Module is safe for determinism because the map is just used for a transient lookup. The cache should be unique and a key clash is an error.
         ms_map = M.fromListWith
@@ -1021,7 +952,7 @@ waitResult :: ResultVar a -> MaybeT IO a
 waitResult (ResultVar f var) = MaybeT (fmap f <$> readMVar var)
 
 data BuildResult = BuildResult { _resultOrigin :: ResultOrigin
-                               , resultVar    :: ResultVar (Maybe HomeModInfo, ModuleNameSet)
+                               , resultVar    :: ResultVar (Maybe HomeModInfo)
                                }
 
 -- The origin of this result var, useful for debugging
@@ -1029,7 +960,7 @@ data ResultOrigin = NoLoop | Loop ResultLoopOrigin deriving (Show)
 
 data ResultLoopOrigin = Initialise | Rehydrated | Finalised deriving (Show)
 
-mkBuildResult :: ResultOrigin -> ResultVar (Maybe HomeModInfo, ModuleNameSet) -> BuildResult
+mkBuildResult :: ResultOrigin -> ResultVar (Maybe HomeModInfo) -> BuildResult
 mkBuildResult = BuildResult
 
 
@@ -1038,9 +969,6 @@ data BuildLoopState = BuildLoopState { buildDep :: M.Map NodeKey BuildResult
                                           -- the appropriate result of compiling a module  but with
                                           -- cycles there can be additional indirection and can point to the result of typechecking a loop
                                      , nNODE :: Int
-                                     , hug_var :: MVar HomeUnitGraph
-                                     -- A global variable which is incrementally updated with the result
-                                     -- of compiling modules.
                                      }
 
 nodeId :: BuildM Int
@@ -1061,26 +989,12 @@ getBuildMap = gets buildDep
 
 getDependencies :: [NodeKey] -> BuildMap -> [BuildResult]
 getDependencies direct_deps build_map =
-  strictMap (expectJust "dep_map" . flip M.lookup build_map) direct_deps
+  strictMap (expectJust . flip M.lookup build_map) direct_deps
 
 type BuildM a = StateT BuildLoopState IO a
 
 
 
-
--- | Environment used when compiling a module
-data MakeEnv = MakeEnv { hsc_env :: !HscEnv -- The basic HscEnv which will be augmented for each module
-                       , compile_sem :: !AbstractSem
-                       -- Modify the environment for module k, with the supplied logger modification function.
-                       -- For -j1, this wrapper doesn't do anything
-                       -- For -jn, the wrapper initialised a log queue and then modifies the logger to pipe its output
-                       --          into the log queue.
-                       , withLogger :: forall a . Int -> ((Logger -> Logger) -> IO a) -> IO a
-                       , env_messager :: !(Maybe Messager)
-                       , diag_wrapper :: GhcMessage -> AnyGhcDiagnostic
-                       }
-
-type RunMakeM a = ReaderT MakeEnv (MaybeT IO) a
 
 -- | Given the build plan, creates a graph which indicates where each NodeKey should
 -- get its direct dependencies from. This might not be the corresponding build action
@@ -1094,18 +1008,26 @@ interpretBuildPlan :: HomeUnitGraph
                          , [MakeAction] -- Actions we need to run in order to build everything
                          , IO [Maybe (Maybe HomeModInfo)]) -- An action to query to get all the built modules at the end.
 interpretBuildPlan hug mhmi_cache old_hpt plan = do
-  hug_var <- newMVar hug
-  ((mcycle, plans), build_map) <- runStateT (buildLoop plan) (BuildLoopState M.empty 1 hug_var)
+  ((mcycle, plans), build_map) <- runStateT (buildLoop plan) (BuildLoopState M.empty 1)
   let wait = collect_results (buildDep build_map)
   return (mcycle, plans, wait)
 
   where
     collect_results build_map =
-      sequence (map (\br -> collect_result (fst <$> resultVar br)) (M.elems build_map))
+      sequence (map (\br -> collect_result (resultVar br)) (M.elems build_map))
       where
         collect_result res_var = runMaybeT (waitResult res_var)
 
-    n_mods = sum (map countMods plan)
+    -- Just used for an assertion
+    count_mods :: BuildPlan -> Int
+    count_mods (SingleModule m) = count_m m
+    count_mods (ResolvedCycle ns) = length ns
+    count_mods (UnresolvedCycle ns) = length ns
+
+    count_m (UnitNode {}) = 0
+    count_m _ = 1
+
+    n_mods = sum (map count_mods plan)
 
     buildLoop :: [BuildPlan]
               -> BuildM (Maybe [ModuleGraphNode], [MakeAction])
@@ -1136,40 +1058,41 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
                       -> ModuleGraphNode          -- The node we are compiling
                       -> BuildM MakeAction
     buildSingleModule rehydrate_nodes origin mod = do
-      mod_idx <- nodeId
       !build_map <- getBuildMap
-      hug_var <- gets hug_var
       -- 1. Get the direct dependencies of this module
-      let direct_deps = nodeDependencies False mod
+      let direct_deps = mgNodeDependencies False mod
           -- It's really important to force build_deps, or the whole buildMap is retained,
           -- which would retain all the result variables, preventing us from collecting them
           -- after they are no longer used.
           !build_deps = getDependencies direct_deps build_map
-      let !build_action =
+      !build_action <-
             case mod of
               InstantiationNode uid iu -> do
-                withCurrentUnit (moduleGraphNodeUnitId mod) $ do
-                  (hug, deps) <- wait_deps_hug hug_var build_deps
+                mod_idx <- nodeId
+                return $ withCurrentUnit (mgNodeUnitId mod) $ do
+                  !_ <- wait_deps build_deps
                   executeInstantiationNode mod_idx n_mods hug uid iu
-                  return (Nothing, deps)
-              ModuleNode _build_deps ms ->
-                let !old_hmi = M.lookup (msKey ms) old_hpt
+                  return Nothing
+              ModuleNode _build_deps ms -> do
+                let !old_hmi = M.lookup (mnKey ms) old_hpt
                     rehydrate_mods = mapMaybe nodeKeyModName <$> rehydrate_nodes
-                in withCurrentUnit (moduleGraphNodeUnitId mod) $ do
-                     (hug, deps) <- wait_deps_hug hug_var build_deps
+                mod_idx <- nodeId
+                return $ withCurrentUnit (mgNodeUnitId mod) $ do
+                     !_ <- wait_deps build_deps
                      hmi <- executeCompileNode mod_idx n_mods old_hmi hug rehydrate_mods ms
                      -- Write the HMI to an external cache (if one exists)
                      -- See Note [Caching HomeModInfo]
                      liftIO $ forM mhmi_cache $ \hmi_cache -> addHmiToCache hmi_cache hmi
-                     -- This global MVar is incrementally modified in order to avoid having to
-                     -- recreate the HPT before compiling each module which leads to a quadratic amount of work.
-                     liftIO $ modifyMVar_ hug_var (return . addHomeModInfoToHug hmi)
-                     return (Just hmi, addToModuleNameSet (moduleGraphNodeUnitId mod) (ms_mod_name ms) deps )
+                     -- Make sure the result is written to the HPT var
+                     liftIO $ HUG.addHomeModInfoToHug hmi hug
+                     return (Just hmi)
               LinkNode _nks uid -> do
-                  withCurrentUnit (moduleGraphNodeUnitId mod) $ do
-                    (hug, deps) <- wait_deps_hug hug_var build_deps
+                  mod_idx <- nodeId
+                  return $ withCurrentUnit (mgNodeUnitId mod) $ do
+                    !_ <- wait_deps build_deps
                     executeLinkNode hug (mod_idx, n_mods) uid direct_deps
-                    return (Nothing, deps)
+                    return Nothing
+              UnitNode {} -> return $ return Nothing
 
 
       res_var <- liftIO newEmptyMVar
@@ -1201,28 +1124,26 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
     -- An action which rehydrates the given keys
     rehydrateAction :: ResultLoopOrigin -> [GenWithIsBoot NodeKey] -> BuildM MakeAction
     rehydrateAction origin deps = do
-      hug_var <- gets hug_var
       !build_map <- getBuildMap
       res_var <- liftIO newEmptyMVar
       let loop_unit :: UnitId
           !loop_unit = nodeKeyUnitId (gwib_mod (head deps))
           !build_deps = getDependencies (map gwib_mod deps) build_map
       let loop_action = withCurrentUnit loop_unit $ do
-            (hug, tdeps) <- wait_deps_hug hug_var build_deps
+            !_ <- wait_deps build_deps
             hsc_env <- asks hsc_env
-            let new_hsc = setHUG hug hsc_env
-                mns :: [ModuleName]
+            let mns :: [ModuleName]
                 mns = mapMaybe (nodeKeyModName . gwib_mod) deps
 
-            hmis' <- liftIO $ rehydrateAfter new_hsc mns
+            hmis' <- liftIO $ rehydrateAfter hsc_env mns
 
             checkRehydrationInvariant hmis' deps
 
             -- Add hydrated interfaces to global variable
-            liftIO $ modifyMVar_ hug_var (\hug -> return $ foldr addHomeModInfoToHug hug hmis')
-            return (hmis', tdeps)
+            liftIO $ mapM_ (\hmi -> HUG.addHomeModInfoToHug hmi hug) hmis'
+            return hmis'
 
-      let fanout i = first (Just . (!! i)) <$> mkResultVar res_var
+      let fanout i = Just . (!! i) <$> mkResultVar res_var
       -- From outside the module loop, anyone must wait for the loop to finish and then
       -- use the result of the rehydrated iface. This makes sure that things not in the
       -- module loop will see the updated interfaces for all the identifiers in the loop.
@@ -1283,9 +1204,6 @@ upsweep n_jobs hsc_env hmi_cache diag_wrapper mHscMessage old_hpt build_plan = d
 toCache :: [HomeModInfo] -> M.Map (ModNodeKeyWithUid) HomeModInfo
 toCache hmis = M.fromList ([(miKey $ hm_iface hmi, hmi) | hmi <- hmis])
 
-miKey :: ModIface -> ModNodeKeyWithUid
-miKey hmi = ModNodeKeyWithUid (mi_mnwib hmi) ((toUnitId $ moduleUnit (mi_module hmi)))
-
 upsweep_inst :: HscEnv
              -> Maybe Messager
              -> Int  -- index of module
@@ -1320,7 +1238,8 @@ upsweep_mod hsc_env mHscMessage old_hmi summary mod_index nmods =  do
   -- used to only happen with the bytecode backend, but with
   -- @-fprefer-byte-code@, @HomeModInfo@ has bytecode even when generating
   -- object code, see #25230.
-  addSptEntries (hscUpdateHPT (\hpt -> addToHpt hpt (ms_mod_name summary) hmi) hsc_env)
+  hscInsertHPT hmi hsc_env
+  addSptEntries (hsc_env)
                 (homeModInfoByteCode hmi)
 
   return hmi
@@ -1336,70 +1255,6 @@ addSptEntries hsc_env mlinkable =
      , spt <- bc_spt_entries bco
      ]
 
-{- Note [-fno-code mode]
-~~~~~~~~~~~~~~~~~~~~~~~~
-GHC offers the flag -fno-code for the purpose of parsing and typechecking a
-program without generating object files. This is intended to be used by tooling
-and IDEs to provide quick feedback on any parser or type errors as cheaply as
-possible.
-
-When GHC is invoked with -fno-code no object files or linked output will be
-generated. As many errors and warnings as possible will be generated, as if
--fno-code had not been passed. The session DynFlags will have
-backend == NoBackend.
-
--fwrite-interface
-~~~~~~~~~~~~~~~~
-Whether interface files are generated in -fno-code mode is controlled by the
--fwrite-interface flag. The -fwrite-interface flag is a no-op if -fno-code is
-not also passed. Recompilation avoidance requires interface files, so passing
--fno-code without -fwrite-interface should be avoided. If -fno-code were
-re-implemented today, -fwrite-interface would be discarded and it would be
-considered always on; this behaviour is as it is for backwards compatibility.
-
-================================================================
-IN SUMMARY: ALWAYS PASS -fno-code AND -fwrite-interface TOGETHER
-================================================================
-
-Template Haskell
-~~~~~~~~~~~~~~~~
-A module using template haskell may invoke an imported function from inside a
-splice. This will cause the type-checker to attempt to execute that code, which
-would fail if no object files had been generated. See #8025. To rectify this,
-during the downsweep we patch the DynFlags in the ModSummary of any home module
-that is imported by a module that uses template haskell, to generate object
-code.
-
-The flavour of the generated code depends on whether `-fprefer-byte-code` is enabled
-or not in the module which needs the code generation. If the module requires byte-code then
-dependencies will generate byte-code, otherwise they will generate object files.
-In the case where some modules require byte-code and some object files, both are
-generated by enabling `-fbyte-code-and-object-code`, the test "fat015" tests these
-configurations.
-
-The object files (and interface files if -fwrite-interface is disabled) produced
-for template haskell are written to temporary files.
-
-Note that since template haskell can run arbitrary IO actions, -fno-code mode
-is no more secure than running without it.
-
-Potential TODOS:
-~~~~~
-* Remove -fwrite-interface and have interface files always written in -fno-code
-  mode
-* Both .o and .dyn_o files are generated for template haskell, but we only need
-  .dyn_o. Fix it.
-* In make mode, a message like
-  Compiling A (A.hs, /tmp/ghc_123.o)
-  is shown if downsweep enabled object code generation for A. Perhaps we should
-  show "nothing" or "temporary object file" instead. Note that one
-  can currently use -keep-tmp-files and inspect the generated file with the
-  current behaviour.
-* Offer a -no-codedir command line option, and write what were temporary
-  object files there. This would speed up recompilation.
-* Use existing object files (if they are up to date) instead of always
-  generating temporary ones.
--}
 
 -- Note [When source is considered modified]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1456,7 +1311,7 @@ topSortModuleGraph
           :: Bool
           -- ^ Drop hi-boot nodes? (see below)
           -> ModuleGraph
-          -> Maybe HomeUnitModule
+          -> Maybe [HomeUnitModule]
              -- ^ Root module name.  If @Nothing@, use the full graph.
           -> [SCC ModuleGraphNode]
 -- ^ Calculate SCCs of the module graph, possibly dropping the hi-boot nodes
@@ -1474,11 +1329,39 @@ topSortModuleGraph
 --              the a source-import of Foo is an import of Foo
 --              The resulting graph has no hi-boot nodes, but can be cyclic
 topSortModuleGraph drop_hs_boot_nodes module_graph mb_root_mod =
-    -- stronglyConnCompG flips the original order, so if we reverse
-    -- the summaries we get a stable topological sort.
-  topSortModules drop_hs_boot_nodes (reverse $ mgModSummaries' module_graph) mb_root_mod
+  topSortModules drop_hs_boot_nodes
+    (sortBy (cmpModuleGraphNodes `on` mkNodeKey) $ mgModSummaries' module_graph)
+    mb_root_mod
 
-topSortModules :: Bool -> [ModuleGraphNode] -> Maybe HomeUnitModule -> [SCC ModuleGraphNode]
+
+  where
+    -- In order to get the "right" ordering
+    --    Module nodes must be in reverse lexigraphic order.
+    --    All modules nodes must appear before package nodes.
+    --
+    -- MP: This is just the ordering which the tests needed in Jan 2025, it does
+    --     not arise from nature.
+    --
+    -- Given the current implementation of scc, the result is in
+    -- The order is sensitive to the internal implementation in Data.Graph,
+    -- if it changes in future then this ordering will need to be modified.
+    --
+    -- The SCC algorithm firstly transposes the input graph and then
+    -- performs dfs on the vertices in the order which they are originally given.
+    -- Therefore, if `ExternalUnit` nodes are first, the order returned will
+    -- be determined by the order the dependencies are stored in the transposed graph.
+    moduleGraphNodeRank :: NodeKey -> Int
+    moduleGraphNodeRank k =
+      case k of
+        NodeKey_Unit {}         -> 0
+        NodeKey_Module {}       -> 1
+        NodeKey_Link {}         -> 2
+        NodeKey_ExternalUnit {} -> 3
+
+    cmpModuleGraphNodes k1 k2 = compare (moduleGraphNodeRank k1) (moduleGraphNodeRank k2)
+                                  `mappend` compare k2 k1
+
+topSortModules :: Bool -> [ModuleGraphNode] -> Maybe [HomeUnitModule] -> [SCC ModuleGraphNode]
 topSortModules drop_hs_boot_nodes summaries mb_root_mod
   = map (fmap summaryNodeSummary) $ stronglyConnCompG initial_graph
   where
@@ -1487,17 +1370,20 @@ topSortModules drop_hs_boot_nodes summaries mb_root_mod
 
     initial_graph = case mb_root_mod of
         Nothing -> graph
-        Just (Module uid root_mod) ->
+        Just mods ->
             -- restrict the graph to just those modules reachable from
             -- the specified module.  We do this by building a graph with
             -- the full set of nodes, and determining the reachable set from
             -- the specified node.
-            let root | Just node <- lookup_node $ NodeKey_Module $ ModNodeKeyWithUid (GWIB root_mod NotBoot) uid
-                     , graph `hasVertexG` node
-                     = node
-                     | otherwise
-                     = throwGhcException (ProgramError "module does not exist")
-            in graphFromEdgedVerticesUniq (seq root (reachableG graph root))
+            let
+              findNodeForModule (Module uid root_mod)
+                | Just node <- lookup_node $ NodeKey_Module $ ModNodeKeyWithUid (GWIB root_mod NotBoot) uid
+                , graph `hasVertexG` node
+                = seq node node
+                | otherwise
+                = throwGhcException (ProgramError "module does not exist")
+              roots = fmap findNodeForModule mods
+            in graphFromEdgedVerticesUniq (seq roots (roots ++ allReachableMany (graphReachability graph) roots))
 
 newtype ModNodeMap a = ModNodeMap { unModNodeMap :: Map.Map ModNodeKey a }
   deriving (Functor, Traversable, Foldable)
@@ -1524,897 +1410,19 @@ modNodeMapUnionWith f (ModNodeMap m) (ModNodeMap n) = ModNodeMap (M.unionWith f 
 -- components in the topological sort, then those imports can
 -- definitely be replaced by ordinary non-SOURCE imports: if SOURCE
 -- were necessary, then the edge would be part of a cycle.
-warnUnnecessarySourceImports :: GhcMonad m => [SCC ModSummary] -> m ()
+warnUnnecessarySourceImports :: GhcMonad m => [SCC ModuleNodeInfo] -> m ()
 warnUnnecessarySourceImports sccs = do
   diag_opts <- initDiagOpts <$> getDynFlags
   when (diag_wopt Opt_WarnUnusedImports diag_opts) $ do
     let check ms =
-           let mods_in_this_cycle = map ms_mod_name ms in
-           [ warn i | m <- ms, i <- ms_home_srcimps m,
+           let mods_in_this_cycle = map moduleNodeInfoModuleName ms in
+           [ warn i | (ModuleNodeCompile m) <- ms, i <- ms_home_srcimps m,
                       unLoc i `notElem`  mods_in_this_cycle ]
 
         warn :: Located ModuleName -> MsgEnvelope GhcMessage
         warn (L loc mod) = GhcDriverMessage <$> mkPlainMsgEnvelope diag_opts
                                                   loc (DriverUnnecessarySourceImports mod)
     logDiagnostics (mkMessages $ listToBag (concatMap (check . flattenSCC) sccs))
-
-
--- This caches the answer to the question, if we are in this unit, what does
--- an import of this module mean.
-type DownsweepCache = M.Map (UnitId, PkgQual, ModuleNameWithIsBoot) [Either DriverMessages ModSummary]
-
------------------------------------------------------------------------------
---
--- | Downsweep (dependency analysis)
---
--- Chase downwards from the specified root set, returning summaries
--- for all home modules encountered.  Only follow source-import
--- links.
---
--- We pass in the previous collection of summaries, which is used as a
--- cache to avoid recalculating a module summary if the source is
--- unchanged.
---
--- The returned list of [ModSummary] nodes has one node for each home-package
--- module, plus one for any hs-boot files.  The imports of these nodes
--- are all there, including the imports of non-home-package modules.
-downsweep :: HscEnv
-          -> (GhcMessage -> AnyGhcDiagnostic)
-          -> Maybe Messager
-          -> [ModSummary]
-          -- ^ Old summaries
-          -> [ModuleName]       -- Ignore dependencies on these; treat
-                                -- them as if they were package modules
-          -> Bool               -- True <=> allow multiple targets to have
-                                --          the same module name; this is
-                                --          very useful for ghc -M
-          -> IO ([DriverMessages], [ModuleGraphNode])
-                -- The non-error elements of the returned list all have distinct
-                -- (Modules, IsBoot) identifiers, unless the Bool is true in
-                -- which case there can be repeats
-downsweep hsc_env diag_wrapper msg old_summaries excl_mods allow_dup_roots = do
-  n_jobs <- mkWorkerLimit (hsc_dflags hsc_env)
-  new <- rootSummariesParallel n_jobs hsc_env diag_wrapper msg summary
-  downsweep_imports hsc_env old_summary_map excl_mods allow_dup_roots new
-  where
-    summary = getRootSummary excl_mods old_summary_map
-
-    -- A cache from file paths to the already summarised modules. The same file
-    -- can be used in multiple units so the map is also keyed by which unit the
-    -- file was used in.
-    -- Reuse these if we can because the most expensive part of downsweep is
-    -- reading the headers.
-    old_summary_map :: M.Map (UnitId, FilePath) ModSummary
-    old_summary_map =
-      M.fromList [((ms_unitid ms, msHsFilePath ms), ms) | ms <- old_summaries]
-
-downsweep_imports :: HscEnv
-                  -> M.Map (UnitId, FilePath) ModSummary
-                  -> [ModuleName]
-                  -> Bool
-                  -> ([(UnitId, DriverMessages)], [ModSummary])
-                  -> IO ([DriverMessages], [ModuleGraphNode])
-downsweep_imports hsc_env old_summaries excl_mods allow_dup_roots (root_errs, rootSummariesOk)
-   = do
-       let root_map = mkRootMap rootSummariesOk
-       checkDuplicates root_map
-       (deps, map0) <- loopSummaries rootSummariesOk (M.empty, root_map)
-       let closure_errs = checkHomeUnitsClosed unit_env
-           unit_env = hsc_unit_env hsc_env
-           tmpfs    = hsc_tmpfs    hsc_env
-
-           downsweep_errs = lefts $ concat $ M.elems map0
-           downsweep_nodes = M.elems deps
-
-           (other_errs, unit_nodes) = partitionEithers $ unitEnv_foldWithKey (\nodes uid hue -> nodes ++ unitModuleNodes downsweep_nodes uid hue) [] (hsc_HUG hsc_env)
-           all_nodes = downsweep_nodes ++ unit_nodes
-           all_errs  = all_root_errs ++  downsweep_errs ++ other_errs
-           all_root_errs =  closure_errs ++ map snd root_errs
-
-       -- if we have been passed -fno-code, we enable code generation
-       -- for dependencies of modules that have -XTemplateHaskell,
-       -- otherwise those modules will fail to compile.
-       -- See Note [-fno-code mode] #8025
-       th_enabled_nodes <- enableCodeGenForTH logger tmpfs unit_env all_nodes
-       if null all_root_errs
-         then return (all_errs, th_enabled_nodes)
-         else pure $ (all_root_errs, [])
-     where
-        -- Dependencies arising on a unit (backpack and module linking deps)
-        unitModuleNodes :: [ModuleGraphNode] -> UnitId -> HomeUnitEnv -> [Either (Messages DriverMessage) ModuleGraphNode]
-        unitModuleNodes summaries uid hue =
-          let instantiation_nodes = instantiationNodes uid (homeUnitEnv_units hue)
-          in map Right instantiation_nodes
-              ++ maybeToList (linkNodes (instantiation_nodes ++ summaries) uid hue)
-
-        calcDeps ms =
-          -- Add a dependency on the HsBoot file if it exists
-          -- This gets passed to the loopImports function which just ignores it if it
-          -- can't be found.
-          [(ms_unitid ms, NoPkgQual, GWIB (noLoc $ ms_mod_name ms) IsBoot) | NotBoot <- [isBootSummary ms] ] ++
-          [(ms_unitid ms, b, c) | (b, c) <- msDeps ms ]
-
-        logger = hsc_logger hsc_env
-
-        -- In a root module, the filename is allowed to diverge from the module
-        -- name, so we have to check that there aren't multiple root files
-        -- defining the same module (otherwise the duplicates will be silently
-        -- ignored, leading to confusing behaviour).
-        checkDuplicates
-          :: DownsweepCache
-          -> IO ()
-        checkDuplicates root_map
-           | allow_dup_roots = return ()
-           | null dup_roots  = return ()
-           | otherwise       = liftIO $ multiRootsErr (head dup_roots)
-           where
-             dup_roots :: [[ModSummary]]        -- Each at least of length 2
-             dup_roots = filterOut isSingleton $ map rights (M.elems root_map)
-
-        -- This loops over all the mod summaries in the dependency graph, accumulates the actual dependencies for each module/unit
-        loopSummaries :: [ModSummary]
-              -> (M.Map NodeKey ModuleGraphNode,
-                    DownsweepCache)
-              -> IO ((M.Map NodeKey ModuleGraphNode), DownsweepCache)
-        loopSummaries [] done = return done
-        loopSummaries (ms:next) (done, summarised)
-          | Just {} <- M.lookup k done
-          = loopSummaries next (done, summarised)
-          -- Didn't work out what the imports mean yet, now do that.
-          | otherwise = do
-             (final_deps, done', summarised') <- loopImports (calcDeps ms) done summarised
-             -- This has the effect of finding a .hs file if we are looking at the .hs-boot file.
-             (_, done'', summarised'') <- loopImports (maybeToList hs_file_for_boot) done' summarised'
-             loopSummaries next (M.insert k (ModuleNode final_deps ms) done'', summarised'')
-          where
-            k = NodeKey_Module (msKey ms)
-
-            hs_file_for_boot
-              | HsBootFile <- ms_hsc_src ms
-              = Just $ ((ms_unitid ms), NoPkgQual, (GWIB (noLoc $ ms_mod_name ms) NotBoot))
-              | otherwise
-              = Nothing
-
-
-        -- This loops over each import in each summary. It is mutually recursive with loopSummaries if we discover
-        -- a new module by doing this.
-        loopImports :: [(UnitId, PkgQual, GenWithIsBoot (Located ModuleName))]
-                        -- Work list: process these modules
-             -> M.Map NodeKey ModuleGraphNode
-             -> DownsweepCache
-                        -- Visited set; the range is a list because
-                        -- the roots can have the same module names
-                        -- if allow_dup_roots is True
-             -> IO ([NodeKey],
-                  M.Map NodeKey ModuleGraphNode, DownsweepCache)
-                        -- The result is the completed NodeMap
-        loopImports [] done summarised = return ([], done, summarised)
-        loopImports ((home_uid,mb_pkg, gwib) : ss) done summarised
-          | Just summs <- M.lookup cache_key summarised
-          = case summs of
-              [Right ms] -> do
-                let nk = NodeKey_Module (msKey ms)
-                (rest, summarised', done') <- loopImports ss done summarised
-                return (nk: rest, summarised', done')
-              [Left _err] ->
-                loopImports ss done summarised
-              _errs ->  do
-                loopImports ss done summarised
-          | otherwise
-          = do
-               mb_s <- summariseModule hsc_env home_unit old_summaries
-                                       is_boot wanted_mod mb_pkg
-                                       Nothing excl_mods
-               case mb_s of
-                   NotThere -> loopImports ss done summarised
-                   External _ -> do
-                    (other_deps, done', summarised') <- loopImports ss done summarised
-                    return (other_deps, done', summarised')
-                   FoundInstantiation iud -> do
-                    (other_deps, done', summarised') <- loopImports ss done summarised
-                    return (NodeKey_Unit iud : other_deps, done', summarised')
-                   FoundHomeWithError (_uid, e) ->  loopImports ss done (Map.insert cache_key [(Left e)] summarised)
-                   FoundHome s -> do
-                     (done', summarised') <-
-                       loopSummaries [s] (done, Map.insert cache_key [Right s] summarised)
-                     (other_deps, final_done, final_summarised) <- loopImports ss done' summarised'
-
-                     -- MP: This assumes that we can only instantiate non home units, which is probably fair enough for now.
-                     return (NodeKey_Module (msKey s) : other_deps, final_done, final_summarised)
-          where
-            cache_key = (home_uid, mb_pkg, unLoc <$> gwib)
-            home_unit = ue_unitHomeUnit home_uid (hsc_unit_env hsc_env)
-            GWIB { gwib_mod = L loc mod, gwib_isBoot = is_boot } = gwib
-            wanted_mod = L loc mod
-
-getRootSummary ::
-  [ModuleName] ->
-  M.Map (UnitId, FilePath) ModSummary ->
-  HscEnv ->
-  Target ->
-  IO (Either (UnitId, DriverMessages) ModSummary)
-getRootSummary excl_mods old_summary_map hsc_env target
-  | TargetFile file mb_phase <- targetId
-  = do
-    let offset_file = augmentByWorkingDirectory dflags file
-    exists <- liftIO $ doesFileExist offset_file
-    if exists || isJust maybe_buf
-    then first (uid,) <$>
-         summariseFile hsc_env home_unit old_summary_map offset_file mb_phase
-         maybe_buf
-    else
-      return $ Left $ (uid,) $ singleMessage $
-      mkPlainErrorMsgEnvelope noSrcSpan (DriverFileNotFound offset_file)
-  | TargetModule modl <- targetId
-  = do
-    maybe_summary <- summariseModule hsc_env home_unit old_summary_map NotBoot
-                     (L rootLoc modl) (ThisPkg (homeUnitId home_unit))
-                     maybe_buf excl_mods
-    pure case maybe_summary of
-      FoundHome s  -> Right s
-      FoundHomeWithError err -> Left err
-      _ -> Left (uid, moduleNotFoundErr modl)
-    where
-      Target {targetId, targetContents = maybe_buf, targetUnitId = uid} = target
-      home_unit = ue_unitHomeUnit uid (hsc_unit_env hsc_env)
-      rootLoc = mkGeneralSrcSpan (fsLit "<command line>")
-      dflags = homeUnitEnv_dflags (ue_findHomeUnitEnv uid (hsc_unit_env hsc_env))
-
--- | Execute 'getRootSummary' for the 'Target's using the parallelism pipeline
--- system.
--- Create bundles of 'Target's wrapped in a 'MakeAction' that uses
--- 'withAbstractSem' to wait for a free slot, limiting the number of
--- concurrently computed summaries to the value of the @-j@ option or the slots
--- allocated by the job server, if that is used.
---
--- The 'MakeAction' returns 'Maybe', which is not handled as an error, because
--- 'runLoop' only sets it to 'Nothing' when an exception was thrown, so the
--- result won't be read anyway here.
---
--- To emulate the current behavior, we funnel exceptions past the concurrency
--- barrier and rethrow the first one afterwards.
-rootSummariesParallel ::
-  WorkerLimit ->
-  HscEnv ->
-  (GhcMessage -> AnyGhcDiagnostic) ->
-  Maybe Messager ->
-  (HscEnv -> Target -> IO (Either (UnitId, DriverMessages) ModSummary)) ->
-  IO ([(UnitId, DriverMessages)], [ModSummary])
-rootSummariesParallel n_jobs hsc_env diag_wrapper msg get_summary = do
-  (actions, get_results) <- unzip <$> mapM action_and_result (zip [1..] bundles)
-  runPipelines n_jobs hsc_env diag_wrapper msg actions
-  (sequence . catMaybes <$> sequence get_results) >>= \case
-    Right results -> pure (partitionEithers (concat results))
-    Left exc -> throwIO exc
-  where
-    bundles = mk_bundles targets
-
-    mk_bundles = unfoldr \case
-      [] -> Nothing
-      ts -> Just (splitAt bundle_size ts)
-
-    bundle_size = 20
-
-    targets = hsc_targets hsc_env
-
-    action_and_result (log_queue_id, ts) = do
-      res_var <- liftIO newEmptyMVar
-      pure $! (MakeAction (action log_queue_id ts) res_var, readMVar res_var)
-
-    action log_queue_id target_bundle = do
-      env@MakeEnv {compile_sem} <- ask
-      lift $ lift $
-        withAbstractSem compile_sem $
-        withLoggerHsc log_queue_id env \ lcl_hsc_env ->
-          MC.try (mapM (get_summary lcl_hsc_env) target_bundle) >>= \case
-            Left e | Just (_ :: SomeAsyncException) <- fromException e ->
-              throwIO e
-            a -> pure a
-
--- | This function checks then important property that if both p and q are home units
--- then any dependency of p, which transitively depends on q is also a home unit.
---
--- See Note [Multiple Home Units], section 'Closure Property'.
-checkHomeUnitsClosed ::  UnitEnv -> [DriverMessages]
-checkHomeUnitsClosed ue
-    | Set.null bad_unit_ids = []
-    | otherwise = [singleMessage $ mkPlainErrorMsgEnvelope rootLoc $ DriverHomePackagesNotClosed (Set.toList bad_unit_ids)]
-  where
-    home_id_set = unitEnv_keys $ ue_home_unit_graph ue
-    bad_unit_ids = upwards_closure Set.\\ home_id_set
-    rootLoc = mkGeneralSrcSpan (fsLit "<command line>")
-
-    graph :: Graph (Node UnitId UnitId)
-    graph = graphFromEdgedVerticesUniq graphNodes
-
-    -- downwards closure of graph
-    downwards_closure
-      = graphFromEdgedVerticesUniq [ DigraphNode uid uid (Set.toList deps)
-                                   | (uid, deps) <- M.toList (allReachable graph node_key)]
-
-    inverse_closure = transposeG downwards_closure
-
-    upwards_closure = Set.fromList $ map node_key $ reachablesG inverse_closure [DigraphNode uid uid [] | uid <- Set.toList home_id_set]
-
-    all_unit_direct_deps :: UniqMap UnitId (Set.Set UnitId)
-    all_unit_direct_deps
-      = unitEnv_foldWithKey go emptyUniqMap $ ue_home_unit_graph ue
-      where
-        go rest this this_uis =
-           plusUniqMap_C Set.union
-             (addToUniqMap_C Set.union external_depends this (Set.fromList $ this_deps))
-             rest
-           where
-             external_depends = mapUniqMap (Set.fromList . unitDepends) (unitInfoMap this_units)
-             this_units = homeUnitEnv_units this_uis
-             this_deps = [ toUnitId unit | (unit,Just _) <- explicitUnits this_units]
-
-    graphNodes :: [Node UnitId UnitId]
-    graphNodes = go Set.empty home_id_set
-      where
-        go done todo
-          = case Set.minView todo of
-              Nothing -> []
-              Just (uid, todo')
-                | Set.member uid done -> go done todo'
-                | otherwise -> case lookupUniqMap all_unit_direct_deps uid of
-                    Nothing -> pprPanic "uid not found" (ppr (uid, all_unit_direct_deps))
-                    Just depends ->
-                      let todo'' = (depends Set.\\ done) `Set.union` todo'
-                      in DigraphNode uid uid (Set.toList depends) : go (Set.insert uid done) todo''
-
--- | Update the every ModSummary that is depended on
--- by a module that needs template haskell. We enable codegen to
--- the specified target, disable optimization and change the .hi
--- and .o file locations to be temporary files.
--- See Note [-fno-code mode]
-enableCodeGenForTH
-  :: Logger
-  -> TmpFs
-  -> UnitEnv
-  -> [ModuleGraphNode]
-  -> IO [ModuleGraphNode]
-enableCodeGenForTH logger tmpfs unit_env =
-  enableCodeGenWhen logger tmpfs TFL_CurrentModule TFL_GhcSession unit_env
-
-
-data CodeGenEnable = EnableByteCode | EnableObject | EnableByteCodeAndObject deriving (Eq, Show, Ord)
-
-instance Outputable CodeGenEnable where
-  ppr = text . show
-
--- | Helper used to implement 'enableCodeGenForTH'.
--- In particular, this enables
--- unoptimized code generation for all modules that meet some
--- condition (first parameter), or are dependencies of those
--- modules. The second parameter is a condition to check before
--- marking modules for code generation.
-enableCodeGenWhen
-  :: Logger
-  -> TmpFs
-  -> TempFileLifetime
-  -> TempFileLifetime
-  -> UnitEnv
-  -> [ModuleGraphNode]
-  -> IO [ModuleGraphNode]
-enableCodeGenWhen logger tmpfs staticLife dynLife unit_env mod_graph =
-  mapM enable_code_gen mod_graph
-  where
-    defaultBackendOf ms = platformDefaultBackend (targetPlatform $ ue_unitFlags (ms_unitid ms) unit_env)
-    enable_code_gen :: ModuleGraphNode -> IO ModuleGraphNode
-    enable_code_gen n@(ModuleNode deps ms)
-      | ModSummary
-        { ms_location = ms_location
-        , ms_hsc_src = HsSrcFile
-        , ms_hspp_opts = dflags
-        } <- ms
-      , Just enable_spec <- mkNodeKey n `Map.lookup` needs_codegen_map =
-      if | nocode_enable ms -> do
-               let new_temp_file suf dynsuf = do
-                     tn <- newTempName logger tmpfs (tmpDir dflags) staticLife suf
-                     let dyn_tn = tn -<.> dynsuf
-                     addFilesToClean tmpfs dynLife [dyn_tn]
-                     return (unsafeEncodeUtf tn, unsafeEncodeUtf dyn_tn)
-                 -- We don't want to create .o or .hi files unless we have been asked
-                 -- to by the user. But we need them, so we patch their locations in
-                 -- the ModSummary with temporary files.
-                 --
-               ((hi_file, dyn_hi_file), (o_file, dyn_o_file)) <-
-                 -- If ``-fwrite-interface` is specified, then the .o and .hi files
-                 -- are written into `-odir` and `-hidir` respectively.  #16670
-                 if gopt Opt_WriteInterface dflags
-                   then return ((ml_hi_file_ospath ms_location, ml_dyn_hi_file_ospath ms_location)
-                               , (ml_obj_file_ospath ms_location, ml_dyn_obj_file_ospath ms_location))
-                   else (,) <$> (new_temp_file (hiSuf_ dflags) (dynHiSuf_ dflags))
-                            <*> (new_temp_file (objectSuf_ dflags) (dynObjectSuf_ dflags))
-               let new_dflags = case enable_spec of
-                                  EnableByteCode -> dflags { backend = interpreterBackend }
-                                  EnableObject   -> dflags { backend = defaultBackendOf ms }
-                                  EnableByteCodeAndObject -> (gopt_set dflags Opt_ByteCodeAndObjectCode) { backend = defaultBackendOf ms}
-               let ms' = ms
-                     { ms_location =
-                         ms_location { ml_hi_file_ospath = hi_file
-                                     , ml_obj_file_ospath = o_file
-                                     , ml_dyn_hi_file_ospath = dyn_hi_file
-                                     , ml_dyn_obj_file_ospath = dyn_o_file }
-                     , ms_hspp_opts = updOptLevel 0 $ new_dflags
-                     }
-               -- Recursive call to catch the other cases
-               enable_code_gen (ModuleNode deps ms')
-
-         -- If -fprefer-byte-code then satisfy dependency by enabling bytecode (if normal object not enough)
-         -- we only get to this case if the default backend is already generating object files, but we need dynamic
-         -- objects
-         | bytecode_and_enable enable_spec ms -> do
-               let ms' = ms
-                     { ms_hspp_opts = gopt_set (ms_hspp_opts ms) Opt_ByteCodeAndObjectCode
-                     }
-               -- Recursive call to catch the other cases
-               enable_code_gen (ModuleNode deps ms')
-         | dynamic_too_enable enable_spec ms -> do
-               let ms' = ms
-                     { ms_hspp_opts = gopt_set (ms_hspp_opts ms) Opt_BuildDynamicToo
-                     }
-               -- Recursive call to catch the other cases
-               enable_code_gen (ModuleNode deps ms')
-         | ext_interp_enable ms -> do
-               let ms' = ms
-                     { ms_hspp_opts = gopt_set (ms_hspp_opts ms) Opt_ExternalInterpreter
-                     }
-               -- Recursive call to catch the other cases
-               enable_code_gen (ModuleNode deps ms')
-
-         | otherwise -> return n
-
-    enable_code_gen ms = return ms
-
-    nocode_enable ms@(ModSummary { ms_hspp_opts = dflags }) =
-      not (backendGeneratesCode (backend dflags)) &&
-      -- Don't enable codegen for TH on indefinite packages; we
-      -- can't compile anything anyway! See #16219.
-      isHomeUnitDefinite (ue_unitHomeUnit (ms_unitid ms) unit_env)
-
-    bytecode_and_enable enable_spec ms =
-      -- In the situation where we **would** need to enable dynamic-too
-      -- IF we had decided we needed objects
-      dynamic_too_enable EnableObject ms
-        -- but we prefer to use bytecode rather than objects
-        && prefer_bytecode
-        -- and we haven't already turned it on
-        && not generate_both
-      where
-        lcl_dflags   = ms_hspp_opts ms
-        prefer_bytecode = case enable_spec of
-                            EnableByteCodeAndObject -> True
-                            EnableByteCode -> True
-                            EnableObject -> False
-
-        generate_both   = gopt Opt_ByteCodeAndObjectCode lcl_dflags
-
-    -- #8180 - when using TemplateHaskell, switch on -dynamic-too so
-    -- the linker can correctly load the object files.  This isn't necessary
-    -- when using -fexternal-interpreter.
-    dynamic_too_enable enable_spec ms
-      | sTargetRTSLinkerOnlySupportsSharedLibs $ settings lcl_dflags =
-          not isDynWay && not dyn_too_enabled
-            && enable_object
-      | otherwise =
-          hostIsDynamic && not hostIsProfiled && internalInterpreter &&
-            not isDynWay && not isProfWay &&  not dyn_too_enabled
-              && enable_object
-      where
-       lcl_dflags   = ms_hspp_opts ms
-       internalInterpreter = not (gopt Opt_ExternalInterpreter lcl_dflags)
-       dyn_too_enabled = gopt Opt_BuildDynamicToo lcl_dflags
-       isDynWay    = hasWay (ways lcl_dflags) WayDyn
-       isProfWay   = hasWay (ways lcl_dflags) WayProf
-       enable_object = case enable_spec of
-                            EnableByteCode -> False
-                            EnableByteCodeAndObject -> True
-                            EnableObject -> True
-
-    -- #16331 - when no "internal interpreter" is available but we
-    -- need to process some TemplateHaskell or QuasiQuotes, we automatically
-    -- turn on -fexternal-interpreter.
-    ext_interp_enable ms = not ghciSupported && internalInterpreter
-      where
-       lcl_dflags   = ms_hspp_opts ms
-       internalInterpreter = not (gopt Opt_ExternalInterpreter lcl_dflags)
-
-    (mg, lookup_node) = moduleGraphNodes False mod_graph
-
-    mk_needed_set roots = Set.fromList $ map (mkNodeKey . node_payload) $ reachablesG mg (map (expectJust "needs_th" . lookup_node) roots)
-
-    needs_obj_set, needs_bc_set :: Set.Set NodeKey
-    needs_obj_set = mk_needed_set need_obj_set
-
-    needs_bc_set = mk_needed_set need_bc_set
-
-    -- A map which tells us how to enable code generation for a NodeKey
-    needs_codegen_map :: Map.Map NodeKey CodeGenEnable
-    needs_codegen_map =
-      -- Another option here would be to just produce object code, rather than both object and
-      -- byte code
-      Map.unionWith (\_ _ -> EnableByteCodeAndObject)
-        (Map.fromList $ [(m, EnableObject) | m <- Set.toList needs_obj_set])
-        (Map.fromList $ [(m, EnableByteCode) | m <- Set.toList needs_bc_set])
-
-    -- The direct dependencies of modules which require object code
-    need_obj_set =
-      concat
-        -- Note we don't need object code for a module if it uses TemplateHaskell itself. Only
-        -- it's dependencies.
-        [ deps
-        | (ModuleNode deps ms) <- mod_graph
-        , isTemplateHaskellOrQQNonBoot ms
-        , not (gopt Opt_UseBytecodeRatherThanObjects (ms_hspp_opts ms))
-        ]
-
-    -- The direct dependencies of modules which require byte code
-    need_bc_set =
-      concat
-        [ deps
-        | (ModuleNode deps ms) <- mod_graph
-        , isTemplateHaskellOrQQNonBoot ms
-        , gopt Opt_UseBytecodeRatherThanObjects (ms_hspp_opts ms)
-        ]
-
--- | Populate the Downsweep cache with the root modules.
-mkRootMap
-  :: [ModSummary]
-  -> DownsweepCache
-mkRootMap summaries = Map.fromListWith (flip (++))
-  [ ((ms_unitid s, NoPkgQual, ms_mnwib s), [Right s]) | s <- summaries ]
-
------------------------------------------------------------------------------
--- Summarising modules
-
--- We have two types of summarisation:
---
---    * Summarise a file.  This is used for the root module(s) passed to
---      cmLoadModules.  The file is read, and used to determine the root
---      module name.  The module name may differ from the filename.
---
---    * Summarise a module.  We are given a module name, and must provide
---      a summary.  The finder is used to locate the file in which the module
---      resides.
-
-summariseFile
-        :: HscEnv
-        -> HomeUnit
-        -> M.Map (UnitId, FilePath) ModSummary    -- old summaries
-        -> FilePath                     -- source file name
-        -> Maybe Phase                  -- start phase
-        -> Maybe (StringBuffer,UTCTime)
-        -> IO (Either DriverMessages ModSummary)
-
-summariseFile hsc_env' home_unit old_summaries src_fn mb_phase maybe_buf
-        -- we can use a cached summary if one is available and the
-        -- source file hasn't changed,
-   | Just old_summary <- M.lookup (homeUnitId home_unit, src_fn) old_summaries
-   = do
-        let location = ms_location $ old_summary
-
-        src_hash <- get_src_hash
-                -- The file exists; we checked in getRootSummary above.
-                -- If it gets removed subsequently, then this
-                -- getFileHash may fail, but that's the right
-                -- behaviour.
-
-                -- return the cached summary if the source didn't change
-        checkSummaryHash
-            hsc_env (new_summary src_fn)
-            old_summary location src_hash
-
-   | otherwise
-   = do src_hash <- get_src_hash
-        new_summary src_fn src_hash
-  where
-    -- change the main active unit so all operations happen relative to the given unit
-    hsc_env = hscSetActiveHomeUnit home_unit hsc_env'
-    -- src_fn does not necessarily exist on the filesystem, so we need to
-    -- check what kind of target we are dealing with
-    get_src_hash = case maybe_buf of
-                      Just (buf,_) -> return $ fingerprintStringBuffer buf
-                      Nothing -> liftIO $ getFileHash src_fn
-
-    new_summary src_fn src_hash = runExceptT $ do
-        preimps@PreprocessedImports {..}
-            <- getPreprocessedImports hsc_env src_fn mb_phase maybe_buf
-
-        let fopts = initFinderOpts (hsc_dflags hsc_env)
-            src_path = unsafeEncodeUtf src_fn
-
-            is_boot = case takeExtension src_fn of
-              ".hs-boot" -> IsBoot
-              ".lhs-boot" -> IsBoot
-              _ -> NotBoot
-
-            (path_without_boot, hsc_src)
-              | isHaskellSigFilename src_fn = (src_path, HsigFile)
-              | IsBoot <- is_boot = (removeBootSuffix src_path, HsBootFile)
-              | otherwise = (src_path, HsSrcFile)
-
-            -- Make a ModLocation for the Finder, who only has one entry for
-            -- each @ModuleName@, and therefore needs to use the locations for
-            -- the non-boot files.
-            location_without_boot =
-              mkHomeModLocation fopts pi_mod_name path_without_boot
-
-            -- Make a ModLocation for this file, adding the @-boot@ suffix to
-            -- all paths if the original was a boot file.
-            location
-              | IsBoot <- is_boot
-              = addBootSuffixLocn location_without_boot
-              | otherwise
-              = location_without_boot
-
-        -- Tell the Finder cache where it is, so that subsequent calls
-        -- to findModule will find it, even if it's not on any search path
-        mod <- liftIO $ do
-          let home_unit = hsc_home_unit hsc_env
-          let fc        = hsc_FC hsc_env
-          addHomeModuleToFinder fc home_unit (GWIB pi_mod_name is_boot) location
-
-        liftIO $ makeNewModSummary hsc_env $ MakeNewModSummary
-            { nms_src_fn = src_fn
-            , nms_src_hash = src_hash
-            , nms_hsc_src = hsc_src
-            , nms_location = location
-            , nms_mod = mod
-            , nms_preimps = preimps
-            }
-
-checkSummaryHash
-    :: HscEnv
-    -> (Fingerprint -> IO (Either e ModSummary))
-    -> ModSummary -> ModLocation -> Fingerprint
-    -> IO (Either e ModSummary)
-checkSummaryHash
-  hsc_env new_summary
-  old_summary
-  location src_hash
-  | ms_hs_hash old_summary == src_hash &&
-      not (gopt Opt_ForceRecomp (hsc_dflags hsc_env)) = do
-           -- update the object-file timestamp
-           obj_timestamp <- modificationTimeIfExists (ml_obj_file location)
-
-           -- We have to repopulate the Finder's cache for file targets
-           -- because the file might not even be on the regular search path
-           -- and it was likely flushed in depanal. This is not technically
-           -- needed when we're called from sumariseModule but it shouldn't
-           -- hurt.
-           -- Also, only add to finder cache for non-boot modules as the finder cache
-           -- makes sure to add a boot suffix for boot files.
-           _ <- do
-              let fc = hsc_FC hsc_env
-                  gwib = GWIB (ms_mod old_summary) (isBootSummary old_summary)
-              case ms_hsc_src old_summary of
-                HsSrcFile -> addModuleToFinder fc gwib location
-                _ -> return ()
-
-           hi_timestamp <- modificationTimeIfExists (ml_hi_file location)
-           hie_timestamp <- modificationTimeIfExists (ml_hie_file location)
-
-           return $ Right
-             ( old_summary
-                     { ms_obj_date = obj_timestamp
-                     , ms_iface_date = hi_timestamp
-                     , ms_hie_date = hie_timestamp
-                     }
-             )
-
-   | otherwise =
-           -- source changed: re-summarise.
-           new_summary src_hash
-
-data SummariseResult =
-        FoundInstantiation InstantiatedUnit
-      | FoundHomeWithError (UnitId, DriverMessages)
-      | FoundHome ModSummary
-      | External UnitId
-      | NotThere
-
--- Summarise a module, and pick up source and timestamp.
-summariseModule
-          :: HscEnv
-          -> HomeUnit
-          -> M.Map (UnitId, FilePath) ModSummary
-          -- ^ Map of old summaries
-          -> IsBootInterface    -- True <=> a {-# SOURCE #-} import
-          -> Located ModuleName -- Imported module to be summarised
-          -> PkgQual
-          -> Maybe (StringBuffer, UTCTime)
-          -> [ModuleName]               -- Modules to exclude
-          -> IO SummariseResult
-
-
-summariseModule hsc_env' home_unit old_summary_map is_boot (L _ wanted_mod) mb_pkg
-                maybe_buf excl_mods
-  | wanted_mod `elem` excl_mods
-  = return NotThere
-  | otherwise  = find_it
-  where
-    -- Temporarily change the currently active home unit so all operations
-    -- happen relative to it
-    hsc_env   = hscSetActiveHomeUnit home_unit hsc_env'
-    dflags    = hsc_dflags hsc_env
-
-    find_it :: IO SummariseResult
-
-    find_it = do
-        found <- findImportedModule hsc_env wanted_mod mb_pkg
-        case found of
-             Found location mod
-                | isJust (ml_hs_file location) ->
-                        -- Home package
-                         just_found location mod
-                | VirtUnit iud <- moduleUnit mod
-                , not (isHomeModule home_unit mod)
-                  -> return $ FoundInstantiation iud
-                | otherwise -> return $ External (moduleUnitId mod)
-             _ -> return NotThere
-                        -- Not found
-                        -- (If it is TRULY not found at all, we'll
-                        -- error when we actually try to compile)
-
-    just_found location mod = do
-                -- Adjust location to point to the hs-boot source file,
-                -- hi file, object file, when is_boot says so
-        let location' = case is_boot of
-              IsBoot -> addBootSuffixLocn location
-              NotBoot -> location
-            src_fn = expectJust "summarise2" (ml_hs_file location')
-
-                -- Check that it exists
-                -- It might have been deleted since the Finder last found it
-        maybe_h <- fileHashIfExists src_fn
-        case maybe_h of
-          -- This situation can also happen if we have found the .hs file but the
-          -- .hs-boot file doesn't exist.
-          Nothing -> return NotThere
-          Just h  -> do
-            fresult <- new_summary_cache_check location' mod src_fn h
-            return $ case fresult of
-              Left err -> FoundHomeWithError (moduleUnitId mod, err)
-              Right ms -> FoundHome ms
-
-    new_summary_cache_check loc mod src_fn h
-      | Just old_summary <- Map.lookup ((toUnitId (moduleUnit mod), src_fn)) old_summary_map =
-
-         -- check the hash on the source file, and
-         -- return the cached summary if it hasn't changed.  If the
-         -- file has changed then need to resummarise.
-        case maybe_buf of
-           Just (buf,_) ->
-               checkSummaryHash hsc_env (new_summary loc mod src_fn) old_summary loc (fingerprintStringBuffer buf)
-           Nothing    ->
-               checkSummaryHash hsc_env (new_summary loc mod src_fn) old_summary loc h
-      | otherwise = new_summary loc mod src_fn h
-
-    new_summary :: ModLocation
-                  -> Module
-                  -> FilePath
-                  -> Fingerprint
-                  -> IO (Either DriverMessages ModSummary)
-    new_summary location mod src_fn src_hash
-      = runExceptT $ do
-        preimps@PreprocessedImports {..}
-            -- Remember to set the active unit here, otherwise the wrong include paths are passed to CPP
-            -- See multiHomeUnits_cpp2 test
-            <- getPreprocessedImports (hscSetActiveUnitId (moduleUnitId mod) hsc_env) src_fn Nothing maybe_buf
-
-        -- NB: Despite the fact that is_boot is a top-level parameter, we
-        -- don't actually know coming into this function what the HscSource
-        -- of the module in question is.  This is because we may be processing
-        -- this module because another module in the graph imported it: in this
-        -- case, we know if it's a boot or not because of the {-# SOURCE #-}
-        -- annotation, but we don't know if it's a signature or a regular
-        -- module until we actually look it up on the filesystem.
-        let hsc_src
-              | is_boot == IsBoot           = HsBootFile
-              | isHaskellSigFilename src_fn = HsigFile
-              | otherwise                   = HsSrcFile
-
-        when (pi_mod_name /= moduleName mod) $
-                throwE $ singleMessage $ mkPlainErrorMsgEnvelope pi_mod_name_loc
-                       $ DriverFileModuleNameMismatch pi_mod_name (moduleName mod)
-
-        let instantiations = homeUnitInstantiations home_unit
-        when (hsc_src == HsigFile && isNothing (lookup pi_mod_name instantiations)) $
-            throwE $ singleMessage $ mkPlainErrorMsgEnvelope pi_mod_name_loc
-                   $ DriverUnexpectedSignature pi_mod_name (checkBuildingCabalPackage dflags) instantiations
-
-        liftIO $ makeNewModSummary hsc_env $ MakeNewModSummary
-            { nms_src_fn = src_fn
-            , nms_src_hash = src_hash
-            , nms_hsc_src = hsc_src
-            , nms_location = location
-            , nms_mod = mod
-            , nms_preimps = preimps
-            }
-
--- | Convenience named arguments for 'makeNewModSummary' only used to make
--- code more readable, not exported.
-data MakeNewModSummary
-  = MakeNewModSummary
-      { nms_src_fn :: FilePath
-      , nms_src_hash :: Fingerprint
-      , nms_hsc_src :: HscSource
-      , nms_location :: ModLocation
-      , nms_mod :: Module
-      , nms_preimps :: PreprocessedImports
-      }
-
-makeNewModSummary :: HscEnv -> MakeNewModSummary -> IO ModSummary
-makeNewModSummary hsc_env MakeNewModSummary{..} = do
-  let PreprocessedImports{..} = nms_preimps
-  obj_timestamp <- modificationTimeIfExists (ml_obj_file nms_location)
-  dyn_obj_timestamp <- modificationTimeIfExists (ml_dyn_obj_file nms_location)
-  hi_timestamp <- modificationTimeIfExists (ml_hi_file nms_location)
-  hie_timestamp <- modificationTimeIfExists (ml_hie_file nms_location)
-
-  extra_sig_imports <- findExtraSigImports hsc_env nms_hsc_src pi_mod_name
-  (implicit_sigs, _inst_deps) <- implicitRequirementsShallow (hscSetActiveUnitId (moduleUnitId nms_mod) hsc_env) pi_theimps
-
-  return $
-        ModSummary
-        { ms_mod = nms_mod
-        , ms_hsc_src = nms_hsc_src
-        , ms_location = nms_location
-        , ms_hspp_file = pi_hspp_fn
-        , ms_hspp_opts = pi_local_dflags
-        , ms_hspp_buf  = Just pi_hspp_buf
-        , ms_parsed_mod = Nothing
-        , ms_srcimps = pi_srcimps
-        , ms_ghc_prim_import = pi_ghc_prim_import
-        , ms_textual_imps =
-            ((,) NoPkgQual . noLoc <$> extra_sig_imports) ++
-            ((,) NoPkgQual . noLoc <$> implicit_sigs) ++
-            pi_theimps
-        , ms_hs_hash = nms_src_hash
-        , ms_iface_date = hi_timestamp
-        , ms_hie_date = hie_timestamp
-        , ms_obj_date = obj_timestamp
-        , ms_dyn_obj_date = dyn_obj_timestamp
-        }
-
-data PreprocessedImports
-  = PreprocessedImports
-      { pi_local_dflags :: DynFlags
-      , pi_srcimps  :: [(PkgQual, Located ModuleName)]
-      , pi_theimps  :: [(PkgQual, Located ModuleName)]
-      , pi_ghc_prim_import :: Bool
-      , pi_hspp_fn  :: FilePath
-      , pi_hspp_buf :: StringBuffer
-      , pi_mod_name_loc :: SrcSpan
-      , pi_mod_name :: ModuleName
-      }
-
--- Preprocess the source file and get its imports
--- The pi_local_dflags contains the OPTIONS pragmas
-getPreprocessedImports
-    :: HscEnv
-    -> FilePath
-    -> Maybe Phase
-    -> Maybe (StringBuffer, UTCTime)
-    -- ^ optional source code buffer and modification time
-    -> ExceptT DriverMessages IO PreprocessedImports
-getPreprocessedImports hsc_env src_fn mb_phase maybe_buf = do
-  (pi_local_dflags, pi_hspp_fn)
-      <- ExceptT $ preprocess hsc_env src_fn (fst <$> maybe_buf) mb_phase
-  pi_hspp_buf <- liftIO $ hGetStringBuffer pi_hspp_fn
-  (pi_srcimps', pi_theimps', pi_ghc_prim_import, L pi_mod_name_loc pi_mod_name)
-      <- ExceptT $ do
-          let imp_prelude = xopt LangExt.ImplicitPrelude pi_local_dflags
-              popts = initParserOpts pi_local_dflags
-          mimps <- getImports popts imp_prelude pi_hspp_buf pi_hspp_fn src_fn
-          return (first (mkMessages . fmap mkDriverPsHeaderMessage . getMessages) mimps)
-  let rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env)
-  let rn_imps = fmap (\(pk, lmn@(L _ mn)) -> (rn_pkg_qual mn pk, lmn))
-  let pi_srcimps = rn_imps pi_srcimps'
-  let pi_theimps = rn_imps pi_theimps'
-  return PreprocessedImports {..}
 
 
 -----------------------------------------------------------------------------
@@ -2473,17 +1481,7 @@ noHsFileErr loc path
   = singleMessage $ mkPlainErrorMsgEnvelope loc (DriverFileNotFound path)
   -}
 
-moduleNotFoundErr :: ModuleName -> DriverMessages
-moduleNotFoundErr mod = singleMessage $ mkPlainErrorMsgEnvelope noSrcSpan (DriverModuleNotFound mod)
 
-multiRootsErr :: [ModSummary] -> IO ()
-multiRootsErr [] = panic "multiRootsErr"
-multiRootsErr summs@(summ1:_)
-  = throwOneError $ fmap GhcDriverMessage $
-    mkPlainErrorMsgEnvelope noSrcSpan $ DriverDuplicatedModuleDeclaration mod files
-  where
-    mod = ms_mod summ1
-    files = map (expectJust "checkDup" . ml_hs_file . ms_location) summs
 
 cyclicModuleErr :: [ModuleGraphNode] -> MsgEnvelope GhcMessage
 -- From a strongly connected component we find
@@ -2495,14 +1493,14 @@ cyclicModuleErr mss
        Just path -> mkPlainErrorMsgEnvelope src_span $
                     GhcDriverMessage $ DriverModuleGraphCycle path
         where
-          src_span = maybe noSrcSpan (mkFileSrcSpan . ms_location) (moduleGraphNodeModSum (head path))
+          src_span = maybe noSrcSpan (mkFileSrcSpan . moduleNodeInfoLocation) (mgNodeIsModule (head path))
   where
     graph :: [Node NodeKey ModuleGraphNode]
     graph =
       [ DigraphNode
         { node_payload = ms
         , node_key = mkNodeKey ms
-        , node_dependencies = nodeDependencies False ms
+        , node_dependencies = mgNodeDependencies False ms
         }
       | ms <- mss
       ]
@@ -2514,13 +1512,19 @@ cleanCurrentModuleTempFilesMaybe logger tmpfs dflags =
     else liftIO $ cleanCurrentModuleTempFiles logger tmpfs
 
 
-addDepsToHscEnv ::  [HomeModInfo] -> HscEnv -> HscEnv
-addDepsToHscEnv deps hsc_env =
-  hscUpdateHUG (\hug -> foldr addHomeModInfoToHug hug deps) hsc_env
+-- | Thin each HPT variable to only contain keys from the given dependencies.
+-- This is used at the end of upsweep to make sure that only completely successfully loaded
+-- modules are visible for subsequent operations.
+restrictDepsHscEnv :: [HomeModInfo] -> HscEnv -> IO ()
+restrictDepsHscEnv deps hsc_env =
+  let deps_with_unit = map (\xs -> (fst (head xs), map snd xs)) $ groupBy ((==) `on` fst) (sortOn fst (map go deps))
+      hug = ue_home_unit_graph $ hsc_unit_env hsc_env
+      go hmi = (hmi_unit, hmi)
+        where
+          hmi_mod  = mi_module (hm_iface hmi)
+          hmi_unit = toUnitId (moduleUnit hmi_mod)
+  in HUG.restrictHug deps_with_unit hug
 
-setHPT ::  HomePackageTable -> HscEnv -> HscEnv
-setHPT deps hsc_env =
-  hscUpdateHPT (const $ deps) hsc_env
 
 setHUG ::  HomeUnitGraph -> HscEnv -> HscEnv
 setHUG deps hsc_env =
@@ -2551,24 +1555,7 @@ wrapAction msg_wrapper hsc_env k = do
                         _ -> errorMsg lcl_logger (text (show exc))
         return Nothing
 
-withParLog :: TVar LogQueueQueue -> Int -> ((Logger -> Logger) -> IO b) -> IO b
-withParLog lqq_var k cont = do
-  let init_log = do
-        -- Make a new log queue
-        lq <- newLogQueue k
-        -- Add it into the LogQueueQueue
-        atomically $ initLogQueue lqq_var lq
-        return lq
-      finish_log lq = liftIO (finishLogQueue lq)
-  MC.bracket init_log finish_log $ \lq -> cont (pushLogHook (const (parLogAction lq)))
 
-withLoggerHsc :: Int -> MakeEnv -> (HscEnv -> IO a) -> IO a
-withLoggerHsc k MakeEnv{withLogger, hsc_env} cont = do
-  withLogger k $ \modifyLogger -> do
-    let lcl_logger = modifyLogger (hsc_logger hsc_env)
-        hsc_env' = hsc_env { hsc_logger = lcl_logger }
-    -- Run continuation with modified logger
-    cont hsc_env'
 
 
 executeInstantiationNode :: Int
@@ -2591,88 +1578,121 @@ executeInstantiationNode k n deps uid iu = do
             return res
 
 
+-- | executeCompileNode interprets how --make module should compile a ModuleNode
+--
+-- 1. If the ModuleNode is a ModuleNodeCompile, then we first check
+--    if the interface file exists and is up to date. If it is, we return those.
+--    Otherwise, we compile the module and return the new HomeModInfo.
+-- 2. If the ModuleNode is a ModuleNodeFixed, then we just need to load the interface
+--    and artifacts from disk.
+
 executeCompileNode :: Int
   -> Int
   -> Maybe HomeModInfo
   -> HomeUnitGraph
   -> Maybe [ModuleName] -- List of modules we need to rehydrate before compiling
-  -> ModSummary
+  -> ModuleNodeInfo
   -> RunMakeM HomeModInfo
-executeCompileNode k n !old_hmi hug mrehydrate_mods mod = do
+executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
   me@MakeEnv{..} <- ask
   -- Rehydrate any dependencies if this module had a boot file or is a signature file.
   lift $ MaybeT (withAbstractSem compile_sem $ withLoggerHsc k me $ \hsc_env -> do
-     hydrated_hsc_env <- liftIO $ maybeRehydrateBefore (setHUG hug hsc_env) mod fixed_mrehydrate_mods
+     hsc_env' <- liftIO $ maybeRehydrateBefore (setHUG hug hsc_env) mni fixed_mrehydrate_mods
+     case mni of
+       ModuleNodeCompile mod -> executeCompileNodeWithSource hsc_env' me  mod
+       ModuleNodeFixed key loc -> executeCompileNodeFixed hsc_env' me key loc
+    )
+
+  where
+    fixed_mrehydrate_mods =
+      case moduleNodeInfoHscSource mni of
+        -- MP: It is probably a bit of a misimplementation in backpack that
+        -- compiling a signature requires an knot_var for that unit.
+        -- If you remove this then a lot of backpack tests fail.
+        Just HsigFile -> Just []
+        _        -> mrehydrate_mods
+
+    executeCompileNodeFixed :: HscEnv -> MakeEnv -> ModNodeKeyWithUid -> ModLocation -> IO (Maybe HomeModInfo)
+    executeCompileNodeFixed hsc_env MakeEnv{diag_wrapper, env_messager} mod loc =
+      wrapAction diag_wrapper hsc_env $ do
+        forM_ env_messager $ \hscMessage -> hscMessage hsc_env (k, n) UpToDate (ModuleNode [] (ModuleNodeFixed mod loc))
+        read_result <- readIface (hsc_hooks hsc_env) (hsc_logger hsc_env) (hsc_dflags hsc_env) (hsc_NC hsc_env) (mnkToModule mod) (ml_hi_file loc)
+        case read_result of
+          M.Failed interface_err ->
+            let mn = mnkModuleName mod
+                err = Can'tFindInterface (BadIfaceFile interface_err) (LookingForModule (gwib_mod mn) (gwib_isBoot mn))
+            in throwErrors $ singleMessage $ mkPlainErrorMsgEnvelope noSrcSpan (GhcDriverMessage (DriverInterfaceError err))
+          M.Succeeded iface -> do
+            details <- genModDetails hsc_env iface
+            mb_object <- findObjectLinkableMaybe (mi_module iface) loc
+            mb_bytecode <- loadIfaceByteCodeLazy hsc_env iface loc (md_types details)
+            let hm_linkable = HomeModLinkable mb_bytecode mb_object
+            return (HomeModInfo iface details hm_linkable)
+
+    executeCompileNodeWithSource :: HscEnv -> MakeEnv -> ModSummary -> IO (Maybe HomeModInfo)
+    executeCompileNodeWithSource hsc_env MakeEnv{diag_wrapper, env_messager} mod = do
      let -- Use the cached DynFlags which includes OPTIONS_GHC pragmas
          lcl_dynflags = ms_hspp_opts mod
      let lcl_hsc_env =
              -- Localise the hsc_env to use the cached flags
              hscSetFlags lcl_dynflags $
-             hydrated_hsc_env
+             hsc_env
      -- Compile the module, locking with a semaphore to avoid too many modules
      -- being compiled at the same time leading to high memory usage.
      wrapAction diag_wrapper lcl_hsc_env $ do
       res <- upsweep_mod lcl_hsc_env env_messager old_hmi mod k n
       cleanCurrentModuleTempFilesMaybe (hsc_logger hsc_env) (hsc_tmpfs hsc_env) lcl_dynflags
-      return res)
+      return res
 
-  where
-    fixed_mrehydrate_mods =
-      case ms_hsc_src mod of
-        -- MP: It is probably a bit of a misimplementation in backpack that
-        -- compiling a signature requires an knot_var for that unit.
-        -- If you remove this then a lot of backpack tests fail.
-        HsigFile -> Just []
-        _        -> mrehydrate_mods
 
 {- Rehydration, see Note [Rehydrating Modules] -}
 
 rehydrate :: HscEnv        -- ^ The HPT in this HscEnv needs rehydrating.
           -> [HomeModInfo] -- ^ These are the modules we want to rehydrate.
-          -> IO HscEnv
+          -> IO [HomeModInfo]
 rehydrate hsc_env hmis = do
   debugTraceMsg logger 2 $ (
      text "Re-hydrating loop: " <+> (ppr (map (mi_module . hm_iface) hmis)))
-  new_mods <- fixIO $ \new_mods -> do
-      let new_hpt = addListToHpt old_hpt new_mods
-      let new_hsc_env = hscUpdateHPT_lazy (const new_hpt) hsc_env
-      mds <- initIfaceCheck (text "rehydrate") new_hsc_env $
-                mapM (typecheckIface . hm_iface) hmis
-      let new_mods = [ (mn,hmi{ hm_details = details })
-                     | (hmi,details) <- zip hmis mds
-                     , let mn = moduleName (mi_module (hm_iface hmi)) ]
-      return new_mods
-  return $ setHPT (foldl' (\old (mn, hmi) -> addToHpt old mn hmi) old_hpt new_mods) hsc_env
+  -- When the HPT was pure we had to tie a knot to update the ModDetails in the
+  -- HPT required to update those ModDetails, but since it was made an IORef we
+  -- just have to make sure the new ModDetails are "reset" so that the new
+  -- modules are looked up in HPT when it is forced. If we didn't "reset" the
+  -- ModDetails, modules in a loop would refer the wrong (hs-boot) definitions
+  -- (as explained in Note [Rehydrating Modules]).
+  mds <- initIfaceCheck (text "rehydrate") hsc_env $
+            mapM (typecheckIface . hm_iface) hmis
+  let new_mods = [ hmi{ hm_details = details }
+                 | (hmi,details) <- zip hmis mds
+                 ]
+  return new_mods
 
   where
-    logger  = hsc_logger hsc_env
-    to_delete =  (map (moduleName . mi_module . hm_iface) hmis)
-    -- Filter out old modules before tying the knot, otherwise we can end
-    -- up with a thunk which keeps reference to the old HomeModInfo.
-    !old_hpt = foldl' delFromHpt (hsc_HPT hsc_env) to_delete
+    logger = hsc_logger hsc_env
 
 -- If needed, then rehydrate the necessary modules with a suitable KnotVars for the
 -- module currently being compiled.
-maybeRehydrateBefore :: HscEnv -> ModSummary -> Maybe [ModuleName] -> IO HscEnv
+maybeRehydrateBefore :: HscEnv -> ModuleNodeInfo -> Maybe [ModuleName] -> IO HscEnv
 maybeRehydrateBefore hsc_env _ Nothing = return hsc_env
-maybeRehydrateBefore hsc_env mod (Just mns) = do
+maybeRehydrateBefore hsc_env mni (Just mns) = do
   knot_var <- initialise_knot_var hsc_env
-  let hmis = map (expectJust "mr" . lookupHpt (hsc_HPT hsc_env)) mns
-  rehydrate (hsc_env { hsc_type_env_vars = knotVarsFromModuleEnv knot_var }) hmis
+  let hsc_env' = hsc_env { hsc_type_env_vars = knotVarsFromModuleEnv knot_var }
+  hmis <- mapM (fmap expectJust . lookupHpt (hsc_HPT hsc_env')) mns
+  hmis' <- rehydrate hsc_env' hmis
+  mapM_ (\hmi -> HUG.addHomeModInfoToHug hmi (hsc_HUG hsc_env')) hmis'
+  return hsc_env'
 
   where
    initialise_knot_var hsc_env = liftIO $
-    let mod_name = homeModuleInstantiation (hsc_home_unit_maybe hsc_env) (ms_mod mod)
+    let mod_name = homeModuleInstantiation (hsc_home_unit_maybe hsc_env) (moduleNodeInfoModule mni)
     in mkModuleEnv . (:[]) . (mod_name,) <$> newIORef emptyTypeEnv
 
 rehydrateAfter :: HscEnv
   -> [ModuleName]
   -> IO [HomeModInfo]
-rehydrateAfter new_hsc mns = do
-  let new_hpt = hsc_HPT new_hsc
-      hmis = map (expectJust "mrAfter" . lookupHpt new_hpt) mns
-  hsc_env <- rehydrate (new_hsc { hsc_type_env_vars = emptyKnotVars }) hmis
-  return $ map (\mn -> expectJust "rehydrate" $ lookupHpt (hsc_HPT hsc_env) mn) mns
+rehydrateAfter hsc mns = do
+  let hpt = hsc_HPT hsc
+  hmis <- mapM (fmap expectJust . lookupHpt hpt) mns
+  rehydrate (hsc { hsc_type_env_vars = emptyKnotVars }) hmis
 
 {-
 Note [Hydrating Modules]
@@ -2866,220 +1886,16 @@ executeLinkNode hug kn uid deps = do
       Failed -> fail "Link Failed"
       Succeeded -> return ()
 
-{-
-Note [ModuleNameSet, efficiency and space leaks]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-During upsweep, the results of compiling modules are placed into a MVar. When we need
-to compute the right compilation environment for a module, we consult this MVar and
-set the HomeUnitGraph accordingly. This is done to avoid having to precisely track
-module dependencies and recreating the HUG from scratch each time, which is very expensive.
-
-In serial mode (-j1), this all works out fine: a module can only be compiled
-after its dependencies have finished compiling, and compilation can't be
-interleaved with the compilation of other module loops. This ensures that
-the HUG only ever contains finalised interfaces.
-
-In parallel mode, we have to be more careful: the HUG variable can contain non-finalised
-interfaces, which have been started by another thread. In order to avoid a space leak
-in which a finalised interface is compiled against a HPT which contains a non-finalised
-interface, we have to restrict the HUG to only contain the visible modules.
-
-The collection of visible modules explains which transitive modules are visible
-from a certain point. It is recorded in the ModuleNameSet.
-Before a module is compiled, we use this set to restrict the HUG to the visible
-modules only, avoiding this tricky space leak.
-
-Efficiency of the ModuleNameSet is of utmost importance, because a union occurs for
-each edge in the module graph. To achieve this, the set is represented directly as an IntSet,
-which provides suitable performance – even using a UniqSet (which is backed by an IntMap) is
-too slow. The crucial test of performance here is the time taken to a do a no-op build in --make mode.
-
-See test "jspace" for an example which used to trigger this problem.
-
--}
-
--- See Note [ModuleNameSet, efficiency and space leaks]
-type ModuleNameSet = M.Map UnitId W.Word64Set
-
-addToModuleNameSet :: UnitId -> ModuleName -> ModuleNameSet -> ModuleNameSet
-addToModuleNameSet uid mn s =
-  let k = (getKey $ getUnique $ mn)
-  in M.insertWith (W.union) uid (W.singleton k) s
-
--- | Wait for some dependencies to finish and then read from the given MVar.
-wait_deps_hug :: MVar HomeUnitGraph -> [BuildResult] -> ReaderT MakeEnv (MaybeT IO) (HomeUnitGraph, ModuleNameSet)
-wait_deps_hug hug_var deps = do
-  (_, module_deps) <- wait_deps deps
-  hug <- liftIO $ readMVar hug_var
-  let pruneHomeUnitEnv uid hme =
-        let -- Restrict to things which are in the transitive closure to avoid retaining
-            -- reference to loop modules which have already been compiled by other threads.
-            -- See Note [ModuleNameSet, efficiency and space leaks]
-            !new = udfmRestrictKeysSet (homeUnitEnv_hpt hme) (fromMaybe W.empty $ M.lookup  uid module_deps)
-        in hme { homeUnitEnv_hpt = new }
-  return (unitEnv_mapWithKey pruneHomeUnitEnv hug, module_deps)
-
 -- | Wait for dependencies to finish, and then return their results.
-wait_deps :: [BuildResult] -> RunMakeM ([HomeModInfo], ModuleNameSet)
-wait_deps [] = return ([], M.empty)
+wait_deps :: [BuildResult] -> RunMakeM [HomeModInfo]
+wait_deps [] = return []
 wait_deps (x:xs) = do
-  (res, deps) <- lift $ waitResult (resultVar x)
-  (hmis, all_deps) <- wait_deps xs
-  let !new_deps = deps `unionModuleNameSet` all_deps
+  res <- lift $ waitResult (resultVar x)
+  hmis <- wait_deps xs
   case res of
-    Nothing -> return (hmis, new_deps)
-    Just hmi -> return (hmi:hmis, new_deps)
-  where
-    unionModuleNameSet = M.unionWith W.union
+    Nothing -> return hmis
+    Just hmi -> return (hmi:hmis)
 
-
--- Executing the pipelines
-
-
-label_self :: String -> IO ()
-label_self thread_name = do
-    self_tid <- CC.myThreadId
-    CC.labelThread self_tid thread_name
-
-
-runPipelines :: WorkerLimit -> HscEnv -> (GhcMessage -> AnyGhcDiagnostic) -> Maybe Messager -> [MakeAction] -> IO ()
--- Don't even initialise plugins if there are no pipelines
-runPipelines n_job hsc_env diag_wrapper mHscMessager all_pipelines = do
-  liftIO $ label_self "main --make thread"
-  case n_job of
-    NumProcessorsLimit n | n <= 1 -> runSeqPipelines hsc_env diag_wrapper mHscMessager all_pipelines
-    _n -> runParPipelines n_job hsc_env diag_wrapper mHscMessager all_pipelines
-
-runSeqPipelines :: HscEnv -> (GhcMessage -> AnyGhcDiagnostic) -> Maybe Messager -> [MakeAction] -> IO ()
-runSeqPipelines plugin_hsc_env diag_wrapper mHscMessager all_pipelines =
-  let env = MakeEnv { hsc_env = plugin_hsc_env
-                    , withLogger = \_ k -> k id
-                    , compile_sem = AbstractSem (return ()) (return ())
-                    , env_messager = mHscMessager
-                    , diag_wrapper = diag_wrapper
-                    }
-  in runAllPipelines (NumProcessorsLimit 1) env all_pipelines
-
-runNjobsAbstractSem :: Int -> (AbstractSem -> IO a) -> IO a
-runNjobsAbstractSem n_jobs action = do
-  compile_sem <- newQSem n_jobs
-  n_capabilities <- getNumCapabilities
-  n_cpus <- getNumProcessors
-  let
-    asem = AbstractSem (waitQSem compile_sem) (signalQSem compile_sem)
-    set_num_caps n = unless (n_capabilities /= 1) $ setNumCapabilities n
-    updNumCapabilities =  do
-      -- Setting number of capabilities more than
-      -- CPU count usually leads to high userspace
-      -- lock contention. #9221
-      set_num_caps $ min n_jobs n_cpus
-    resetNumCapabilities = set_num_caps n_capabilities
-  MC.bracket_ updNumCapabilities resetNumCapabilities $ action asem
-
-runWorkerLimit :: WorkerLimit -> (AbstractSem -> IO a) -> IO a
-#if defined(wasm32_HOST_ARCH)
-runWorkerLimit _ action = do
-  lock <- newMVar ()
-  action $ AbstractSem (takeMVar lock) (putMVar lock ())
-#else
-runWorkerLimit worker_limit action = case worker_limit of
-    NumProcessorsLimit n_jobs ->
-      runNjobsAbstractSem n_jobs action
-    JSemLimit sem ->
-      runJSemAbstractSem sem action
-#endif
-
--- | Build and run a pipeline
-runParPipelines :: WorkerLimit -- ^ How to limit work parallelism
-             -> HscEnv         -- ^ The basic HscEnv which is augmented with specific info for each module
-             -> (GhcMessage -> AnyGhcDiagnostic)
-             -> Maybe Messager   -- ^ Optional custom messager to use to report progress
-             -> [MakeAction]  -- ^ The build plan for all the module nodes
-             -> IO ()
-runParPipelines worker_limit plugin_hsc_env diag_wrapper mHscMessager all_pipelines = do
-
-
-  -- A variable which we write to when an error has happened and we have to tell the
-  -- logging thread to gracefully shut down.
-  stopped_var <- newTVarIO False
-  -- The queue of LogQueues which actions are able to write to. When an action starts it
-  -- will add it's LogQueue into this queue.
-  log_queue_queue_var <- newTVarIO newLogQueueQueue
-  -- Thread which coordinates the printing of logs
-  wait_log_thread <- logThread (hsc_logger plugin_hsc_env) stopped_var log_queue_queue_var
-
-
-  -- Make the logger thread-safe, in case there is some output which isn't sent via the LogQueue.
-  thread_safe_logger <- liftIO $ makeThreadSafe (hsc_logger plugin_hsc_env)
-  let thread_safe_hsc_env = plugin_hsc_env { hsc_logger = thread_safe_logger }
-
-  runWorkerLimit worker_limit $ \abstract_sem -> do
-    let env = MakeEnv { hsc_env = thread_safe_hsc_env
-                      , withLogger = withParLog log_queue_queue_var
-                      , compile_sem = abstract_sem
-                      , env_messager = mHscMessager
-                      , diag_wrapper = diag_wrapper
-                      }
-    -- Reset the number of capabilities once the upsweep ends.
-    runAllPipelines worker_limit env all_pipelines
-    atomically $ writeTVar stopped_var True
-    wait_log_thread
-
-withLocalTmpFS :: TmpFs -> (TmpFs -> IO a) -> IO a
-withLocalTmpFS tmpfs act = do
-  let initialiser = do
-        liftIO $ forkTmpFsFrom tmpfs
-      finaliser tmpfs_local = do
-        liftIO $ mergeTmpFsInto tmpfs_local tmpfs
-       -- Add remaining files which weren't cleaned up into local tmp fs for
-       -- clean-up later.
-       -- Clear the logQueue if this node had it's own log queue
-  MC.bracket initialiser finaliser act
-
-withLocalTmpFSMake :: MakeEnv -> (MakeEnv -> IO a) -> IO a
-withLocalTmpFSMake env k =
-  withLocalTmpFS (hsc_tmpfs (hsc_env env)) $ \lcl_tmpfs
-    -> k (env { hsc_env = (hsc_env env) { hsc_tmpfs = lcl_tmpfs }})
-
-
--- | Run the given actions and then wait for them all to finish.
-runAllPipelines :: WorkerLimit -> MakeEnv -> [MakeAction] -> IO ()
-runAllPipelines worker_limit env acts = do
-  let single_worker = isWorkerLimitSequential worker_limit
-      spawn_actions :: IO [ThreadId]
-      spawn_actions = if single_worker
-        then (:[]) <$> (forkIOWithUnmask $ \unmask -> void $ runLoop (\io -> io unmask) env acts)
-        else runLoop forkIOWithUnmask env acts
-
-      kill_actions :: [ThreadId] -> IO ()
-      kill_actions tids = mapM_ killThread tids
-
-  MC.bracket spawn_actions kill_actions $ \_ -> do
-    mapM_ waitMakeAction acts
-
--- | Execute each action in order, limiting the amount of parallelism by the given
--- semaphore.
-runLoop :: (((forall a. IO a -> IO a) -> IO ()) -> IO a) -> MakeEnv -> [MakeAction] -> IO [a]
-runLoop _ _env [] = return []
-runLoop fork_thread env (MakeAction act res_var :acts) = do
-
-  -- withLocalTmpFs has to occur outside of fork to remain deterministic
-  new_thread <- withLocalTmpFSMake env $ \lcl_env ->
-    fork_thread $ \unmask -> (do
-            mres <- (unmask $ run_pipeline lcl_env act)
-                      `MC.onException` (putMVar res_var Nothing) -- Defensive: If there's an unhandled exception then still signal the failure.
-            putMVar res_var mres)
-  threads <- runLoop fork_thread env acts
-  return (new_thread : threads)
-  where
-      run_pipeline :: MakeEnv -> RunMakeM a -> IO (Maybe a)
-      run_pipeline env p = runMaybeT (runReaderT p env)
-
-data MakeAction = forall a . MakeAction !(RunMakeM a) !(MVar (Maybe a))
-
-waitMakeAction :: MakeAction -> IO ()
-waitMakeAction (MakeAction _ mvar) = () <$ readMVar mvar
 
 {- Note [GHC Heap Invariants]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3116,6 +1932,4 @@ which can be checked easily using ghc-debug.
 5. At the end of a successful upsweep, the number of live ModDetails equals the
    number of non-boot Modules.
    Why? Each module has a HomeModInfo which contains a ModDetails from that module.
-   Where? See Note [ModuleNameSet, efficiency and space leaks], a variety of places
-          in the driver are responsible.
 -}

@@ -1,4 +1,5 @@
 
+{-# LANGUAGE DuplicateRecordFields    #-}
 {-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE ScopedTypeVariables      #-}
 {-# LANGUAGE TypeFamilies             #-}
@@ -97,7 +98,7 @@ checkHsigDeclM sig_iface sig_thing real_thing = do
     -- implementation cases.
     checkBootDeclM Hsig sig_thing real_thing
     real_fixity <- lookupFixityRn name
-    let sig_fixity = case mi_fix_fn (mi_final_exts sig_iface) (occName name) of
+    let sig_fixity = case mi_fix_fn sig_iface (occName name) of
                         Nothing -> defaultFixity
                         Just f -> f
     when (real_fixity /= sig_fixity) $
@@ -221,7 +222,8 @@ check_inst sig_inst@(ClsInst { is_dfun = dfun_id }) = do
     (tclvl,cts) <- pushTcLevelM $ do
        given_ids <- mapM newEvVar inst_theta
        let given_loc = mkGivenLoc topTcLevel skol_info (mkCtLocEnv lcl_env)
-           givens = [ CtGiven { ctev_pred = idType given_id
+           givens = [ CtGiven $
+                      GivenCt { ctev_pred = idType given_id
                               -- Doesn't matter, make something up
                               , ctev_evar = given_id
                               , ctev_loc  = given_loc  }
@@ -297,14 +299,14 @@ implicitRequirements hsc_env normal_imports
 -- than a transitive closure done here) all the free holes are still reachable.
 implicitRequirementsShallow
   :: HscEnv
-  -> [(PkgQual, Located ModuleName)]
+  -> [(ImportLevel, PkgQual, Located ModuleName)]
   -> IO ([ModuleName], [InstantiatedUnit])
 implicitRequirementsShallow hsc_env normal_imports = go ([], []) normal_imports
  where
   mhome_unit = hsc_home_unit_maybe hsc_env
 
   go acc [] = pure acc
-  go (accL, accR) ((mb_pkg, L _ imp):imports) = do
+  go (accL, accR) ((_stage, mb_pkg, L _ imp):imports) = do
     found <- findImportedModule hsc_env imp mb_pkg
     let acc' = case found of
           Found _ mod | notHomeModuleMaybe mhome_unit mod ->
@@ -484,15 +486,6 @@ inheritedSigPvpWarning =
 -- logically "implicit" entities are defined indirectly in an interface
 -- file.  #13151 gives a proposal to make these *truly* implicit.
 
-merge_msg :: ModuleName -> [InstantiatedModule] -> SDoc
-merge_msg mod_name [] =
-    text "while checking the local signature" <+> ppr mod_name <+>
-    text "for consistency"
-merge_msg mod_name reqs =
-  hang (text "while merging the signatures from" <> colon)
-   2 (vcat [ bullet <+> ppr req | req <- reqs ] $$
-      bullet <+> text "...and the local signature for" <+> ppr mod_name)
-
 -- | Given a local 'ModIface', merge all inherited requirements
 -- from 'requirementMerges' into this signature, producing
 -- a final 'TcGblEnv' that matches the local signature and
@@ -542,7 +535,7 @@ mergeSignatures
     -- we are going to merge in.
     let reqs = requirementMerges unit_state mod_name
 
-    addErrCtxt (pprWithUnitState unit_state $ merge_msg mod_name reqs) $ do
+    addErrCtxt (MergeSignaturesCtxt unit_state mod_name reqs) $ do
 
     -- STEP 2: Read in the RAW forms of all of these interfaces
     ireq_ifaces0 <- liftIO $ forM reqs $ \(Module iuid mod_name) -> do
@@ -641,7 +634,8 @@ mergeSignatures
                                             is_pkg_qual = NoPkgQual,
                                             is_qual     = False,
                                             is_isboot   = NotBoot,
-                                            is_dloc     = locA loc
+                                            is_dloc     = locA loc,
+                                            is_level    = NormalLevel
                                           } ImpAll
                                 rdr_env = mkGlobalRdrEnv $ gresFromAvails hsc_env (Just ispec) as1
                             setGblEnv tcg_env {
@@ -651,7 +645,7 @@ mergeSignatures
                                     emptyImportAvails
                                     (tcg_semantic_mod tcg_env)
                         case mb_r of
-                            Just (_, as2, _) -> return (thinModIface as2 ireq_iface, as2)
+                            Just (_, _, as2, _) -> return (thinModIface as2 ireq_iface, as2)
                             Nothing -> addMessages msgs >> failM
                     -- We can't thin signatures from non-signature packages
                     _ -> return (ireq_iface, as1)
@@ -708,8 +702,9 @@ mergeSignatures
 
     -- Make sure we didn't refer to anything that doesn't actually exist
     -- pprTrace "mergeSignatures: exports_from_avail" (ppr exports) $ return ()
-    (mb_lies, _, _) <- exports_from_avail mb_exports rdr_env
-                        (tcg_imports tcg_env) (tcg_semantic_mod tcg_env)
+    (mb_lies, exp_dflts, _, _) <-
+      exports_from_avail mb_exports rdr_env
+          (tcg_imports tcg_env) (tcg_semantic_mod tcg_env)
 
     {- -- NB: This is commented out, because warns above is disabled.
     -- If you tried to explicitly export an identifier that has a warning
@@ -729,8 +724,7 @@ mergeSignatures
     failIfErrsM
 
     -- Save the exports
-    let drop_defaults (spans, _defaults, avails) = (spans, avails)
-    setGblEnv tcg_env { tcg_rn_exports = map drop_defaults <$> mb_lies } $ do
+    setGblEnv tcg_env { tcg_rn_exports = mb_lies, tcg_default_exports = exp_dflts } $ do
     tcg_env <- getGblEnv
 
     let home_unit = hsc_home_unit hsc_env
@@ -859,7 +853,7 @@ mergeSignatures
                 if outer_mod == mi_module iface
                     -- Don't add ourselves!
                     then tcg_merged tcg_env
-                    else (mi_module iface, mi_mod_hash (mi_final_exts iface)) : tcg_merged tcg_env
+                    else (mi_module iface, mi_mod_hash iface) : tcg_merged tcg_env
             }
 
     -- Note [Signature merging DFuns]
@@ -918,13 +912,6 @@ tcRnInstantiateSignature hsc_env this_mod real_loc =
 exportOccs :: [AvailInfo] -> [OccName]
 exportOccs = concatMap (map nameOccName . availNames)
 
-impl_msg :: UnitState -> Module -> InstantiatedModule -> SDoc
-impl_msg unit_state impl_mod (Module req_uid req_mod_name)
-   = pprWithUnitState unit_state $
-      text "While checking that" <+> quotes (ppr impl_mod) <+>
-      text "implements signature" <+> quotes (ppr req_mod_name) <+>
-      text "in" <+> quotes (ppr req_uid) <> dot
-
 -- | Check if module implements a signature.  (The signature is
 -- always un-hashed, which is why its components are specified
 -- explicitly.)
@@ -934,7 +921,7 @@ checkImplements impl_mod req_mod@(Module uid mod_name) = do
   let unit_state = hsc_units hsc_env
       home_unit  = hsc_home_unit hsc_env
       other_home_units = hsc_all_home_unit_ids hsc_env
-  addErrCtxt (impl_msg unit_state impl_mod req_mod) $ do
+  addErrCtxt (CheckImplementsCtxt unit_state impl_mod req_mod) $ do
     let insts = instUnitInsts uid
 
     -- STEP 1: Load the implementing interface, and make a RdrEnv

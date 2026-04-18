@@ -48,7 +48,15 @@ data Flavour = Flavour {
     ghcSplitSections :: Bool, -- ^ Whether to enable split sections
     -- | Whether to build docs and which ones
     --   (haddocks, user manual, haddock manual)
-    ghcDocs :: Action DocTargets }
+    ghcDocs :: Action DocTargets,
+
+    -- | Whether to uses hashes or inplace for unit ids
+    hashUnitIds :: Bool,
+
+    -- | Whether to generate .hie files
+    ghcHieFiles :: Stage -> Bool
+
+    }
 
 -- | A set of documentation targets
 type DocTargets = Set DocTarget

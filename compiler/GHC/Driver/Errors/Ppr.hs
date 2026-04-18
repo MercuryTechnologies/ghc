@@ -23,7 +23,6 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Unit.Module
 import GHC.Unit.Module.Graph
-import GHC.Unit.Module.ModSummary
 import GHC.Unit.State
 import GHC.Types.Hint
 import GHC.Types.SrcLoc
@@ -63,7 +62,7 @@ instance Diagnostic GhcMessage where
       -> diagnosticMessage (dsMessageOpts opts) m
     GhcDriverMessage m
       -> diagnosticMessage (driverMessageOpts opts) m
-    GhcUnknownMessage (UnknownDiagnostic f m)
+    GhcUnknownMessage (UnknownDiagnostic f _ m)
       -> diagnosticMessage (f opts) m
 
   diagnosticReason = \case
@@ -90,7 +89,7 @@ instance Diagnostic GhcMessage where
     GhcUnknownMessage m
       -> diagnosticHints m
 
-  diagnosticCode = constructorCode
+  diagnosticCode = constructorCode @GHC
 
 instance HasDefaultDiagnosticOpts DriverMessageOpts where
   defaultOpts = DriverMessageOpts (defaultDiagnosticOpts @PsMessage) (defaultDiagnosticOpts @IfaceMessage)
@@ -98,7 +97,7 @@ instance HasDefaultDiagnosticOpts DriverMessageOpts where
 instance Diagnostic DriverMessage where
   type DiagnosticOpts DriverMessage = DriverMessageOpts
   diagnosticMessage opts = \case
-    DriverUnknownMessage (UnknownDiagnostic f m)
+    DriverUnknownMessage (UnknownDiagnostic f _ m)
       -> diagnosticMessage (f opts) m
     DriverPsHeaderMessage m
       -> diagnosticMessage (psDiagnosticOpts opts) m
@@ -156,7 +155,7 @@ instance Diagnostic DriverMessage where
            text "module" <+> quotes (ppr mod) <+>
            text "is defined in multiple files:" <+>
            sep (map text files)
-    DriverModuleNotFound mod
+    DriverModuleNotFound _uid mod
       -> mkSimpleDecorated (text "module" <+> quotes (ppr mod) <+> text "cannot be found locally")
     DriverFileModuleNameMismatch actual expected
       -> mkSimpleDecorated $
@@ -261,10 +260,16 @@ instance Diagnostic DriverMessage where
         ppr_node (ModuleNode _deps m) = text "module" <+> ppr_ms m
         ppr_node (InstantiationNode _uid u) = text "instantiated unit" <+> ppr u
         ppr_node (LinkNode uid _) = pprPanic "LinkNode should not be in a cycle" (ppr uid)
+        ppr_node (UnitNode uid _) = pprPanic "UnitNode should not be in a cycle" (ppr uid)
 
-        ppr_ms :: ModSummary -> SDoc
-        ppr_ms ms = quotes (ppr (moduleName (ms_mod ms))) <+>
-                    (parens (text (msHsFilePath ms)))
+        ppr_ms :: ModuleNodeInfo -> SDoc
+        ppr_ms ms = quotes (ppr (moduleNodeInfoModule ms)) <+>
+                    (parens (text (node_path ms)))
+
+        node_path :: ModuleNodeInfo -> FilePath
+        node_path ms = case ml_hs_file (moduleNodeInfoLocation ms) of
+          Just f -> f
+          Nothing -> ml_hi_file (moduleNodeInfoLocation ms)
     DriverInstantiationNodeInDependencyGeneration node ->
       mkSimpleDecorated $
         vcat [ text "Unexpected backpack instantiation in dependency graph while constructing Makefile:"
@@ -276,7 +281,7 @@ instance Diagnostic DriverMessage where
             ++ llvmVersionStr supportedLlvmVersionLowerBound
             ++ " and "
             ++ llvmVersionStr supportedLlvmVersionUpperBound
-            ++ ") and reinstall GHC to make -fllvm work")
+            ++ ") and reinstall GHC to ensure -fllvm works")
 
   diagnosticReason = \case
     DriverUnknownMessage m
@@ -347,7 +352,7 @@ instance Diagnostic DriverMessage where
     DriverInstantiationNodeInDependencyGeneration {}
       -> ErrorWithoutFlag
     DriverNoConfiguredLLVMToolchain
-      -> ErrorWithoutFlag
+      -> WarningWithoutFlag
 
   diagnosticHints = \case
     DriverUnknownMessage m
@@ -422,4 +427,4 @@ instance Diagnostic DriverMessage where
     DriverNoConfiguredLLVMToolchain
       -> noHints
 
-  diagnosticCode = constructorCode
+  diagnosticCode = constructorCode @GHC

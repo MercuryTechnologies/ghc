@@ -35,11 +35,11 @@ import GHC.Toolchain.NormaliseTriple (normaliseTriple)
 import Text.Read (readMaybe)
 
 data Opts = Opts
-    { optTriple    :: String
+    { optTriple    :: Maybe String
     , optTargetPrefix :: Maybe String
     , optLocallyExecutable :: Maybe Bool
     , optLlvmTriple :: Maybe String
-    , optOutput    :: String
+    , optOutput    :: Maybe String
     , optCc        :: ProgOpt
     , optCxx       :: ProgOpt
     , optCpp       :: ProgOpt
@@ -52,7 +52,12 @@ data Opts = Opts
     , optNm        :: ProgOpt
     , optReadelf   :: ProgOpt
     , optMergeObjs :: ProgOpt
+    , optLlc       :: ProgOpt
+    , optOpt       :: ProgOpt
+    , optLlvmAs    :: ProgOpt
     , optWindres   :: ProgOpt
+    , optOtool     :: ProgOpt
+    , optInstallNameTool :: ProgOpt
     -- Note we don't actually configure LD into anything but
     -- see #23857 and #22550 for the very unfortunate story.
     , optLd        :: ProgOpt
@@ -82,11 +87,11 @@ emptyFormatOpts = FormatOpts { formatOptInput = error "formatOpts: input"
 
 emptyOpts :: Opts
 emptyOpts = Opts
-    { optTriple    = ""
+    { optTriple    = Nothing
     , optTargetPrefix = Nothing
     , optLocallyExecutable = Nothing
     , optLlvmTriple = Nothing
-    , optOutput    = ""
+    , optOutput    = Nothing
     , optCc        = po0
     , optCxx       = po0
     , optCpp       = po0
@@ -99,8 +104,13 @@ emptyOpts = Opts
     , optNm        = po0
     , optReadelf   = po0
     , optMergeObjs = po0
+    , optLlc       = po0
+    , optOpt       = po0
+    , optLlvmAs    = po0
     , optWindres   = po0
     , optLd        = po0
+    , optOtool     = po0
+    , optInstallNameTool = po0
     , optUnregisterised = Nothing
     , optTablesNextToCode = Nothing
     , optUseLibFFIForAdjustors = Nothing
@@ -112,7 +122,8 @@ emptyOpts = Opts
     po0 = emptyProgOpt
 
 _optCc, _optCxx, _optCpp, _optHsCpp, _optJsCpp, _optCmmCpp, _optCcLink, _optAr,
-    _optRanlib, _optNm, _optReadelf, _optMergeObjs, _optWindres, _optLd
+    _optRanlib, _optNm, _optReadelf, _optMergeObjs, _optLlc, _optOpt, _optLlvmAs,
+    _optWindres, _optLd, _optOtool, _optInstallNameTool
     :: Lens Opts ProgOpt
 _optCc      = Lens optCc      (\x o -> o {optCc=x})
 _optCxx     = Lens optCxx     (\x o -> o {optCxx=x})
@@ -126,16 +137,21 @@ _optRanlib  = Lens optRanlib  (\x o -> o {optRanlib=x})
 _optNm      = Lens optNm      (\x o -> o {optNm=x})
 _optReadelf = Lens optReadelf (\x o -> o {optReadelf=x})
 _optMergeObjs = Lens optMergeObjs (\x o -> o {optMergeObjs=x})
+_optLlc     = Lens optLlc     (\x o -> o {optLlc=x})
+_optOpt     = Lens optOpt     (\x o -> o {optOpt=x})
+_optLlvmAs  = Lens optLlvmAs  (\x o -> o {optLlvmAs=x})
 _optWindres = Lens optWindres (\x o -> o {optWindres=x})
-_optLd = Lens optLd (\x o -> o {optLd= x})
+_optLd      = Lens optLd (\x o -> o {optLd=x})
+_optOtool   = Lens optOtool (\x o -> o {optOtool=x})
+_optInstallNameTool = Lens optInstallNameTool (\x o -> o {optInstallNameTool=x})
 
-_optTriple :: Lens Opts String
+_optTriple :: Lens Opts (Maybe String)
 _optTriple = Lens optTriple (\x o -> o {optTriple=x})
 
 _optLlvmTriple :: Lens Opts (Maybe String)
 _optLlvmTriple = Lens optLlvmTriple (\x o -> o {optLlvmTriple=x})
 
-_optOutput :: Lens Opts String
+_optOutput :: Lens Opts (Maybe String)
 _optOutput = Lens optOutput (\x o -> o {optOutput=x})
 
 _optTargetPrefix :: Lens Opts (Maybe String)
@@ -183,8 +199,13 @@ options =
     , progOpts "nm" "nm archiver" _optNm
     , progOpts "readelf" "readelf utility" _optReadelf
     , progOpts "merge-objs" "linker for merging objects" _optMergeObjs
+    , progOpts "llc" "LLVM llc utility" _optLlc
+    , progOpts "opt" "LLVM opt utility" _optOpt
+    , progOpts "llvm-as" "Assembler used for LLVM backend (typically clang)" _optLlvmAs
     , progOpts "windres" "windres utility" _optWindres
     , progOpts "ld" "linker" _optLd
+    , progOpts "otool" "otool utility" _optOtool
+    , progOpts "install-name-tool" "install-name-tool utility" _optInstallNameTool
     ]
   where
     progOpts :: String -> String -> Lens Opts ProgOpt -> [OptDescr (Opts -> Opts)]
@@ -213,7 +234,7 @@ options =
         , Option [] ["disable-" ++ optName] (NoArg (set lens (Just False))) ("Disable " ++ description)
         ]
 
-    tripleOpt = Option ['t'] ["triple"] (ReqArg (set _optTriple) "TRIPLE") "Target triple"
+    tripleOpt = Option ['t'] ["triple"] (ReqArg (set _optTriple . Just) "TRIPLE") "Target triple"
     llvmTripleOpt = Option [] ["llvm-triple"] (ReqArg (set _optLlvmTriple . Just) "LLVM-TRIPLE") "LLVM Target triple"
 
     targetPrefixOpt = Option ['T'] ["target-prefix"] (ReqArg (set _optTargetPrefix . Just) "PREFIX")
@@ -233,7 +254,7 @@ options =
     keepTempOpt = Option [] ["keep-temp"] (NoArg (set _optKeepTemp True))
         "do not remove temporary files"
 
-    outputOpt = Option ['o'] ["output"] (ReqArg (set _optOutput) "OUTPUT")
+    outputOpt = Option ['o'] ["output"] (ReqArg (set _optOutput . Just) "OUTPUT")
         "The output path for the generated target toolchain configuration"
 
 formatOpts :: [OptDescr (FormatOpts -> FormatOpts)]
@@ -243,6 +264,16 @@ formatOpts = [
     , (Option ['i'] ["input"] (ReqArg (set _formatOptInput) "INPUT")
         "The target file to format")
     ]
+
+validateOpts :: Opts -> [String]
+validateOpts opts = mconcat
+    [ assertJust _optTriple "missing --triple flag"
+    , assertJust _optOutput "missing --output flag"
+    ]
+  where
+    assertJust :: Lens Opts (Maybe a) -> String -> [String]
+    assertJust lens msg =
+      [ msg | Nothing <- pure $ view lens opts ]
 
 main :: IO ()
 main = do
@@ -273,14 +304,14 @@ doFormat args = do
 
 doConfigure :: [String] -> IO ()
 doConfigure args = do
-    let (opts0, _nonopts, errs) = getOpt RequireOrder options args
+    let (opts0, _nonopts, parseErrs) = getOpt RequireOrder options args
     let opts = foldr (.) id opts0 emptyOpts
-    case errs of
+    case parseErrs ++ validateOpts opts of
       [] -> do
           let env = Env { verbosity = optVerbosity opts
                         , targetPrefix = case optTargetPrefix opts of
                                            Just prefix -> Just prefix
-                                           Nothing -> Just $ optTriple opts ++ "-"
+                                           Nothing -> Just $ fromMaybe (error "undefined triple") (optTriple opts) ++ "-"
                         , keepTemp = optKeepTemp opts
                         , canLocallyExecute = fromMaybe True (optLocallyExecutable opts)
                         , logContexts = []
@@ -289,7 +320,7 @@ doConfigure args = do
           case r of
             Left err -> print err >> exitWith (ExitFailure 2)
             Right () -> return ()
-      _  -> do
+      errs -> do
         mapM_ putStrLn errs
         putStrLn $ usageInfo "ghc-toolchain" options
         exitWith (ExitFailure 1)
@@ -298,7 +329,7 @@ run :: Opts -> M ()
 run opts = do
     tgt <- mkTarget opts
     logDebug $ "Final Target: " ++ show tgt
-    let file = optOutput opts
+    let file = fromMaybe (error "undefined --output") (optOutput opts)
     writeFile file (show tgt)
 
 optional :: M a -> M (Maybe a)
@@ -317,6 +348,7 @@ registerisedSupported archOs =
       ArchRISCV64   -> True
       ArchWasm32    -> True
       ArchJavaScript -> True
+      ArchLoongArch64 -> True
       _             -> False
 
 determineUnregisterised :: ArchOS -> Maybe Bool -> M Bool
@@ -338,6 +370,7 @@ tablesNextToCodeSupported archOs =
       ArchPPC      -> False
       ArchPPC_64 _ -> False
       ArchS390X    -> False
+      ArchAArch64  -> archOS_OS archOs /= OSMinGW32
       _            -> True
 
 determineTablesNextToCode
@@ -390,7 +423,7 @@ ldOverrideWhitelist a =
 
 mkTarget :: Opts -> M Target
 mkTarget opts = do
-    normalised_triple <- normaliseTriple (optTriple opts)
+    normalised_triple <- normaliseTriple (fromMaybe (error "missing --triple") (optTriple opts))
     -- Use Llvm target if specified, otherwise use triple as llvm target
     let tgtLlvmTarget = fromMaybe normalised_triple (optLlvmTriple opts)
 
@@ -424,6 +457,11 @@ mkTarget opts = do
     when (isNothing mergeObjs && not (arSupportsDashL ar)) $
       throwE "Neither a object-merging tool (e.g. ld -r) nor an ar that supports -L is available"
 
+    -- LLVM toolchain
+    llc <- findProgram "llc" (optLlc opts) ["llc"] <|> return (Program "llc" [])
+    opt <- findProgram "opt" (optOpt opts) ["opt"] <|> return (Program "opt" [])
+    llvmAs <- findProgram "llvm assembler" (optLlvmAs opts) ["clang"] <|> return (Program "clang" [])
+
     -- Windows-specific utilities
     windres <-
         case archOS_OS archOs of
@@ -431,6 +469,15 @@ mkTarget opts = do
             windres <- findProgram "windres" (optWindres opts) ["windres"]
             return (Just windres)
           _ -> return Nothing
+
+    -- Darwin-specific utilities
+    (otool, installNameTool) <-
+        case archOS_OS archOs of
+          OSDarwin -> do
+            otool <- findProgram "otool" (optOtool opts) ["otool"]
+            installNameTool <- findProgram "install_name_tool" (optInstallNameTool opts) ["install_name_tool"]
+            return (Just otool, Just installNameTool)
+          _ -> return (Nothing, Nothing)
 
     -- various other properties of the platform
     tgtWordSize <- checkWordSize cc
@@ -468,7 +515,12 @@ mkTarget opts = do
                    , tgtRanlib = ranlib
                    , tgtNm = nm
                    , tgtMergeObjs = mergeObjs
+                   , tgtLlc = Just llc
+                   , tgtOpt = Just opt
+                   , tgtLlvmAs = Just llvmAs
                    , tgtWindres = windres
+                   , tgtOtool = otool
+                   , tgtInstallNameTool = installNameTool
                    , tgtWordSize
                    , tgtEndianness
                    , tgtUnregisterised

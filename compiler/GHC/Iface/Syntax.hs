@@ -26,7 +26,8 @@ module GHC.Iface.Syntax (
         IfaceCompleteMatch(..),
         IfaceLFInfo(..), IfaceTopBndrInfo(..),
         IfaceImport(..),
-        ImpIfaceList(..),
+        ifImpModule,
+        ImpIfaceList(..), IfaceExport,
 
         -- * Binding names
         IfaceTopBndr,
@@ -69,9 +70,11 @@ import GHC.Types.Name.Set
 import GHC.Types.Name.Reader
 import GHC.Types.CostCentre
 import GHC.Types.Literal
+import GHC.Types.Avail
 import GHC.Types.ForeignCall
 import GHC.Types.Annotations( AnnPayload, AnnTarget )
 import GHC.Types.Basic
+import GHC.Types.Tickish
 import GHC.Unit.Module
 import GHC.Unit.Module.Warnings
 import GHC.Types.SrcLoc
@@ -92,14 +95,14 @@ import GHC.Utils.Binary.Typeable () -- instance Binary AnnPayload
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc( dropList, filterByList, notNull, unzipWith,
-                       seqList, zipWithEqual )
+                       zipWithEqual )
 
 import Language.Haskell.Syntax.BooleanFormula(BooleanFormula(..))
 
 import Control.Monad
-import System.IO.Unsafe
 import Control.DeepSeq
 import Data.Proxy
+import qualified Data.Set as Set
 
 infixl 3 &&&
 
@@ -111,12 +114,52 @@ infixl 3 &&&
 ************************************************************************
 -}
 
+type IfaceExport = AvailInfo
+
 data IfaceImport = IfaceImport ImpDeclSpec ImpIfaceList
 
 data ImpIfaceList
   = ImpIfaceAll -- ^ no user import list
-  | ImpIfaceExplicit !IfGlobalRdrEnv
-  | ImpIfaceEverythingBut !NameSet
+  | ImpIfaceExplicit
+    { iil_avails :: !DetOrdAvails
+    , iil_non_explicit_parents :: ![Name]
+    }
+  | ImpIfaceEverythingBut ![Name]
+
+-- | Extract the imported module from an IfaceImport
+ifImpModule :: IfaceImport -> Module
+ifImpModule (IfaceImport declSpec _) = is_mod declSpec
+
+instance Binary IfaceImport where
+  put_ bh (IfaceImport declSpec ifaceList) = do
+    put_ bh declSpec
+    put_ bh ifaceList
+  get bh = do
+    declSpec <- get bh
+    ifaceList <- get bh
+    return (IfaceImport declSpec ifaceList)
+
+instance Binary ImpIfaceList where
+  put_ bh ImpIfaceAll = putByte bh 0
+  put_ bh (ImpIfaceExplicit env implicit_parents) = do
+    putByte bh 1
+    put_ bh env
+    put_ bh implicit_parents
+  put_ bh (ImpIfaceEverythingBut ns) = do
+    putByte bh 2
+    put_ @[Name] bh ns
+  get bh = do
+    tag <- getByte bh
+    case tag of
+      0 -> return ImpIfaceAll
+      1 -> do
+        env <- get bh
+        implicit_parents <- get bh
+        return $ ImpIfaceExplicit env implicit_parents
+      2 -> do
+        ns <- get @[Name] bh
+        return $ ImpIfaceEverythingBut ns
+      _ -> fail $ "instance Binary ImpIfaceList: Invalid tag " ++ show tag
 
 -- | A binding top-level 'Name' in an interface file (e.g. the name of an
 -- 'IfaceDecl').
@@ -212,7 +255,14 @@ data IfaceClassBody
      ifClassCtxt :: IfaceContext,             -- Super classes
      ifATs       :: [IfaceAT],                -- Associated type families
      ifSigs      :: [IfaceClassOp],           -- Method signatures
-     ifMinDef    :: IfaceBooleanFormula       -- Minimal complete definition
+     ifMinDef    :: IfaceBooleanFormula,      -- Minimal complete definition
+     ifUnary     :: Bool                      -- This is a unary class
+       -- NB: in principle ifUnary is redundant; it can be deduced from
+       --     the number and types of class ops.  In practice, in interface
+       --     files those types are knot tied, and it's very easy to get a
+       --     black hole.  Easiest thing: let the definition module decide if
+       --     it is a unary class, and communicate that through IfaceClassBody
+       --     See (UCM12) in Note [Unary class magic] in GHC.Core.TyCon
     }
 
 -- See also 'BooleanFormula'
@@ -291,7 +341,7 @@ data IfaceConDecl
         -- So this guarantee holds for IfaceConDecl, but *not* for DataCon
 
         ifConExTCvs   :: [IfaceBndr],  -- Existential ty/covars
-        ifConUserTvBinders :: [IfaceForAllSpecBndr],
+        ifConUserTvBinders :: [IfaceForAllBndr],
           -- The tyvars, in the order the user wrote them
           -- INVARIANT: the set of tyvars in ifConUserTvBinders is exactly the
           --            set of tyvars (*not* covars) of ifConExTCvs, unioned
@@ -322,7 +372,7 @@ data IfaceSrcBang
 -- See Note [Named default declarations] in GHC.Tc.Gen.Default
 -- | Exported named defaults
 data IfaceDefault
-  = IfaceDefault { ifDefaultCls  :: IfaceTyCon,            -- Defaulted class
+  = IfaceDefault { ifDefaultCls  :: IfExtName,            -- Defaulted class
                    ifDefaultTys  :: [IfaceType],          -- List of defaults
                    ifDefaultWarn :: Maybe IfaceWarningTxt }
 
@@ -500,6 +550,14 @@ instance Binary IfaceLFInfo where
             4 -> pure IfLFUnlifted
             _ -> panic "Invalid byte"
 
+instance NFData IfaceLFInfo where
+  rnf = \case
+    IfLFReEntrant arity -> rnf arity
+    IfLFThunk updatable mb_fun -> rnf updatable `seq` rnf mb_fun
+    IfLFCon con -> rnf con
+    IfLFUnknown fun_flag -> rnf fun_flag
+    IfLFUnlifted -> ()
+
 {-
 Note [Versioning of instances]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -551,9 +609,7 @@ ifaceDeclImplicitBndrs (IfaceClass { ifName = cls_tc_name
                                         ifSigs      = sigs,
                                         ifATs       = ats
                                      }})
-  = --   (possibly) newtype coercion
-    co_occs ++
-    --    data constructor (DataCon namespace)
+  = --    data constructor (DataCon namespace)
     --    data worker (Id namespace)
     --    no wrapper (class dictionaries never have a wrapper)
     [dc_occ, dcww_occ] ++
@@ -566,12 +622,8 @@ ifaceDeclImplicitBndrs (IfaceClass { ifName = cls_tc_name
   where
     cls_tc_occ = occName cls_tc_name
     n_ctxt = length sc_ctxt
-    n_sigs = length sigs
-    co_occs | is_newtype = [mkNewTyCoOcc cls_tc_occ]
-            | otherwise  = []
     dcww_occ = mkDataConWorkerOcc dc_occ
     dc_occ = mkClassDataConOcc cls_tc_occ
-    is_newtype = n_sigs + n_ctxt == 1 -- Sigh (keep this synced with buildClass)
 
 ifaceDeclImplicitBndrs _ = []
 
@@ -598,9 +650,7 @@ ifaceDeclFingerprints hash decl
     [ (occ, computeFingerprint' (hash,occ))
     | occ <- ifaceDeclImplicitBndrs decl ]
   where
-     computeFingerprint' =
-       unsafeDupablePerformIO
-        . computeFingerprint (panic "ifaceDeclFingerprints")
+    computeFingerprint' = computeFingerprint (panic "ifaceDeclFingerprints")
 
 fromIfaceWarnings :: IfaceWarnings -> Warnings GhcRn
 fromIfaceWarnings = \case
@@ -651,7 +701,7 @@ data IfaceTickish
   = IfaceHpcTick    Module Int               -- from HpcTick x
   | IfaceSCC        CostCentre Bool Bool     -- from ProfNote
   | IfaceSource  RealSrcSpan FastString      -- from SourceNote
-  | IfaceBreakpoint Int [IfaceExpr] Module   -- from Breakpoint
+  | IfaceBreakpoint BreakpointId [IfaceExpr] -- from Breakpoint
 
 data IfaceAlt = IfaceAlt IfaceConAlt [IfLclName] IfaceExpr
         -- Note: IfLclName, not IfaceBndr (and same with the case binder)
@@ -912,15 +962,226 @@ constraintIfaceKind :: IfaceKind
 constraintIfaceKind =
   IfaceTyConApp (IfaceTyCon constraintKindTyConName (mkIfaceTyConInfo NotPromoted IfaceNormalTyCon)) IA_Nil
 
+{- Note [Print invisible binders in interface declarations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Starting from GHC 9.8 it is possible to write invisible @-binders
+in type-level declarations. That feature introduced several challenges
+in interface declaration pretty printing (e.g. using the :info command
+inside GHCi) to overcome.
+
+Consider this example with a redundant type variable `a`:
+
+  type Id :: forall a b. b -> b
+  type Id x = x
+
+GHC will create system binders for kinds there to meet typechecking
+and compilation needs and that will turn that declaration into a less
+straightforward form with multiple @-binders:
+
+  type Id :: forall {k} (a :: k) b. b -> b
+  type Id @{k} @a @b x = x :: b
+
+This information isn't required for understanding in most cases,
+so GHC will hide it unless -fprint-explicit-kinds flag is supplied by the user.
+And here is what we get:
+
+  type Id :: forall {k} (a :: k) b. b -> b
+  type Id x = x
+
+However, there are several cases involving user-written @-binders
+when it is cruicial to show them to provide understanding of what's going on.
+First of all it can plainly appear on the right-hand side:
+
+  type T :: forall (a :: Type). Type
+  type T @x = Tuple2 x x
+
+Not only that, an invisible binder can be unused by itself, but have an
+impact on invisible binder positioning, e.g.:
+
+  type T :: forall (a :: Type) (b :: Type). Type
+  type T           @x          @y        = Tuple2 y y
+
+Here `x` is unused, but it is required to display, as `y` corresponds
+to `b` in the standalone kind signature.
+
+The last problem is related to non-generative type declarations (type
+synonyms and type families) only. It is not possible to partially
+apply them, hence it's important to understand what parts of a declaration's
+kind are related to the declaration itself. Here is a simple example:
+
+  type T1 :: forall k. k -> Maybe k
+  type T1 = Just
+
+  type T2 :: forall k. k -> Maybe k
+  type T2 @k = Just
+
+Both these type synonyms have the same kind signature, but they aren't
+the same! `T1` can be used in strictly more cases, for example, as
+an argument for a higher-order type:
+
+  type F :: (forall k. k -> Maybe k) -> Type
+
+  type R1 = F T1 -- Yes!
+  type R2 = F T2 -- No, that will not compile :(
+
+User-written invisible binders and "system" binders introduced by GHC
+are indistinguishable at this stage, hence we try to only print
+semantically significant binders by default.
+
+An invisible binder is considered significant when it meets at least
+one of the following two criteria:
+  - It visibly occurs in the declaration's body (See more about that below)
+  - It is followed by a significant binder,
+    so it affects positioning
+For non-generative type declarations (type synonyms and type families),
+there is one additional criterion:
+  - It is not followed by a visible binder, so it
+    affects the arity of a type declaration
+
+The overall solution consists of three functions:
+- `iface_decl_non_generative` decides whether the current declaration is
+   generative or not
+
+- `iface_decl_mentioned_vars` gives a Set of variables that
+  visibly occur in the declaration's body
+
+- `suppressIfaceInvisibles` uses information provided
+  by the first two functions to actually filter out insignificant
+  @-binders
+
+Here is what we consider "visibly occurs" in general and for
+each declaration type:
+
+- Variables that visibly occur in IfaceType are collected by the
+  `visibleTypeVarOccurencies` function.
+
+- Variables that visibly occur in IfaceAT are collected by `iface_at_mentioned_vars`
+  function. It accounts visible binders for associated data and type
+  families and for type families only, it counts invisible binders.
+  Associated types can't have definitions, so it's safe to drop all other
+  binders.
+
+- None of the type variables in IfaceData declared using GADT syntax doesn't are considered
+  as visibe occurrences. This is because each constructor has its own variables, e.g.:
+
+    type D :: forall (a :: Type). Type
+    data D @a where
+      MkD :: D @b
+      -- This is shorthand for:
+      -- MkD :: forall b. D @b
+
+- For IfaceData declared using Haskell98 syntax, a variable is considered visible
+  if it visibly occurs in at least one argument's type in at least one constructor.
+
+- For IfaceSynonym, a variable is considered visible if it visibly occurs
+  in the RHS type.
+
+- For IfaceFamily, a variable is considered visible if i occurs inside
+  an injectivity annotation, e.g.
+
+    type family F @a = r | r -> a
+
+- For IfaceClass, a variable is considered visible if it occurs at least
+  once inside a functional dependency annotation or in at least one method's
+  type signature, or if it visibly occurs in at least one associated type's
+  declaration (Visible occurrences in associated types are described above.)
+
+- IfacePatSyn, IfaceId and IfaceAxiom are irrelevant to this problem.
+-}
+
+iface_decl_generative :: IfaceDecl -> Bool
+iface_decl_generative IfaceSynonym{} = False
+iface_decl_generative IfaceFamily{ifFamFlav = rhs}
+  | IfaceDataFamilyTyCon <- rhs = True
+  | otherwise = False
+iface_decl_generative IfaceData{} = True
+iface_decl_generative IfaceId{} = True
+iface_decl_generative IfaceClass{} = True
+iface_decl_generative IfaceAxiom{} = True
+iface_decl_generative IfacePatSyn{} = True
+
+iface_at_mentioned_vars :: IfaceAT -> Set.Set IfLclName
+iface_at_mentioned_vars (IfaceAT decl _)
+  = Set.fromList . map ifTyConBinderName . suppress_vars $ binders
+  where
+    -- ifBinders is not total, so we assume here that associated types
+    -- cannot be IfaceId, IfaceAxiom or IfacePatSyn
+    binders = case decl of
+      IfaceFamily {ifBinders} -> ifBinders
+      IfaceData{ifBinders} -> ifBinders
+      IfaceSynonym{ifBinders} -> ifBinders
+      IfaceClass{ifBinders} -> ifBinders
+      IfaceId{} -> panic "IfaceId shoudn't be an associated type!"
+      IfaceAxiom{} -> panic "IfaceAxiom shoudn't be an associated type!"
+      IfacePatSyn {} -> panic "IfacePatSyn shoudn't be an associated type!"
+
+    suppress_arity = not (iface_decl_generative decl)
+
+    suppress_vars binders =
+      suppressIfaceInvisibles
+        -- We need to count trailing invisible binders for type families
+        (MkPrintArityInvisibles suppress_arity)
+        -- But this setting will simply count all invisible binderss
+        (PrintExplicitKinds False)
+        -- ...and associated types can't have a RHS
+        mempty
+        binders binders
+
+-- See Note [Print invisible binders in interface declarations]
+-- in particular, the parts about collecting visible occurrences
+iface_decl_mentioned_vars :: IfaceDecl -> Set.Set IfLclName
+iface_decl_mentioned_vars (IfaceData { ifCons = condecls, ifGadtSyntax = gadt })
+  | gadt = mempty
+  -- Get visible occurrences in each constructor in each alternative
+  | otherwise = Set.unions (map mentioned_con_vars cons)
+  where
+    mentioned_con_vars = Set.unions . map (visibleTypeVarOccurencies . snd) . ifConArgTys
+    cons = visibleIfConDecls condecls
+
+iface_decl_mentioned_vars (IfaceClass { ifFDs = fds, ifBody = IfAbstractClass })
+  = Set.unions (map fundep_names fds)
+  where
+    fundep_names fd = Set.fromList (fst fd) `Set.union` Set.fromList (snd fd)
+
+iface_decl_mentioned_vars
+  (IfaceClass { ifFDs    = fds
+              , ifBody = IfConcreteClass {
+                  ifATs = ats,
+                  ifSigs = sigs
+                }})
+  = Set.unions
+        [ Set.unions (map fundep_names fds)
+        , Set.unions (map iface_at_mentioned_vars ats)
+        , Set.unions (map (visibleTypeVarOccurencies . class_op_type) sigs)
+        ]
+  where
+    class_op_type (IfaceClassOp _bndr ty _default) = ty
+
+    fundep_names fd = Set.fromList (fst fd) `Set.union` Set.fromList (snd fd)
+
+iface_decl_mentioned_vars (IfaceSynonym {ifSynRhs  = poly_ty})
+  = visibleTypeVarOccurencies poly_ty
+
+-- Consider a binder to be a visible occurrence if it occurs inside an injectivity annotation.
+iface_decl_mentioned_vars (IfaceFamily { ifBinders = binders, ifResVar = res_var, ifFamInj = inj })
+  | Just{} <- res_var
+  , Injective injectivity <- inj
+  = Set.fromList . map (ifTyConBinderName . snd) . filter fst $ zip injectivity binders
+  | otherwise = mempty
+
+iface_decl_mentioned_vars IfacePatSyn{} = mempty
+iface_decl_mentioned_vars IfaceId{} = mempty
+iface_decl_mentioned_vars IfaceAxiom{} = mempty
+
 pprIfaceDecl :: ShowSub -> IfaceDecl -> SDoc
 -- NB: pprIfaceDecl is also used for pretty-printing TyThings in GHCi
 --     See Note [Pretty printing via Iface syntax] in GHC.Types.TyThing.Ppr
-pprIfaceDecl ss (IfaceData { ifName = tycon, ifCType = ctype,
-                             ifCtxt = context, ifResKind = kind,
-                             ifRoles = roles, ifCons = condecls,
-                             ifParent = parent,
-                             ifGadtSyntax = gadt,
-                             ifBinders = binders })
+pprIfaceDecl ss decl@(IfaceData { ifName = tycon, ifCType = ctype,
+                                  ifCtxt = context, ifResKind = kind,
+                                  ifRoles = roles, ifCons = condecls,
+                                  ifParent = parent,
+                                  ifGadtSyntax = gadt,
+                                  ifBinders = binders })
 
   | gadt      = vcat [ pp_roles
                      , pp_ki_sig
@@ -946,8 +1207,10 @@ pprIfaceDecl ss (IfaceData { ifName = tycon, ifCType = ctype,
     pp_kind    = ppUnless (ki_sig_printable || isIfaceLiftedTypeKind kind)
                           (dcolon <+> ppr kind)
 
+    decl_head = pprIfaceDeclHead decl suppress_bndr_sig context ss tycon binders
+
     pp_lhs = case parent of
-               IfNoParent -> pprIfaceDeclHead suppress_bndr_sig context ss tycon binders
+               IfNoParent -> decl_head
                IfDataInstance{}
                           -> text "instance" <+> pp_data_inst_forall
                                              <+> pprIfaceTyConParent parent
@@ -994,35 +1257,39 @@ pprIfaceDecl ss (IfaceData { ifName = tycon, ifCType = ctype,
 
     pp_extra = vcat [pprCType ctype]
 
-pprIfaceDecl ss (IfaceClass { ifName  = clas
-                            , ifRoles = roles
-                            , ifFDs    = fds
-                            , ifBinders = binders
-                            , ifBody = IfAbstractClass })
+pprIfaceDecl ss decl@(IfaceClass { ifName  = clas
+                                 , ifRoles = roles
+                                 , ifFDs    = fds
+                                 , ifBinders = binders
+                                 , ifBody = IfAbstractClass })
   = vcat [ pprClassRoles ss clas binders roles
          , pprClassStandaloneKindSig ss clas (mkIfaceTyConKind binders constraintIfaceKind)
-         , text "class" <+> pprIfaceDeclHead suppress_bndr_sig [] ss clas binders <+> pprFundeps fds ]
+         , text "class" <+> decl_head <+> pprFundeps fds ]
   where
+    decl_head = pprIfaceDeclHead decl suppress_bndr_sig [] ss clas binders
+
     -- See Note [Suppressing binder signatures] in GHC.Iface.Type
     suppress_bndr_sig = SuppressBndrSig True
 
-pprIfaceDecl ss (IfaceClass { ifName  = clas
-                            , ifRoles = roles
-                            , ifFDs    = fds
-                            , ifBinders = binders
-                            , ifBody = IfConcreteClass {
-                                ifATs = ats,
-                                ifSigs = sigs,
-                                ifClassCtxt = context,
-                                ifMinDef = minDef
-                              }})
+pprIfaceDecl ss decl@(IfaceClass { ifName  = clas
+                                 , ifRoles = roles
+                                 , ifFDs    = fds
+                                 , ifBinders = binders
+                                 , ifBody = IfConcreteClass {
+                                     ifATs = ats,
+                                     ifSigs = sigs,
+                                     ifClassCtxt = context,
+                                     ifMinDef = minDef
+                                   }})
   = vcat [ pprClassRoles ss clas binders roles
          , pprClassStandaloneKindSig ss clas (mkIfaceTyConKind binders constraintIfaceKind)
-         , text "class" <+> pprIfaceDeclHead suppress_bndr_sig context ss clas binders <+> pprFundeps fds <+> pp_where
+         , text "class" <+> decl_head <+> pprFundeps fds <+> pp_where
          , nest 2 (vcat [ vcat asocs, vcat dsigs
                         , ppShowAllSubs ss (pprMinDef $ fromIfaceBooleanFormula minDef)])]
     where
       pp_where = ppShowRhs ss $ ppUnless (null sigs && null ats) (text "where")
+
+      decl_head = pprIfaceDeclHead decl suppress_bndr_sig context ss clas binders
 
       asocs = ppr_trim $ map maybeShowAssoc ats
       dsigs = ppr_trim $ map maybeShowSig sigs
@@ -1055,18 +1322,19 @@ pprIfaceDecl ss (IfaceClass { ifName  = clas
       -- See Note [Suppressing binder signatures] in GHC.Iface.Type
       suppress_bndr_sig = SuppressBndrSig True
 
-pprIfaceDecl ss (IfaceSynonym { ifName    = tc
-                              , ifBinders = binders
-                              , ifSynRhs  = mono_ty
-                              , ifResKind = res_kind})
+pprIfaceDecl ss decl@(IfaceSynonym { ifName    = tc
+                                   , ifBinders = binders
+                                   , ifSynRhs  = poly_ty
+                                   , ifResKind = res_kind})
   = vcat [ pprStandaloneKindSig name_doc (mkIfaceTyConKind binders res_kind)
-         , hang (text "type" <+> pprIfaceDeclHead suppress_bndr_sig [] ss tc binders <+> equals)
-           2 (sep [ pprIfaceForAll tvs, pprIfaceContextArr theta, ppr_tau
-                  , ppUnless (isIfaceLiftedTypeKind res_kind) (dcolon <+> ppr res_kind) ])
+         , hang (text "type" <+> decl_head <+> equals)
+           2 (sep [ pprIfaceForAll tvs, pprIfaceContextArr theta, ppr_tau ])
          ]
   where
-    (tvs, theta, tau) = splitIfaceSigmaTy mono_ty
+    (tvs, theta, tau) = splitIfaceSigmaTy poly_ty
     name_doc = pprPrefixIfDeclBndr (ss_how_much ss) (occName tc)
+
+    decl_head = pprIfaceDeclHead decl suppress_bndr_sig [] ss tc binders
 
     -- See Note [Printing type abbreviations] in GHC.Iface.Type
     ppr_tau | tc `hasKey` liftedTypeKindTyConKey ||
@@ -1078,20 +1346,18 @@ pprIfaceDecl ss (IfaceSynonym { ifName    = tc
     -- See Note [Suppressing binder signatures] in GHC.Iface.Type
     suppress_bndr_sig = SuppressBndrSig True
 
-pprIfaceDecl ss (IfaceFamily { ifName = tycon
-                             , ifFamFlav = rhs, ifBinders = binders
-                             , ifResKind = res_kind
-                             , ifResVar = res_var, ifFamInj = inj })
+pprIfaceDecl ss decl@(IfaceFamily { ifName = tycon
+                                  , ifFamFlav = rhs, ifBinders = binders
+                                  , ifResKind = res_kind
+                                  , ifResVar = res_var, ifFamInj = inj })
   | IfaceDataFamilyTyCon <- rhs
   = vcat [ pprStandaloneKindSig name_doc (mkIfaceTyConKind binders res_kind)
-         , text "data family" <+> pprIfaceDeclHead suppress_bndr_sig [] ss tycon binders
+         , text "data family" <+> decl_head
          ]
 
   | otherwise
   = vcat [ pprStandaloneKindSig name_doc (mkIfaceTyConKind binders res_kind)
-         , hang (text "type family"
-                   <+> pprIfaceDeclHead suppress_bndr_sig [] ss tycon binders
-                   <+> pp_inj res_var inj
+         , hang (text "type family" <+> decl_head <+> pp_inj res_var inj
                    <+> ppShowRhs ss (pp_where rhs))
               2 (ppShowRhs ss (pp_rhs rhs))
            $$
@@ -1099,6 +1365,8 @@ pprIfaceDecl ss (IfaceFamily { ifName = tycon
          ]
   where
     name_doc = pprPrefixIfDeclBndr (ss_how_much ss) (occName tycon)
+
+    decl_head = pprIfaceDeclHead decl suppress_bndr_sig [] ss tycon binders
 
     pp_where (IfaceClosedSynFamilyTyCon {}) = text "where"
     pp_where _                              = empty
@@ -1111,7 +1379,7 @@ pprIfaceDecl ss (IfaceFamily { ifName = tycon
 
     pp_inj_cond res inj = case filterByList inj binders of
        []  -> empty
-       tvs -> hsep [vbar, ppr res, text "->", interppSP (map ifTyConBinderName tvs)]
+       tvs -> hsep [vbar, ppr res, arrow, interppSP (map ifTyConBinderName tvs)]
 
     pp_rhs IfaceDataFamilyTyCon
       = ppShowIface ss (text "data")
@@ -1188,12 +1456,17 @@ pprRoles :: (Role -> Bool) -> SDoc -> [IfaceTyConBinder]
          -> [Role] -> SDoc
 pprRoles suppress_if tyCon bndrs roles
   = sdocOption sdocPrintExplicitKinds $ \print_kinds ->
-      let froles = suppressIfaceInvisibles (PrintExplicitKinds print_kinds) bndrs roles
+      let froles =
+            suppressIfaceInvisibles
+              (MkPrintArityInvisibles False)
+              (PrintExplicitKinds print_kinds)
+              mempty
+              bndrs roles
       in ppUnless (all suppress_if froles || null froles) $
          text "type role" <+> tyCon <+> hsep (map ppr froles)
 
 pprStandaloneKindSig :: SDoc -> IfaceType -> SDoc
-pprStandaloneKindSig tyCon ty = text "type" <+> tyCon <+> text "::" <+> ppr ty
+pprStandaloneKindSig tyCon ty = text "type" <+> tyCon <+> dcolon <+> ppr ty
 
 pprInfixIfDeclBndr :: ShowHowMuch -> OccName -> SDoc
 pprInfixIfDeclBndr (ShowSome _ (AltPpr (Just ppr_bndr))) name
@@ -1245,16 +1518,25 @@ pprIfaceTyConParent IfNoParent
 pprIfaceTyConParent (IfDataInstance _ tc tys)
   = pprIfaceTypeApp topPrec tc tys
 
-pprIfaceDeclHead :: SuppressBndrSig
+pprIfaceDeclHead :: IfaceDecl
+                 -> SuppressBndrSig
                  -> IfaceContext -> ShowSub -> Name
                  -> [IfaceTyConBinder]   -- of the tycon, for invisible-suppression
                  -> SDoc
-pprIfaceDeclHead suppress_sig context ss tc_occ bndrs
+pprIfaceDeclHead decl suppress_sig context ss tc_occ bndrs
   = sdocOption sdocPrintExplicitKinds $ \print_kinds ->
     sep [ pprIfaceContextArr context
         , pprPrefixIfDeclBndr (ss_how_much ss) (occName tc_occ)
           <+> pprIfaceTyConBinders suppress_sig
-                (suppressIfaceInvisibles (PrintExplicitKinds print_kinds) bndrs bndrs) ]
+              (suppressIfaceInvisibles
+                (MkPrintArityInvisibles print_arity)
+                (PrintExplicitKinds print_kinds)
+                mentioned_vars
+                bndrs bndrs) ]
+  where
+    -- See Note [Print invisible binders in interface declarations]
+    mentioned_vars = iface_decl_mentioned_vars decl
+    print_arity = not (iface_decl_generative decl)
 
 pprIfaceConDecl :: ShowSub -> Bool
                 -> IfaceTopBndr
@@ -1289,15 +1571,15 @@ pprIfaceConDecl ss gadt_style tycon tc_binders parent
     -- the visibilities of the existential tyvar binders, we can simply drop
     -- the universal tyvar binders from user_tvbs.
     ex_tvbs = dropList tc_binders user_tvbs
-    ppr_ex_quant = pprIfaceForAllPartMust (ifaceForAllSpecToBndrs ex_tvbs) ctxt
+    ppr_ex_quant = pprIfaceForAllPartMust ex_tvbs ctxt
     pp_gadt_res_ty = mk_user_con_res_ty eq_spec
-    ppr_gadt_ty = pprIfaceForAllPart (ifaceForAllSpecToBndrs user_tvbs) ctxt pp_tau
+    ppr_gadt_ty = pprIfaceForAllPart user_tvbs ctxt pp_tau
 
         -- A bit gruesome this, but we can't form the full con_tau, and ppr it,
         -- because we don't have a Name for the tycon, only an OccName
     pp_tau | null fields
            = case pp_args ++ [pp_gadt_res_ty] of
-                (t:ts) -> fsep (t : zipWithEqual "pprIfaceConDecl" (\(w,_) d -> ppr_arr w <+> d)
+                (t:ts) -> fsep (t : zipWithEqual (\(w,_) d -> ppr_arr w <+> d)
                                                  arg_tys ts)
                 []     -> panic "pp_con_taus"
            | otherwise
@@ -1312,9 +1594,9 @@ pprIfaceConDecl ss gadt_style tycon tc_binders parent
 
     ppr_bang IfNoBang = whenPprDebug $ char '_'
     ppr_bang IfStrict = char '!'
-    ppr_bang IfUnpack = text "{-# UNPACK #-}"
-    ppr_bang (IfUnpackCo co) = text "! {-# UNPACK #-}" <>
-                               pprParendIfaceCoercion co
+    ppr_bang IfUnpack = text "{-# UNPACK #-} !"
+    ppr_bang (IfUnpackCo co) = text "{-# UNPACK #-} !" <>
+                               whenPprDebug (pprParendIfaceCoercion co)
 
     pprFieldArgTy, pprArgTy :: (IfaceBang, IfaceType) -> SDoc
     -- If using record syntax, the only reason one would need to parenthesize
@@ -1568,7 +1850,7 @@ pprIfaceTickish (IfaceSCC cc tick scope)
   = braces (pprCostCentreCore cc <+> ppr tick <+> ppr scope)
 pprIfaceTickish (IfaceSource src _names)
   = braces (pprUserRealSpan True src)
-pprIfaceTickish (IfaceBreakpoint m ix fvs)
+pprIfaceTickish (IfaceBreakpoint (BreakpointId m ix) fvs)
   = braces (text "break" <+> ppr m <+> ppr ix <+> ppr fvs)
 
 ------------------
@@ -1918,7 +2200,7 @@ freeNamesIfaceTyConParent (IfDataInstance ax tc tys)
   = unitNameSet ax &&& freeNamesIfTc tc &&& freeNamesIfAppArgs tys
 
 freeNamesIfTickish :: IfaceTickish -> NameSet
-freeNamesIfTickish (IfaceBreakpoint _ fvs _) =
+freeNamesIfTickish (IfaceBreakpoint _ fvs) =
   fnList freeNamesIfExpr fvs
 freeNamesIfTickish _ = emptyNameSet
 
@@ -2014,9 +2296,10 @@ instance Binary IfaceDecl where
                 ifFDs     = a5,
                 ifBody = IfConcreteClass {
                     ifClassCtxt = a1,
-                    ifATs  = a6,
-                    ifSigs = a7,
-                    ifMinDef  = a8
+                    ifATs       = a6,
+                    ifSigs      = a7,
+                    ifMinDef    = a8,
+                    ifUnary     = a9
                 }}) = do
         putByte bh 5
         put_ bh a1
@@ -2027,6 +2310,7 @@ instance Binary IfaceDecl where
         put_ bh a6
         put_ bh a7
         put_ bh a8
+        put_ bh a9
 
     put_ bh (IfaceAxiom a1 a2 a3 a4) = do
         putByte bh 6
@@ -2100,6 +2384,7 @@ instance Binary IfaceDecl where
                     a6 <- get bh
                     a7 <- get bh
                     a8 <- get bh
+                    a9 <- get bh
                     return (IfaceClass {
                         ifName    = a2,
                         ifRoles   = a3,
@@ -2107,9 +2392,10 @@ instance Binary IfaceDecl where
                         ifFDs     = a5,
                         ifBody = IfConcreteClass {
                             ifClassCtxt = a1,
-                            ifATs  = a6,
-                            ifSigs = a7,
-                            ifMinDef  = a8
+                            ifATs       = a6,
+                            ifSigs      = a7,
+                            ifMinDef    = a8,
+                            ifUnary     = a9
                         }})
             6 -> do a1 <- getIfaceTopBndr bh
                     a2 <- get bh
@@ -2496,6 +2782,10 @@ getUnfoldingCache bh = do
     return (UnfoldingCache { uf_is_value = hnf, uf_is_conlike = conlike
                            , uf_is_work_free = wf, uf_expandable = exp })
 
+seqUnfoldingCache :: IfUnfoldingCache -> ()
+seqUnfoldingCache (UnfoldingCache hnf conlike wf exp) =
+    rnf hnf `seq` rnf conlike `seq` rnf wf `seq` rnf exp `seq` ()
+
 infixl 9 .<<|.
 (.<<|.) :: (Num a, Bits a) => a -> Bool -> a
 x .<<|. b = (if b then (`setBit` 0) else id) (x `shiftL` 1)
@@ -2566,12 +2856,10 @@ instance Binary IfaceExpr where
         putByte bh 13
         put_ bh a
         put_ bh b
-    put_ bh (IfaceLitRubbish TypeLike r) = do
+    put_ bh (IfaceLitRubbish torc r) = do
         putByte bh 14
         put_ bh r
-    put_ bh (IfaceLitRubbish ConstraintLike r) = do
-        putByte bh 15
-        put_ bh r
+        put_ bh torc
     get bh = do
         h <- getByte bh
         case h of
@@ -2615,9 +2903,8 @@ instance Binary IfaceExpr where
                      b <- get bh
                      return (IfaceECase a b)
             14 -> do r <- get bh
-                     return (IfaceLitRubbish TypeLike r)
-            15 -> do r <- get bh
-                     return (IfaceLitRubbish ConstraintLike r)
+                     torc <- get bh
+                     return (IfaceLitRubbish torc r)
             _ -> panic ("get IfaceExpr " ++ show h)
 
 instance Binary IfaceTickish where
@@ -2638,7 +2925,7 @@ instance Binary IfaceTickish where
         put_ bh (srcSpanEndLine src)
         put_ bh (srcSpanEndCol src)
         put_ bh name
-    put_ bh (IfaceBreakpoint m ix fvs) = do
+    put_ bh (IfaceBreakpoint (BreakpointId m ix) fvs) = do
         putByte bh 3
         put_ bh m
         put_ bh ix
@@ -2666,7 +2953,7 @@ instance Binary IfaceTickish where
             3 -> do m <- get bh
                     ix <- get bh
                     fvs <- get bh
-                    return (IfaceBreakpoint m ix fvs)
+                    return (IfaceBreakpoint (BreakpointId m ix) fvs)
             _ -> panic ("get IfaceTickish " ++ show h)
 
 instance Binary IfaceConAlt where
@@ -2768,7 +3055,7 @@ instance NFData IfaceImport where
 instance NFData ImpIfaceList where
   rnf ImpIfaceAll = ()
   rnf (ImpIfaceEverythingBut ns) = rnf ns
-  rnf (ImpIfaceExplicit gre) = rnf gre
+  rnf (ImpIfaceExplicit gre explicit) = rnf gre `seq` rnf explicit
 
 instance NFData IfaceDecl where
   rnf = \case
@@ -2776,36 +3063,36 @@ instance NFData IfaceDecl where
       rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4
 
     IfaceData f1 f2 f3 f4 f5 f6 f7 f8 f9 ->
-      f1 `seq` seqList f2 `seq` f3 `seq` f4 `seq` f5 `seq`
+      rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq`
       rnf f6 `seq` rnf f7 `seq` rnf f8 `seq` rnf f9
 
     IfaceSynonym f1 f2 f3 f4 f5 ->
-      rnf f1 `seq` f2 `seq` seqList f3 `seq` rnf f4 `seq` rnf f5
+      rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5
 
     IfaceFamily f1 f2 f3 f4 f5 f6 ->
-      rnf f1 `seq` rnf f2 `seq` seqList f3 `seq` rnf f4 `seq` rnf f5 `seq` f6 `seq` ()
+      rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` rnf f6 `seq` ()
 
     IfaceClass f1 f2 f3 f4 f5 ->
-      rnf f1 `seq` f2 `seq` seqList f3 `seq` rnf f4 `seq` rnf f5
+      rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5
 
     IfaceAxiom nm tycon role ax ->
       rnf nm `seq`
       rnf tycon `seq`
-      role `seq`
+      rnf role `seq`
       rnf ax
 
     IfacePatSyn f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 ->
-      rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` f5 `seq` f6 `seq`
-      rnf f7 `seq` rnf f8 `seq` rnf f9 `seq` rnf f10 `seq` f11 `seq` ()
+      rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` rnf f6 `seq`
+      rnf f7 `seq` rnf f8 `seq` rnf f9 `seq` rnf f10 `seq` rnf f11 `seq` ()
 
 instance NFData IfaceAxBranch where
   rnf (IfaceAxBranch f1 f2 f3 f4 f5 f6 f7) =
-    rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` f5 `seq` rnf f6 `seq` rnf f7
+    rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` rnf f6 `seq` rnf f7
 
 instance NFData IfaceClassBody where
   rnf = \case
     IfAbstractClass -> ()
-    IfConcreteClass f1 f2 f3 f4 -> rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` ()
+    IfConcreteClass f1 f2 f3 f4 f5 -> rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` ()
 
 instance NFData IfaceBooleanFormula where
   rnf = \case
@@ -2818,7 +3105,7 @@ instance NFData IfaceAT where
   rnf (IfaceAT f1 f2) = rnf f1 `seq` rnf f2
 
 instance NFData IfaceClassOp where
-  rnf (IfaceClassOp f1 f2 f3) = rnf f1 `seq` rnf f2 `seq` f3 `seq` ()
+  rnf (IfaceClassOp f1 f2 f3) = rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` ()
 
 instance NFData IfaceTyConParent where
   rnf = \case
@@ -2833,19 +3120,22 @@ instance NFData IfaceConDecls where
 
 instance NFData IfaceConDecl where
   rnf (IfCon f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11) =
-    rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` f5 `seq` rnf f6 `seq`
-    rnf f7 `seq` rnf f8 `seq` f9 `seq` rnf f10 `seq` rnf f11
+    rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` rnf f6 `seq`
+    rnf f7 `seq` rnf f8 `seq` rnf f9 `seq` rnf f10 `seq` rnf f11
 
 instance NFData IfaceSrcBang where
-  rnf (IfSrcBang f1 f2) = f1 `seq` f2 `seq` ()
+  rnf (IfSrcBang f1 f2) = rnf f1 `seq` rnf f2 `seq` ()
 
 instance NFData IfaceBang where
-  rnf x = x `seq` ()
+  rnf IfNoBang = ()
+  rnf IfStrict = ()
+  rnf IfUnpack = ()
+  rnf (IfUnpackCo co) = rnf co
 
 instance NFData IfaceIdDetails where
   rnf = \case
     IfVanillaId -> ()
-    IfWorkerLikeId dmds -> dmds `seqList` ()
+    IfWorkerLikeId dmds -> rnf dmds `seq` ()
     IfRecSelId (Left tycon) b c d -> rnf tycon `seq` rnf b `seq` rnf c `seq` rnf d
     IfRecSelId (Right decl) b c d -> rnf decl `seq` rnf b `seq` rnf c `seq` rnf d
     IfDFunId -> ()
@@ -2854,23 +3144,22 @@ instance NFData IfaceInfoItem where
   rnf = \case
     HsArity a -> rnf a
     HsDmdSig str -> seqDmdSig str
-    HsInline p -> p `seq` () -- TODO: seq further?
+    HsInline p -> rnf p `seq` ()
     HsUnfold b unf -> rnf b `seq` rnf unf
     HsNoCafRefs -> ()
-    HsCprSig cpr -> cpr `seq` ()
-    HsLFInfo lf_info -> lf_info `seq` () -- TODO: seq further?
-    HsTagSig sig -> sig `seq` ()
+    HsCprSig cpr -> seqCprSig cpr `seq` ()
+    HsLFInfo lf_info -> rnf lf_info `seq` ()
+    HsTagSig sig -> seqTagSig sig `seq` ()
 
 instance NFData IfGuidance where
   rnf = \case
     IfNoGuidance -> ()
-    IfWhen a b c -> a `seq` b `seq` c `seq` ()
+    IfWhen a b c -> rnf a `seq` rnf b `seq` rnf c `seq` ()
 
 instance NFData IfaceUnfolding where
   rnf = \case
-    IfCoreUnfold src cache guidance expr -> src `seq` cache `seq` rnf guidance `seq` rnf expr
+    IfCoreUnfold src cache guidance expr -> rnf src `seq` seqUnfoldingCache cache `seq` rnf guidance `seq` rnf expr
     IfDFunUnfold bndrs exprs             -> rnf bndrs `seq` rnf exprs
-    -- See Note [UnfoldingCache] in GHC.Core for why it suffices to merely `seq` on cache
 
 instance NFData IfaceExpr where
   rnf = \case
@@ -2878,16 +3167,16 @@ instance NFData IfaceExpr where
     IfaceExt nm -> rnf nm
     IfaceType ty -> rnf ty
     IfaceCo co -> rnf co
-    IfaceTuple sort exprs -> sort `seq` rnf exprs
+    IfaceTuple sort exprs -> rnf sort `seq` rnf exprs
     IfaceLam bndr expr -> rnf bndr `seq` rnf expr
     IfaceApp e1 e2 -> rnf e1 `seq` rnf e2
-    IfaceCase e nm alts -> rnf e `seq` nm `seq` rnf alts
+    IfaceCase e nm alts -> rnf e `seq` rnf nm `seq` rnf alts
     IfaceECase e ty -> rnf e `seq` rnf ty
     IfaceLet bind e -> rnf bind `seq` rnf e
     IfaceCast e co -> rnf e `seq` rnf co
-    IfaceLit l -> l `seq` () -- FIXME
-    IfaceLitRubbish tc r -> tc `seq` rnf r `seq` ()
-    IfaceFCall fc ty -> fc `seq` rnf ty
+    IfaceLit l -> rnf l `seq` ()
+    IfaceLitRubbish tc r -> rnf tc `seq` rnf r `seq` ()
+    IfaceFCall fc ty -> rnf fc `seq` rnf ty
     IfaceTick tick e -> rnf tick `seq` rnf e
 
 instance NFData IfaceAlt where
@@ -2899,7 +3188,7 @@ instance (NFData b, NFData a) => NFData (IfaceBindingX a b) where
     IfaceRec binds -> rnf binds
 
 instance NFData IfaceTopBndrInfo where
-  rnf (IfGblTopBndr n) = n `seq` ()
+  rnf (IfGblTopBndr n) = rnf n `seq` ()
   rnf (IfLclTopBndr fs ty info dets) = rnf fs `seq` rnf ty `seq` rnf info `seq` rnf dets `seq` ()
 
 instance NFData IfaceMaybeRhs where
@@ -2921,22 +3210,22 @@ instance NFData IfaceFamTyConFlav where
 instance NFData IfaceTickish where
   rnf = \case
     IfaceHpcTick m i -> rnf m `seq` rnf i
-    IfaceSCC cc b1 b2 -> cc `seq` rnf b1 `seq` rnf b2
-    IfaceSource src str -> src `seq` rnf str
-    IfaceBreakpoint m i fvs -> rnf m `seq` rnf i `seq` rnf fvs
+    IfaceSCC cc b1 b2 -> rnf cc `seq` rnf b1 `seq` rnf b2
+    IfaceSource src str -> rnf src `seq` rnf str
+    IfaceBreakpoint i fvs -> rnf i `seq` rnf fvs
 
 instance NFData IfaceConAlt where
   rnf = \case
     IfaceDefaultAlt -> ()
     IfaceDataAlt nm -> rnf nm
-    IfaceLitAlt lit -> lit `seq` ()
+    IfaceLitAlt lit -> rnf lit `seq` ()
 
 instance NFData IfaceCompleteMatch where
   rnf (IfaceCompleteMatch f1 mtc) = rnf f1 `seq` rnf mtc
 
 instance NFData IfaceRule where
   rnf (IfaceRule f1 f2 f3 f4 f5 f6 f7 f8) =
-    rnf f1 `seq` f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` rnf f6 `seq` rnf f7 `seq` f8 `seq` ()
+    rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` rnf f6 `seq` rnf f7 `seq` rnf f8 `seq` ()
 
 instance NFData IfaceDefault where
   rnf (IfaceDefault f1 f2 f3) =
@@ -2944,11 +3233,11 @@ instance NFData IfaceDefault where
 
 instance NFData IfaceFamInst where
   rnf (IfaceFamInst f1 f2 f3 f4) =
-    rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` f4 `seq` ()
+    rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` ()
 
 instance NFData IfaceClsInst where
   rnf (IfaceClsInst f1 f2 f3 f4 f5 f6) =
-    f1 `seq` rnf f2 `seq` rnf f3 `seq` f4 `seq` f5 `seq` rnf f6
+    rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5 `seq` rnf f6
 
 instance NFData IfaceWarnings where
   rnf = \case
@@ -2956,12 +3245,12 @@ instance NFData IfaceWarnings where
       IfWarnSome vs ds -> rnf vs `seq` rnf ds
 
 instance NFData IfaceWarningTxt where
-    rnf = \case
-        IfWarningTxt f1 f2 f3 -> rnf f1 `seq` rnf f2 `seq` rnf f3
-        IfDeprecatedTxt f1 f2 -> rnf f1 `seq` rnf f2
+  rnf = \case
+    IfWarningTxt f1 f2 f3 -> rnf f1 `seq` rnf f2 `seq` rnf f3
+    IfDeprecatedTxt f1 f2 -> rnf f1 `seq` rnf f2
 
 instance NFData IfaceStringLiteral where
-    rnf (IfStringLiteral f1 f2) = rnf f1 `seq` rnf f2
+  rnf (IfStringLiteral f1 f2) = rnf f1 `seq` rnf f2
 
 instance NFData IfaceAnnotation where
-  rnf (IfaceAnnotation f1 f2) = f1 `seq` f2 `seq` ()
+  rnf (IfaceAnnotation f1 f2) = rnf f1 `seq` rnf f2 `seq` ()

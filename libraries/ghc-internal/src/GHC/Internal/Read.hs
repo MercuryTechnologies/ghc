@@ -73,7 +73,7 @@ import GHC.Internal.Base
 import GHC.Internal.Arr
 import GHC.Internal.Word
 import GHC.Internal.List (filter)
-import GHC.Tuple (Solo (..))
+import GHC.Internal.Tuple (Solo (..))
 
 
 -- | @'readParen' 'True' p@ parses what @p@ parses, but surrounded with
@@ -551,7 +551,7 @@ instance Read L.Lexeme where
   readList     = readListDefault
 
 --------------------------------------------------------------
--- GHC.Internal.Numeric instances of Read
+-- Numeric instances of Read
 --------------------------------------------------------------
 
 readNumber :: Num a => (L.Lexeme -> ReadPrec a) -> ReadPrec a

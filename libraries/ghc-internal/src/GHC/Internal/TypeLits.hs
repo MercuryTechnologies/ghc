@@ -37,7 +37,7 @@ working with type-level data will be defined in a separate library.
 
 module GHC.Internal.TypeLits
   ( -- * Kinds
-    N.Natural, N.Nat, Symbol  -- Symbol is declared in GHC.Types in package ghc-prim
+    N.Natural, N.Nat, Symbol  -- Symbol is declared in GHC.Internal.Types
 
     -- * Linking type and value level
   , N.KnownNat(natSing), natVal, natVal'
@@ -57,7 +57,7 @@ module GHC.Internal.TypeLits
   , SChar (UnsafeSChar)
       -- We export a pattern synonym instead of the real constructor:
       -- See Note [Preventing unsafe coercions for singleton types].
-  , pattern N.SNat, pattern SSymbol, pattern SChar
+  , data N.SNat, data SSymbol, data SChar
   , fromSNat, fromSSymbol, fromSChar
   , withSomeSNat, withSomeSSymbol, withSomeSChar
   , N.withKnownNat, withKnownSymbol, withKnownChar
@@ -80,13 +80,13 @@ module GHC.Internal.TypeLits
 import GHC.Internal.Base ( Bool(..), Eq(..), Functor(..), Ord(..), Ordering(..), String
                 , (.), otherwise, withDict, Void, (++)
                 , errorWithoutStackTrace)
-import GHC.Types(Symbol, Char, TYPE, Coercible)
+import GHC.Internal.Types(Symbol, Char, TYPE, Coercible)
 import GHC.Internal.TypeError(ErrorMessage(..), TypeError)
 import GHC.Internal.Num(Integer, fromInteger)
 import GHC.Internal.Show(Show(..), appPrec, appPrec1, showParen, showString)
 import GHC.Internal.Read(Read(..))
 import GHC.Internal.Real(toInteger)
-import GHC.Prim(Proxy#)
+import GHC.Internal.Prim(Proxy#)
 import GHC.Internal.Data.Either (Either (..))
 import GHC.Internal.Data.Maybe (Maybe(..))
 import GHC.Internal.Data.Proxy (Proxy(..))

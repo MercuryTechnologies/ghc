@@ -84,6 +84,16 @@ mkSimpleUnfolding !opts rhs
 
 mkDFunUnfolding :: [Var] -> DataCon -> [CoreExpr] -> Unfolding
 mkDFunUnfolding bndrs con ops
+  | isUnaryClassDataCon con
+  = -- See (UCM5) in Note [Unary class magic] in GHC.Core.TyCon
+    mkDataConUnfolding $
+    mkLams bndrs  $
+    mkApps (Var (dataConWrapId con)) ops
+                -- This application will satisfy the Core invariants
+                -- from Note [Representation polymorphism invariants] in GHC.Core,
+                -- because typeclass method types are never unlifted.
+
+  | otherwise
   = DFunUnfolding { df_bndrs = bndrs
                   , df_con = con
                   , df_args = map occurAnalyseExpr ops }
@@ -97,7 +107,10 @@ mkDataConUnfolding expr
   where
     guide = UnfWhen { ug_arity     = manifestArity expr
                     , ug_unsat_ok  = unSaturatedOk
-                    , ug_boring_ok = False }
+                    , ug_boring_ok = inlineBoringOk expr }
+            -- inineBoringOk; sometimes wrappers are very simple, like
+            --    \@a p q. K @a <coercion> p q
+            -- and then we definitely want to inline it #25713
 
 mkWrapperUnfolding :: SimpleOpts -> CoreExpr -> Arity -> Unfolding
 -- Make the unfolding for the wrapper in a worker/wrapper split
@@ -184,6 +197,9 @@ specUnfolding opts spec_bndrs spec_app rule_lhs_args
                    spec_app (mkLams old_bndrs arg)
                    -- The beta-redexes created by spec_app will be
                    -- simplified away by simplOptExpr
+                   -- ToDo: this is VERY DELICATE for type args.  We make
+                   --        (\@a @b x y. TYPE ty) ty1 ty2 d1 d2
+                   -- and rely on it simplifying to ty[ty1/a, ty2/b]
 
 specUnfolding opts spec_bndrs spec_app rule_lhs_args
               (CoreUnfolding { uf_src = src, uf_tmpl = tmpl

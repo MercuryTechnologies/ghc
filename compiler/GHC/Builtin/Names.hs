@@ -54,14 +54,13 @@ This is accomplished through a combination of mechanisms:
   1. When parsing source code, the RdrName-decorated AST has some
      RdrNames which are Exact. These are wired-in RdrNames where
      we could directly tell from the parsed syntax what Name to
-     use. For example, when we parse a [] in a type we can just insert
-     an Exact RdrName Name with the listTyConKey.
+     use. For example, when we parse a [] in a type and ListTuplePuns
+     are enabled, we can just insert (Exact listTyConName :: RdrName).
 
-     Currently, I believe this is just an optimisation: it would be
-     equally valid to just output Orig RdrNames that correctly record
-     the module etc we expect the final Name to come from. However,
-     were we to eliminate isBuiltInOcc_maybe it would become essential
-     (see point 3).
+     This is just an optimisation: it would be equally valid to output
+     Orig RdrNames that correctly record the module (and package) that
+     we expect the final Name to come from. The name would be looked up
+     in the OrigNameCache (see point 3).
 
   2. The knownKeyNames (which consist of the basicKnownKeyNames from
      the module, and those names reachable via the wired-in stuff from
@@ -78,9 +77,10 @@ This is accomplished through a combination of mechanisms:
   3. For "infinite families" of known-key names (i.e. tuples and sums), we
      have to be extra careful. Because there are an infinite number of
      these things, we cannot add them to the list of known-key names
-     used to initialise the OrigNameCache. Instead, we have to
-     rely on never having to look them up in that cache. See
-     Note [Infinite families of known-key names] for details.
+     used to initialise the OrigNameCache. Instead, lookupOrigNameCache pretends
+     that these names are in the cache by using isInfiniteFamilyOrigName_maybe
+     before the actual lookup.
+     See Note [Infinite families of known-key names] for details.
 
 
 Note [Infinite families of known-key names]
@@ -98,25 +98,14 @@ things,
 
   b) The known infinite families of names are specially serialised by
      GHC.Iface.Binary.putName, with that special treatment detected when we read
-     back to ensure that we get back to the correct uniques. See Note [Symbol
-     table representation of names] in GHC.Iface.Binary and Note [How tuples
-     work] in GHC.Builtin.Types.
+     back to ensure that we get back to the correct uniques.
+     See Note [Symbol table representation of names] in GHC.Iface.Binary and
+     Note [How tuples work] in GHC.Builtin.Types.
 
-Most of the infinite families cannot occur in source code, so mechanisms (a) and (b)
-suffice to ensure that they always have the right Unique. In particular,
-implicit param TyCon names, constraint tuples and Any TyCons cannot be mentioned
-by the user. For those things that *can* appear in source programs,
-
-  c) GHC.Iface.Env.lookupOrigNameCache uses isBuiltInOcc_maybe to map built-in syntax
-     directly onto the corresponding name, rather than trying to find it in the
-     original-name cache.
-
+  c) GHC.Iface.Env.lookupOrigNameCache uses isInfiniteFamilyOrigName_maybe to
+     map tuples and sums onto their exact names, rather than trying to find them
+     in the original-name cache.
      See also Note [Built-in syntax and the OrigNameCache]
-
-Note that one-tuples are an exception to the rule, as they do get assigned
-known keys. See
-Note [One-tuples] (Wrinkle: Make boxed one-tuple names have known keys)
-in GHC.Builtin.Types.
 
 -}
 
@@ -256,7 +245,7 @@ basicKnownKeyNames
         typeRepIdName,
         mkTrTypeName,
         mkTrConName,
-        mkTrAppName,
+        mkTrAppCheckedName,
         mkTrFunName,
         typeSymbolTypeRepName, typeNatTypeRepName, typeCharTypeRepName,
         trGhcPrimModuleName,
@@ -279,7 +268,7 @@ basicKnownKeyNames
         -- Dynamic
         toDynName,
 
-        -- GHC.Internal.Numeric stuff
+        -- Numeric stuff
         negateName, minusName, geName, eqName,
         mkRationalBase2Name, mkRationalBase10Name,
 
@@ -559,24 +548,23 @@ genericTyConNames = [
 gHC_PRIM, gHC_PRIM_PANIC,
     gHC_TYPES, gHC_INTERNAL_DATA_DATA, gHC_MAGIC, gHC_MAGIC_DICT,
     gHC_CLASSES, gHC_PRIMOPWRAPPERS :: Module
-gHC_PRIM           = mkPrimModule (fsLit "GHC.Prim")   -- Primitive types and values
-gHC_PRIM_PANIC     = mkPrimModule (fsLit "GHC.Prim.Panic")
-gHC_TYPES          = mkPrimModule (fsLit "GHC.Types")
-gHC_MAGIC          = mkPrimModule (fsLit "GHC.Magic")
-gHC_MAGIC_DICT     = mkPrimModule (fsLit "GHC.Magic.Dict")
-gHC_CSTRING        = mkPrimModule (fsLit "GHC.CString")
-gHC_CLASSES        = mkPrimModule (fsLit "GHC.Classes")
-gHC_PRIMOPWRAPPERS = mkPrimModule (fsLit "GHC.PrimopWrappers")
-
-gHC_INTERNAL_TUPLE                  = mkPrimModule (fsLit "GHC.Tuple")
+gHC_PRIM           = mkGhcInternalModule (fsLit "GHC.Internal.Prim")   -- Primitive types and values
+gHC_PRIM_PANIC     = mkGhcInternalModule (fsLit "GHC.Internal.Prim.Panic")
+gHC_TYPES          = mkGhcInternalModule (fsLit "GHC.Internal.Types")
+gHC_MAGIC          = mkGhcInternalModule (fsLit "GHC.Internal.Magic")
+gHC_MAGIC_DICT     = mkGhcInternalModule (fsLit "GHC.Internal.Magic.Dict")
+gHC_CSTRING        = mkGhcInternalModule (fsLit "GHC.Internal.CString")
+gHC_CLASSES        = mkGhcInternalModule (fsLit "GHC.Internal.Classes")
+gHC_PRIMOPWRAPPERS = mkGhcInternalModule (fsLit "GHC.Internal.PrimopWrappers")
+gHC_INTERNAL_TUPLE = mkGhcInternalModule (fsLit "GHC.Internal.Tuple")
 
 gHC_INTERNAL_CONTROL_MONAD_ZIP :: Module
 gHC_INTERNAL_CONTROL_MONAD_ZIP  = mkGhcInternalModule (fsLit "GHC.Internal.Control.Monad.Zip")
 
 gHC_INTERNAL_NUM_INTEGER, gHC_INTERNAL_NUM_NATURAL, gHC_INTERNAL_NUM_BIGNAT :: Module
-gHC_INTERNAL_NUM_INTEGER            = mkBignumModule (fsLit "GHC.Num.Integer")
-gHC_INTERNAL_NUM_NATURAL            = mkBignumModule (fsLit "GHC.Num.Natural")
-gHC_INTERNAL_NUM_BIGNAT             = mkBignumModule (fsLit "GHC.Num.BigNat")
+gHC_INTERNAL_NUM_INTEGER            = mkGhcInternalModule (fsLit "GHC.Internal.Bignum.Integer")
+gHC_INTERNAL_NUM_NATURAL            = mkGhcInternalModule (fsLit "GHC.Internal.Bignum.Natural")
+gHC_INTERNAL_NUM_BIGNAT             = mkGhcInternalModule (fsLit "GHC.Internal.Bignum.BigNat")
 
 gHC_INTERNAL_BASE, gHC_INTERNAL_ENUM,
     gHC_INTERNAL_GHCI, gHC_INTERNAL_GHCI_HELPERS, gHC_CSTRING, gHC_INTERNAL_DATA_STRING,
@@ -682,12 +670,6 @@ mkInteractiveModule n = mkModule interactiveUnit (mkModuleName ("Ghci" ++ n))
 pRELUDE_NAME, mAIN_NAME :: ModuleName
 pRELUDE_NAME   = mkModuleNameFS (fsLit "Prelude")
 mAIN_NAME      = mkModuleNameFS (fsLit "Main")
-
-mkPrimModule :: FastString -> Module
-mkPrimModule m = mkModule primUnit (mkModuleNameFS m)
-
-mkBignumModule :: FastString -> Module
-mkBignumModule m = mkModule bignumUnit (mkModuleNameFS m)
 
 mkGhcInternalModule :: FastString -> Module
 mkGhcInternalModule m = mkGhcInternalModule_ (mkModuleNameFS m)
@@ -1374,7 +1356,7 @@ typeableClassName
   , someTypeRepDataConName
   , mkTrTypeName
   , mkTrConName
-  , mkTrAppName
+  , mkTrAppCheckedName
   , mkTrFunName
   , typeRepIdName
   , typeNatTypeRepName
@@ -1389,7 +1371,7 @@ someTypeRepDataConName = dcQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "SomeTypeR
 typeRepIdName         = varQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "typeRep#")       typeRepIdKey
 mkTrTypeName          = varQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "mkTrType")       mkTrTypeKey
 mkTrConName           = varQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "mkTrCon")        mkTrConKey
-mkTrAppName           = varQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "mkTrApp")        mkTrAppKey
+mkTrAppCheckedName    = varQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "mkTrAppChecked") mkTrAppCheckedKey
 mkTrFunName           = varQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "mkTrFun")        mkTrFunKey
 typeNatTypeRepName    = varQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "typeNatTypeRep") typeNatTypeRepKey
 typeSymbolTypeRepName = varQual gHC_INTERNAL_TYPEABLE_INTERNAL (fsLit "typeSymbolTypeRep") typeSymbolTypeRepKey
@@ -1830,7 +1812,7 @@ addrPrimTyConKey, arrayPrimTyConKey, boolTyConKey,
     weakPrimTyConKey, mutableArrayPrimTyConKey,
     mutableByteArrayPrimTyConKey, orderingTyConKey, mVarPrimTyConKey,
     ratioTyConKey, rationalTyConKey, realWorldTyConKey, stablePtrPrimTyConKey,
-    stablePtrTyConKey, eqTyConKey, heqTyConKey, ioPortPrimTyConKey,
+    stablePtrTyConKey, eqTyConKey, heqTyConKey,
     smallArrayPrimTyConKey, smallMutableArrayPrimTyConKey,
     stringTyConKey,
     ccArrowTyConKey, ctArrowTyConKey, tcArrowTyConKey :: Unique
@@ -1867,7 +1849,7 @@ mutableArrayPrimTyConKey                = mkPreludeTyConUnique 30
 mutableByteArrayPrimTyConKey            = mkPreludeTyConUnique 31
 orderingTyConKey                        = mkPreludeTyConUnique 32
 mVarPrimTyConKey                        = mkPreludeTyConUnique 33
-ioPortPrimTyConKey                      = mkPreludeTyConUnique 34
+-- ioPortPrimTyConKey (34) was killed
 ratioTyConKey                           = mkPreludeTyConUnique 35
 rationalTyConKey                        = mkPreludeTyConUnique 36
 realWorldTyConKey                       = mkPreludeTyConUnique 37
@@ -2517,7 +2499,7 @@ proxyHashKey = mkPreludeMiscIdUnique 502
 mkTyConKey
   , mkTrTypeKey
   , mkTrConKey
-  , mkTrAppKey
+  , mkTrAppCheckedKey
   , mkTrFunKey
   , typeNatTypeRepKey
   , typeSymbolTypeRepKey
@@ -2527,7 +2509,7 @@ mkTyConKey
 mkTyConKey            = mkPreludeMiscIdUnique 503
 mkTrTypeKey           = mkPreludeMiscIdUnique 504
 mkTrConKey            = mkPreludeMiscIdUnique 505
-mkTrAppKey            = mkPreludeMiscIdUnique 506
+mkTrAppCheckedKey     = mkPreludeMiscIdUnique 506
 typeNatTypeRepKey     = mkPreludeMiscIdUnique 507
 typeSymbolTypeRepKey  = mkPreludeMiscIdUnique 508
 typeCharTypeRepKey    = mkPreludeMiscIdUnique 509

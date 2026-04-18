@@ -41,8 +41,11 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Tidy
 import GHC.Core.TyCo.FVs
 import GHC.Core.Class
-import GHC.Types.Var
+import GHC.Core.Predicate( scopedSort )
 import GHC.Core.Multiplicity( pprArrowWithMultiplicity )
+
+import GHC.Types.Var
+
 import GHC.Iface.Type
 
 import GHC.Types.Var.Set
@@ -321,7 +324,7 @@ pprDataConWithArgs :: DataCon -> SDoc
 pprDataConWithArgs dc = sep [forAllDoc, thetaDoc, ppr dc <+> argsDoc]
   where
     (_univ_tvs, _ex_tvs, _eq_spec, theta, arg_tys, _res_ty) = dataConFullSig dc
-    user_bndrs = tyVarSpecToBinders $ dataConUserTyVarBinders dc
+    user_bndrs = dataConUserTyVarBinders dc
     forAllDoc  = pprUserForAll user_bndrs
     thetaDoc   = pprThetaArrowTy theta
     argsDoc    = hsep (fmap pprParendType (map scaledThing arg_tys))

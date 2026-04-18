@@ -44,6 +44,7 @@ module GHC.Driver.Pipeline (
 
 
 import GHC.Prelude
+import GHC.Builtin.Names
 
 import GHC.Platform
 
@@ -91,6 +92,7 @@ import GHC.Data.StringBuffer   ( hPutStringBuffer )
 import GHC.Data.Maybe          ( expectJust )
 
 import GHC.Iface.Make          ( mkFullIface )
+import GHC.Iface.Load          ( getGhcPrimIface )
 import GHC.Runtime.Loader      ( initializePlugins )
 
 
@@ -105,11 +107,10 @@ import GHC.Types.SourceError
 import GHC.Unit
 import GHC.Unit.Env
 import GHC.Unit.Finder
---import GHC.Unit.State
 import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.ModIface
-import GHC.Unit.Module.Deps
 import GHC.Unit.Home.ModInfo
+import GHC.Unit.Home.PackageTable
 
 import System.Directory
 import System.FilePath
@@ -253,7 +254,7 @@ compileOne' mHscMessage
 
  where lcl_dflags  = ms_hspp_opts summary
        location    = ms_location summary
-       input_fn    = expectJust "compile:hs" (ml_hs_file location)
+       input_fn    = expectJust (ml_hs_file location)
        input_fnpp  = ms_hspp_file summary
 
        pipelineOutput = backendPipelineOutput bcknd
@@ -403,18 +404,18 @@ link' logger tmpfs fc dflags unit_env batch_attempt_linking mHscMessager hpt
                           LinkStaticLib -> True
                           _ -> False
 
-            home_mod_infos = eltsHpt hpt
+        -- the packages we depend on
+        -- TODO: This should be a query on the 'ModuleGraph', since we need to
+        -- know which packages are actually needed at the runtime stage.
+        pkg_deps <- map snd . Set.toList <$> hptCollectDependencies hpt
 
-            -- the packages we depend on
-            pkg_deps  = Set.toList
-                          $ Set.unions
-                          $ fmap (dep_direct_pkgs . mi_deps . hm_iface)
-                          $ home_mod_infos
+        -- the linkables to link
+        linkables <- hptCollectObjects hpt
 
-            -- the linkables to link
-            linkables = map (expectJust "link". homeModInfoObject) home_mod_infos
+        -- the home modules, for tracing
+        home_modules <- hptCollectModules hpt
 
-        debugTraceMsg logger 3 (text "link: hmi ..." $$ vcat (map (ppr . mi_module . hm_iface) home_mod_infos))
+        debugTraceMsg logger 3 (text "link: hmi ..." $$ vcat (map ppr home_modules))
         debugTraceMsg logger 3 (text "link: linkables are ..." $$ vcat (map ppr linkables))
         debugTraceMsg logger 3 (text "link: pkg deps are ..." $$ vcat (map ppr pkg_deps))
 
@@ -472,7 +473,7 @@ linkingNeeded logger dflags unit_env staticLink linkables pkg_deps = do
         -- modification times on all of the objects and libraries, then omit
         -- linking (unless the -fforce-recomp flag was given).
   let platform   = ue_platform unit_env
-      unit_state = ue_units unit_env
+      unit_state = ue_homeUnitState unit_env
       arch_os    = platformArchOS platform
       exe_file   = exeFileName arch_os staticLink (outputFile_ dflags)
   e_exe_time <- tryIO $ getModificationUTCTime exe_file
@@ -820,7 +821,13 @@ hscGenBackendPipeline pipe_env hsc_env mod_sum result = do
         let !linkable = Linkable part_time (ms_mod mod_sum) (NE.singleton (DotO final_object ModuleObject))
         -- Add the object linkable to the potential bytecode linkable which was generated in HscBackend.
         return (mlinkable { homeMod_object = Just linkable })
-  return (miface, final_linkable)
+
+  -- when building ghc-internal with --make (e.g. with cabal-install), we want
+  -- the virtual interface for gHC_PRIM in the cache, not the empty one.
+  let miface_final
+        | ms_mod mod_sum == gHC_PRIM = getGhcPrimIface (hsc_hooks hsc_env)
+        | otherwise                  = miface
+  return (miface_final, final_linkable)
 
 asPipeline :: P m => Bool -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m (Maybe ObjFile)
 asPipeline use_cpp pipe_env hsc_env location input_fn =

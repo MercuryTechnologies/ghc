@@ -7,7 +7,7 @@ where
 
 import GHC.Prelude
 
-import GHC.ByteCode.Types
+import GHC.HsToCore.Breakpoints
 import GHC.ForeignSrcLang
 
 import GHC.Hs
@@ -53,9 +53,8 @@ data ModGuts
         mg_exports   :: ![AvailInfo],    -- ^ What it exports
         mg_deps      :: !Dependencies,   -- ^ What it depends on, directly or
                                          -- otherwise
-        mg_usages    :: ![Usage],        -- ^ What was used?  Used for interfaces.
+        mg_usages    :: !(Maybe [Usage]), -- ^ What was used?  Used for interfaces.
 
-        mg_used_th   :: !Bool,           -- ^ Did we run a TH splice?
         mg_rdr_env   :: !GlobalRdrEnv,   -- ^ Top-level lexical environment
 
         -- These fields all describe the things **declared in this module**
@@ -141,7 +140,6 @@ data CgGuts
         cg_foreign_files :: ![(ForeignSrcLang, FilePath)],
         cg_dep_pkgs  :: !(Set UnitId),      -- ^ Dependent packages, used to
                                             -- generate #includes for C code gen
-        cg_hpc_info  :: !HpcInfo,           -- ^ Program coverage tick box information
         cg_modBreaks :: !(Maybe ModBreaks), -- ^ Module breakpoints
         cg_spt_entries :: [SptEntry]
                 -- ^ Static pointer table entries for static forms defined in

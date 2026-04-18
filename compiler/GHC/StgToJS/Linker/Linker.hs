@@ -2,6 +2,7 @@
 {-# LANGUAGE TupleSections     #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE BlockArguments    #-}
+{-# LANGUAGE MultiWayIf        #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -24,8 +25,6 @@ module GHC.StgToJS.Linker.Linker
   ( jsLinkBinary
   , jsLink
   , embedJsFile
-  , staticInitStat
-  , staticDeclStat
   , mkExportedFuns
   , mkExportedModFuns
   , computeLinkDependencies
@@ -101,7 +100,7 @@ import qualified Data.ByteString          as BS
 import Data.Function            (on)
 import qualified Data.IntSet              as IS
 import Data.IORef
-import Data.List  ( nub, intercalate, groupBy, intersperse, sortBy)
+import Data.List  ( nub, intercalate, groupBy, intersperse )
 import Data.Map.Strict          (Map)
 import qualified Data.Map.Strict          as M
 import Data.Maybe
@@ -123,6 +122,7 @@ import System.Directory ( createDirectoryIfMissing
 import GHC.Unit.Finder.Types
 import GHC.Unit.Finder (findObjectLinkableMaybe, findHomeModule)
 import GHC.Driver.Config.Finder (initFinderOpts)
+import qualified GHC.Unit.Home.Graph as HUG
 
 data LinkerStats = LinkerStats
   { bytesPerModule     :: !(Map Module Word64) -- ^ number of bytes linked per module
@@ -462,6 +462,9 @@ computeLinkDependencies cfg unit_env link_spec finder_opts finder_cache ar_cache
 
   -- all the units we want to link together, without their dependencies
   let root_units = filter (/= ue_currentUnit unit_env)
+                   -- fendor: GHCi uses more 'UnidIds' than just 'interactiveUnitId'.
+                   -- If this breaks for some reason,
+                   -- see Note [Multiple Home Units aware GHCi] for GHCi session setup.
                    $ filter (/= interactiveUnitId)
                    $ nub
                    $ rts_wired_units ++ reverse obj_units ++ reverse units
@@ -483,7 +486,7 @@ computeLinkDependencies cfg unit_env link_spec finder_opts finder_cache ar_cache
   new_required_blocks_var <- newIORef []
   let load_info mod = do
         -- Adapted from the tangled code in GHC.Linker.Loader.getLinkDeps.
-        linkable <- case lookupHugByModule mod (ue_home_unit_graph unit_env) of
+        linkable <- HUG.lookupHugByModule mod (ue_home_unit_graph unit_env) >>= \case
           Nothing ->
                 -- It's not in the HPT because we are in one shot mode,
                 -- so use the Finder to get a ModLocation...
@@ -664,14 +667,21 @@ renderLinkerStats s =
 
 
 getPackageArchives :: StgToJSConfig -> UnitEnv -> [UnitId] -> IO [FilePath]
-getPackageArchives cfg unit_env units =
-  filterM doesFileExist [ ST.unpack p </> "lib" ++ ST.unpack l ++ profSuff <.> "a"
-                        | u <- units
-                        , p <- getInstalledPackageLibDirs ue_state u
-                        , l <- getInstalledPackageHsLibs  ue_state u
-                        ]
+getPackageArchives cfg unit_env units = do
+  fmap concat $ forM units $ \u -> do
+    let archives = [ ST.unpack p </> "lib" ++ ST.unpack l ++ profSuff <.> "a"
+                   | p <- getInstalledPackageLibDirs ue_state u
+                   , l <- getInstalledPackageHsLibs  ue_state u
+                   ]
+    foundArchives <- filterM doesFileExist archives
+    if | not (null archives)
+       , null foundArchives
+       -> do
+         throwGhcExceptionIO (InstallationError $ "Could not find any library archives for unit-id: " <> (renderWithContext (csContext cfg) $ ppr u))
+       | otherwise
+       -> pure foundArchives
   where
-    ue_state = ue_units unit_env
+    ue_state = ue_homeUnitState unit_env
 
     -- XXX the profiling library name is probably wrong now
     profSuff | csProf cfg = "_p"
@@ -927,22 +937,8 @@ collectModuleCodes ar_cache link_plan = do
       module_blocks = M.fromListWith IS.union $
                       map (\ref -> (block_ref_mod ref, IS.singleton (block_ref_idx ref))) (S.toList blocks)
 
-  -- GHCJS had this comment: "read ghc-prim first, since we depend on that for
-  -- static initialization". Not sure if it's still true as we haven't ported
-  -- the compactor yet. Still we sort to read ghc-prim blocks first just in
-  -- case.
-  let pred x = moduleUnitId (fst x) == primUnitId
-      cmp x y = case (pred x, pred y) of
-        (True,False)  -> LT
-        (False,True)  -> GT
-        (True,True)   -> EQ
-        (False,False) -> EQ
-
-      sorted_module_blocks :: [(Module,BlockIds)]
-      sorted_module_blocks = sortBy cmp (M.toList module_blocks)
-
   -- load blocks
-  forM sorted_module_blocks $ \(mod,bids) -> do
+  forM (M.toList module_blocks) $ \(mod,bids) -> do
     case M.lookup mod block_info of
       Nothing  -> pprPanic "collectModuleCodes: couldn't find block info for module" (ppr mod)
       Just lbi -> extractBlocks ar_cache lbi bids
@@ -1014,7 +1010,7 @@ readArObject ar_cache mod ar_file = do
 -- | dependencies for the RTS, these need to be always linked
 rtsDeps :: ([UnitId], Set ExportedFun)
 rtsDeps =
-  ( [ghcInternalUnitId, primUnitId]
+  ( [ghcInternalUnitId]
   , S.fromList $ concat
       [ mkInternalFuns "GHC.Internal.Conc.Sync"
           ["reportError"]
@@ -1055,11 +1051,11 @@ rtsDeps =
           , "setCurrentThreadResultException"
           , "setCurrentThreadResultValue"
           ]
-      , mkPrimFuns "GHC.Types"
+      , mkInternalFuns "GHC.Internal.Types"
           [ ":"
           , "[]"
           ]
-      , mkPrimFuns "GHC.Tuple"
+      , mkInternalFuns "GHC.Internal.Tuple"
           [ "(,)"
           , "(,,)"
           , "(,,,)"
@@ -1076,10 +1072,6 @@ rtsDeps =
 -- | Export the functions in @ghc-internal@
 mkInternalFuns :: FastString -> [FastString] -> [ExportedFun]
 mkInternalFuns = mkExportedFuns ghcInternalUnitId
-
--- | Export the Prim functions
-mkPrimFuns :: FastString -> [FastString] -> [ExportedFun]
-mkPrimFuns = mkExportedFuns primUnitId
 
 -- | Given a @UnitId@, a module name, and a set of symbols in the module,
 -- package these into an @ExportedFun@.
@@ -1253,27 +1245,22 @@ staticInitStat :: StaticInfo -> JS.JStat
 staticInitStat (StaticInfo i sv mcc) =
   jStgStatToJS $
   case sv of
-    StaticData con args         -> appS hdStiStr $ add_cc_arg
-                                    [ global i
-                                    , global con
-                                    , jsStaticArgs args
-                                    ]
-    StaticFun  f   args         -> appS hdStiStr $ add_cc_arg
-                                    [ global i
-                                    , global f
-                                    , jsStaticArgs args
-                                    ]
-    StaticList args mt          -> appS hdStlStr $ add_cc_arg
-                                    [ global i
-                                    , jsStaticArgs args
-                                    , toJExpr $ maybe null_ (toJExpr . TxtI) mt
-                                    ]
-    StaticThunk (Just (f,args)) -> appS hdStcStr $ add_cc_arg
-                                    [ global i
-                                    , global f
-                                    , jsStaticArgs args
-                                    ]
-    _                           -> mempty
+    (StaticApp k app args) -> appS
+                              (if k == SAKThunk then hdStcStr else hdStiStr)
+                              $ add_cc_arg
+                                [ global i
+                                , global app
+                                , jsStaticArgs args
+                                ]
+
+    StaticList args mt     -> appS hdStlStr
+                              $ add_cc_arg
+                              [ global i
+                              , jsStaticArgs args
+                              , toJExpr $ maybe null_ (toJExpr . TxtI) mt
+                              ]
+
+    StaticUnboxed _             -> mempty
   where
     -- add optional cost-center argument
     add_cc_arg as = case mcc of
@@ -1286,20 +1273,15 @@ staticDeclStat (StaticInfo global_name static_value _) = jStgStatToJS decl
   where
     global_ident = name global_name
     decl_init v  = global_ident ||= v
-    decl_no_init = appS hdDiStr [toJExpr global_ident]
 
     decl = case static_value of
       StaticUnboxed u     -> decl_init (unboxed_expr u)
-      StaticThunk Nothing -> decl_no_init -- CAF initialized in an alternative way
       _                   -> decl_init (app hdDStr [])
 
     unboxed_expr = \case
       StaticUnboxedBool b          -> app hdPStr [toJExpr b]
       StaticUnboxedInt i           -> app hdPStr [toJExpr i]
       StaticUnboxedDouble d        -> app hdPStr [toJExpr (unSaneDouble d)]
-      -- GHCJS used a function wrapper for this:
-      -- StaticUnboxedString str      -> ApplExpr (initStr str) []
-      -- But we are defining it statically for now.
       StaticUnboxedString str      -> initStr str
       StaticUnboxedStringOffset {} -> 0
 

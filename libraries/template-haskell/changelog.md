@@ -1,13 +1,19 @@
 # Changelog for [`template-haskell` package](http://hackage.haskell.org/package/template-haskell)
 
+## 2.24.0.0
+
+  * Introduce `dataToCodeQ` and `liftDataTyped`, typed variants of `dataToExpQ` and `liftData` respectively.
+
+  * Remove the `Language.Haskell.TH.Lib.Internal` module. This module has long been deprecated, and exposes compiler internals.
+    Users should use `Language.Haskell.TH.Lib` instead, which exposes a more stable version of this API.
+
+  * Remove `addrToByteArrayName` and `addrToByteArray` from `Language.Haskell.TH.Syntax`. These were part of the implementation of the `Lift ByteArray` instance and were accidentally exported because this module lacked an explicit export list. They have no usages on Hackage.
+
 ## 2.23.0.0
 
   * Extend `Exp` with `ForallE`, `ForallVisE`, `ConstraintedE`,
     introduce functions `forallE`, `forallVisE`, `constraintedE` (GHC Proposal #281).
   * `template-haskell` is no longer wired-in. All wired-in identifiers have been moved to `ghc-internal`.
-
-## 2.22.1.0
-
   * `Lift` instances were added for the `template-haskell` AST.
 
 ## 2.22.0.0

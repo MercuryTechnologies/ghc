@@ -31,13 +31,16 @@ Executable ghc
     Default-Language: GHC2021
 
     Main-Is: Main.hs
+    Other-Modules:
+        GHC.Driver.Session.Lint,
+        GHC.Driver.Session.Mode
     Build-Depends: base       >= 4   && < 5,
                    array      >= 0.1 && < 0.6,
                    bytestring >= 0.9 && < 0.13,
                    directory  >= 1   && < 1.4,
                    process    >= 1   && < 1.7,
                    filepath   >= 1.5 && < 1.6,
-                   containers >= 0.5 && < 0.8,
+                   containers >= 0.5 && < 0.9,
                    transformers >= 0.5 && < 0.7,
                    ghc-boot      == @ProjectVersionMunged@,
                    ghc           == @ProjectVersionMunged@
@@ -57,17 +60,18 @@ Executable ghc
         -- NB: this is never built by the bootstrapping GHC+libraries
         Build-depends:
             deepseq        >= 1.4 && < 1.6,
-            ghc-prim       >= 0.5.0 && < 0.12,
+            ghc-prim       >= 0.5.0 && < 0.14,
             ghci           == @ProjectVersionMunged@,
             haskeline      == 0.8.*,
             exceptions     == 0.10.*,
-            time           >= 1.8 && < 1.15
+            time           >= 1.8 && < 1.16
         CPP-Options: -DHAVE_INTERNAL_INTERPRETER
         Other-Modules:
             GHCi.Leak
             GHCi.UI
             GHCi.UI.Info
             GHCi.UI.Monad
+            GHCi.UI.Print
             GHCi.UI.Exception
             GHCi.Util
         Other-Extensions:

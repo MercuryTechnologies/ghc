@@ -33,7 +33,6 @@ import GHC.Data.Maybe (catMaybes)
 import GHC.Hs.Expr (prependQualified, HsExpr(..), HsLamVariant(..), lamCaseKeyword)
 import GHC.Hs.Type (pprLHsContext, pprHsArrow, pprHsForAll)
 import GHC.Builtin.Names (allNameStringList)
-import GHC.Builtin.Types (filterCTuple)
 import qualified GHC.LanguageExtensions as LangExt
 import Data.List.NonEmpty (NonEmpty((:|)))
 import GHC.Hs.Pat (Pat(..), LPat)
@@ -44,7 +43,7 @@ import GHC.Parser.Annotation (noAnn)
 instance Diagnostic PsMessage where
   type DiagnosticOpts PsMessage = NoDiagnosticOpts
   diagnosticMessage opts = \case
-    PsUnknownMessage (UnknownDiagnostic f m)
+    PsUnknownMessage (UnknownDiagnostic f _ m)
       -> diagnosticMessage (f opts) m
 
     PsHeaderMessage m
@@ -274,9 +273,14 @@ instance Diagnostic PsMessage where
                   2 (pprWithCommas ppr vs)
                 , text "See https://gitlab.haskell.org/ghc/ghc/issues/16754 for details."
                 ]
-    PsErrIllegalExplicitNamespace
+    PsErrIllegalExplicitNamespace kw
       -> mkSimpleDecorated $
-           text "Illegal keyword 'type'"
+           text "Illegal keyword" <+> quotes kw_doc
+         where
+           kw_doc = case kw of
+             ExplicitTypeNamespace{} -> text "type"
+             ExplicitDataNamespace{} -> text "data"
+
 
     PsErrUnallowedPragma prag
       -> mkSimpleDecorated $
@@ -288,6 +292,8 @@ instance Diagnostic PsMessage where
              <+> text "in postpositive position. "
     PsErrImportQualifiedTwice
       -> mkSimpleDecorated $ text "Multiple occurrences of 'qualified'"
+    PsErrSpliceOrQuoteTwice
+      -> mkSimpleDecorated $ text "Multiple occurrences of a splice or quote keyword"
     PsErrIllegalImportBundleForm
       -> mkSimpleDecorated $
            text "Illegal import form, this syntax can only be used to bundle"
@@ -462,12 +468,6 @@ instance Diagnostic PsMessage where
       -> let msg  = parse_error_in_pat
              body = case details of
                  PEIP_NegApp -> text "-" <> ppr s
-                 PEIP_TypeArgs peipd_tyargs
-                   | not (null peipd_tyargs) -> ppr s <+> vcat [
-                               hsep (map ppr peipd_tyargs)
-                             , text "Type applications in patterns are only allowed on data constructors."
-                             ]
-                   | otherwise -> ppr s
                  PEIP_OtherPatDetails (ParseContext (Just fun) _)
                   -> ppr s <+> text "In a function binding for the"
                                      <+> quotes (ppr fun)
@@ -497,19 +497,14 @@ instance Diagnostic PsMessage where
        -> mkSimpleDecorated $
             vcat [ text "Unexpected type" <+> quotes (ppr t)
                  , text "In the" <+> what
-                   <+> text "declaration for" <+> quotes tc'
+                   <+> text "declaration for" <+> quotes (ppr tc)
                  , vcat[ (text "A" <+> what
                           <+> text "declaration should have form")
                  , nest 2
                    (what
-                    <+> tc'
+                    <+> ppr tc
                     <+> hsep (map text (takeList tparms allNameStringList))
                     <+> equals_or_where) ] ]
-           where
-             -- Avoid printing a constraint tuple in the error message. Print
-             -- a plain old tuple instead (since that's what the user probably
-             -- wrote). See #14907
-             tc' = ppr $ filterCTuple tc
     PsErrInvalidPackageName pkg
       -> mkSimpleDecorated $ vcat
             [ text "Parse error" <> colon <+> quotes (ftext pkg)
@@ -571,6 +566,18 @@ instance Diagnostic PsMessage where
     PsErrIllegalOrPat pat
       -> mkSimpleDecorated $ vcat [text "Illegal or-pattern:" <+> ppr (unLoc pat)]
 
+    PsErrSpecExprMultipleTypeAscription
+      -> mkSimpleDecorated $
+           text "SPECIALISE expression doesn't support multiple type ascriptions"
+
+    PsWarnSpecMultipleTypeAscription
+      -> mkSimpleDecorated $
+           text "SPECIALISE pragmas with multiple type ascriptions are deprecated, and will be removed in GHC 9.18"
+
+    PsWarnPatternNamespaceSpecifier _explicit_namespaces
+      -> mkSimpleDecorated $
+          text "The" <+> quotes (text "pattern") <+> "namespace specifier is deprecated."
+
   diagnosticReason  = \case
     PsUnknownMessage m                            -> diagnosticReason m
     PsHeaderMessage  m                            -> psHeaderMessageReason m
@@ -617,10 +624,11 @@ instance Diagnostic PsMessage where
     PsErrNoSingleWhereBindInPatSynDecl{}          -> ErrorWithoutFlag
     PsErrDeclSpliceNotAtTopLevel{}                -> ErrorWithoutFlag
     PsErrMultipleNamesInStandaloneKindSignature{} -> ErrorWithoutFlag
-    PsErrIllegalExplicitNamespace                 -> ErrorWithoutFlag
+    PsErrIllegalExplicitNamespace{}               -> ErrorWithoutFlag
     PsErrUnallowedPragma{}                        -> ErrorWithoutFlag
     PsErrImportPostQualified                      -> ErrorWithoutFlag
     PsErrImportQualifiedTwice                     -> ErrorWithoutFlag
+    PsErrSpliceOrQuoteTwice                       -> ErrorWithoutFlag
     PsErrIllegalImportBundleForm                  -> ErrorWithoutFlag
     PsErrInvalidRuleActivationMarker              -> ErrorWithoutFlag
     PsErrMissingBlock                             -> ErrorWithoutFlag
@@ -689,6 +697,9 @@ instance Diagnostic PsMessage where
     PsErrInvalidPun {}                            -> ErrorWithoutFlag
     PsErrIllegalOrPat{}                           -> ErrorWithoutFlag
     PsErrTypeSyntaxInPat{}                        -> ErrorWithoutFlag
+    PsErrSpecExprMultipleTypeAscription{}         -> ErrorWithoutFlag
+    PsWarnSpecMultipleTypeAscription{}            -> WarningWithFlag Opt_WarnDeprecatedPragmas
+    PsWarnPatternNamespaceSpecifier{}             -> WarningWithFlag Opt_WarnPatternNamespaceSpecifier
 
   diagnosticHints = \case
     PsUnknownMessage m                            -> diagnosticHints m
@@ -753,10 +764,11 @@ instance Diagnostic PsMessage where
     PsErrNoSingleWhereBindInPatSynDecl{}          -> noHints
     PsErrDeclSpliceNotAtTopLevel{}                -> noHints
     PsErrMultipleNamesInStandaloneKindSignature{} -> noHints
-    PsErrIllegalExplicitNamespace                 -> [suggestExtension LangExt.ExplicitNamespaces]
+    PsErrIllegalExplicitNamespace{}               -> [suggestExtension LangExt.ExplicitNamespaces]
     PsErrUnallowedPragma{}                        -> noHints
     PsErrImportPostQualified                      -> [suggestExtension LangExt.ImportQualifiedPost]
     PsErrImportQualifiedTwice                     -> noHints
+    PsErrSpliceOrQuoteTwice                       -> noHints
     PsErrIllegalImportBundleForm                  -> noHints
     PsErrInvalidRuleActivationMarker              -> noHints
     PsErrMissingBlock                             -> noHints
@@ -858,8 +870,16 @@ instance Diagnostic PsMessage where
     PsErrInvalidPun {}                            -> [suggestExtension LangExt.ListTuplePuns]
     PsErrIllegalOrPat{}                           -> [suggestExtension LangExt.OrPatterns]
     PsErrTypeSyntaxInPat{}                        -> noHints
+    PsErrSpecExprMultipleTypeAscription {}        -> [SuggestSplittingIntoSeveralSpecialisePragmas]
+    PsWarnSpecMultipleTypeAscription{}            -> [SuggestSplittingIntoSeveralSpecialisePragmas]
+    PsWarnPatternNamespaceSpecifier explicit_namespaces
+      | explicit_namespaces -> [SuggestDataKeyword]
+      | otherwise ->
+          let info = text "and replace" <+> quotes (text "pattern")
+                        <+> text "with" <+> quotes (text "data") <> "."
+          in [useExtensionInOrderTo info LangExt.ExplicitNamespaces]
 
-  diagnosticCode = constructorCode
+  diagnosticCode = constructorCode @GHC
 
 psHeaderMessageDiagnostic :: PsHeaderMessage -> DecoratedSDoc
 psHeaderMessageDiagnostic = \case

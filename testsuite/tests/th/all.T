@@ -147,6 +147,8 @@ test('T2713', normal, compile_fail, ['-v0'])
 test('T2674', normal, compile_fail, ['-v0'])
 test('TH_emptycase', normal, compile, ['-v0'])
 test('T24046', normal, compile, ['-v0'])
+test('EmptyGuard', normal, compile_fail, ['-v0'])
+test('EmptyParStmt', normal, compile_fail, ['-v0'])
 
 test('T2386', [only_ways(['normal'])], makefile_test, ['T2386'])
 
@@ -266,7 +268,7 @@ test('T8028', [], multimod_compile, ['T8028', '-v0 ' + config.ghc_th_way_flags])
 test('TH_Roles1', normal, compile_fail, ['-v0'])
 test('TH_Roles2', normalise_version('ghc-internal', 'array', 'base', 'deepseq', 'ghc-prim',
                                     'ghc-boot', 'ghc-boot-th',
-                                    'ghc-bignum', 'pretty', 'template-haskell',
+                                    'pretty', 'template-haskell',
                                     'binary', 'bytestring', 'containers'
                                     ), compile, ['-v0 -ddump-tc -dsuppress-uniques'])
 test('TH_Roles3', normal, compile, ['-v0 -dsuppress-uniques'])
@@ -488,9 +490,9 @@ test('T15471', normal, multimod_compile, ['T15471.hs', '-v0'])
 test('T16180',
      [when(llvm_build(), expect_broken_for(16541, ['ext-interp'])),
       req_asm,
-      # Ideally OpenBSD should have expect_broken_for(14012, ['ext-interp']).
+      # Ideally {Free,Open}BSD should have expect_broken_for(14012, ['ext-interp']).
       # Except the failure is in compilation so skip seems the best we can do.
-      when(opsys('openbsd'), skip),
+      when(opsys('openbsd') or opsys('freebsd'), skip),
       expect_broken_for(16541, ghci_ways)],
      compile_and_run, ['-package ghc'])
 test('T16183', normal, compile, ['-v0 -ddump-splices -dsuppress-uniques'])
@@ -632,3 +634,10 @@ test('T25252',
    req_c],
   compile_and_run, ['-fPIC T25252_c.c'])
 test('T25083', [extra_files(['T25083_A.hs', 'T25083_B.hs'])], multimod_compile_and_run, ['T25083', '-v0 -j'])
+test('T25174', normal, compile, [''])
+test('T25179', normal, compile, [''])
+test('FunNameTH', normal, compile, [''])
+test('QQInQuote', normal, compile, [''])
+test('QQTopError', normal, compile_fail, ['-fdiagnostics-show-caret'])
+test('GadtConSigs_th_pprint1', normal, compile, [''])
+test('GadtConSigs_th_dump1', normal, compile, ['-v0 -ddump-splices -dsuppress-uniques'])

@@ -25,14 +25,14 @@
 #  define RTS_THUNK_INFO(i) extern const W_(i)[]
 #  define RTS_INFO(i)       extern const W_(i)[]
 #  define RTS_CLOSURE(i)    extern W_(i)[]
-#  define RTS_FUN_DECL(f)   extern DLL_IMPORT_RTS StgFunPtr f(void)
+#  define RTS_FUN_DECL(f)   extern StgFunPtr f(void)
 #else
-#  define RTS_RET_INFO(i)   extern DLL_IMPORT_RTS const StgRetInfoTable i
-#  define RTS_FUN_INFO(i)   extern DLL_IMPORT_RTS const StgFunInfoTable i
-#  define RTS_THUNK_INFO(i) extern DLL_IMPORT_RTS const StgThunkInfoTable i
-#  define RTS_INFO(i)       extern DLL_IMPORT_RTS const StgInfoTable i
-#  define RTS_CLOSURE(i)    extern DLL_IMPORT_RTS StgClosure i
-#  define RTS_FUN_DECL(f)   extern DLL_IMPORT_RTS StgFunPtr f(void)
+#  define RTS_RET_INFO(i)   extern const StgRetInfoTable i
+#  define RTS_FUN_INFO(i)   extern const StgFunInfoTable i
+#  define RTS_THUNK_INFO(i) extern const StgThunkInfoTable i
+#  define RTS_INFO(i)       extern const StgInfoTable i
+#  define RTS_CLOSURE(i)    extern StgClosure i
+#  define RTS_FUN_DECL(f)   extern StgFunPtr f(void)
 #endif
 
 #if defined(TABLES_NEXT_TO_CODE)
@@ -65,6 +65,7 @@ RTS_RET(stg_stack_underflow_frame_d);
 RTS_RET(stg_stack_underflow_frame_v16);
 RTS_RET(stg_stack_underflow_frame_v32);
 RTS_RET(stg_stack_underflow_frame_v64);
+RTS_RET(stg_ann_frame);
 RTS_RET(stg_keepAlive_frame);
 RTS_RET(stg_restore_cccs_d);
 RTS_RET(stg_restore_cccs_v16);
@@ -265,11 +266,11 @@ RTS_CLOSURE(stg_NO_TREC_closure);
 RTS_ENTRY(stg_NO_FINALIZER);
 
 #if IN_STG_CODE
-extern DLL_IMPORT_RTS StgWordArray stg_CHARLIKE_closure;
-extern DLL_IMPORT_RTS StgWordArray stg_INTLIKE_closure;
+extern StgWordArray stg_CHARLIKE_closure;
+extern StgWordArray stg_INTLIKE_closure;
 #else
-extern DLL_IMPORT_RTS StgIntCharlikeClosure stg_CHARLIKE_closure[];
-extern DLL_IMPORT_RTS StgIntCharlikeClosure stg_INTLIKE_closure[];
+extern StgIntCharlikeClosure stg_CHARLIKE_closure[MAX_CHARLIKE - MIN_CHARLIKE + 1];
+extern StgIntCharlikeClosure stg_INTLIKE_closure[MAX_INTLIKE - MIN_INTLIKE + 1];
 #endif
 
 /* StgStartup */
@@ -437,10 +438,6 @@ RTS_FUN_DECL(stg_block_stmwait);
 RTS_FUN_DECL(stg_block_throwto);
 RTS_RET(stg_block_throwto);
 
-RTS_FUN_DECL(stg_readIOPortzh);
-RTS_FUN_DECL(stg_writeIOPortzh);
-RTS_FUN_DECL(stg_newIOPortzh);
-
 /* Entry/exit points from StgStartup.cmm */
 
 RTS_RET(stg_stop_thread);
@@ -604,12 +601,16 @@ RTS_FUN_DECL(stg_traceEventzh);
 RTS_FUN_DECL(stg_traceBinaryEventzh);
 RTS_FUN_DECL(stg_traceMarkerzh);
 RTS_FUN_DECL(stg_getThreadAllocationCounterzh);
+RTS_FUN_DECL(stg_getOtherThreadAllocationCounterzh);
 RTS_FUN_DECL(stg_setThreadAllocationCounterzh);
+RTS_FUN_DECL(stg_setOtherThreadAllocationCounterzh);
 
 RTS_FUN_DECL(stg_castWord64ToDoublezh);
 RTS_FUN_DECL(stg_castDoubleToWord64zh);
 RTS_FUN_DECL(stg_castWord32ToFloatzh);
 RTS_FUN_DECL(stg_castFloatToWord32zh);
+
+RTS_FUN_DECL(stg_annotateStackzh);
 
 /* Other misc stuff */
 // See wiki:commentary/compiler/backends/ppr-c#prototypes

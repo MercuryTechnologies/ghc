@@ -85,10 +85,24 @@ AC_DEFUN([FP_SETTINGS],
         SettingsWindresCommand="$WindresCmd"
     fi
 
+    # Fallback values for LLVM tools. See #26209.
+    if test -z "$LlcCmd"; then
+        LlcCmd="llc"
+    fi
+
+    if test -z "$OptCmd"; then
+        OptCmd="opt"
+    fi
+
+    if test -z "$LlvmAsCmd"; then
+        LlvmAsCmd="clang"
+    fi
+
     # LLVM backend tools
     SettingsLlcCommand="$LlcCmd"
     SettingsOptCommand="$OptCmd"
     SettingsLlvmAsCommand="$LlvmAsCmd"
+    SettingsLlvmAsFlags="$LlvmAsFlags"
 
     if test "$EnableDistroToolchain" = "YES"; then
         # If the user specified --enable-distro-toolchain then we just use the
@@ -131,17 +145,11 @@ AC_DEFUN([FP_SETTINGS],
         SUBST_TOOLDIR([SettingsLlcCommand])
         SUBST_TOOLDIR([SettingsOptCommand])
         SUBST_TOOLDIR([SettingsLlvmAsCommand])
+        SUBST_TOOLDIR([SettingsLlvmAsFlags])
     fi
 
     # Mac-only tools
-    if test -z "$OtoolCmd"; then
-        OtoolCmd="otool"
-    fi
     SettingsOtoolCommand="$OtoolCmd"
-
-    if test -z "$InstallNameToolCmd"; then
-        InstallNameToolCmd="install_name_tool"
-    fi
     SettingsInstallNameToolCommand="$InstallNameToolCmd"
 
     SettingsCCompilerSupportsNoPie="$CONF_GCC_SUPPORTS_NO_PIE"
@@ -171,5 +179,6 @@ AC_DEFUN([FP_SETTINGS],
     AC_SUBST(SettingsLlcCommand)
     AC_SUBST(SettingsOptCommand)
     AC_SUBST(SettingsLlvmAsCommand)
+    AC_SUBST(SettingsLlvmAsFlags)
     AC_SUBST(SettingsUseDistroMINGW)
 ])

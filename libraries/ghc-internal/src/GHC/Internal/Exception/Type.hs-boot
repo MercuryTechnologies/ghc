@@ -2,7 +2,8 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 module GHC.Internal.Exception.Type
-  ( SomeException
+  ( Exception
+  , SomeException
   , divZeroException
   , overflowException
   , ratioZeroDenomException
@@ -10,7 +11,9 @@ module GHC.Internal.Exception.Type
   ) where
 
 -- See W1 of Note [Tracking dependencies on primitives] in GHC.Internal.Base
-import GHC.Types ()
+import GHC.Internal.Types ()
+
+class Exception e
 
 data SomeException
 divZeroException, overflowException,

@@ -24,7 +24,7 @@ module GHC.Tc.Gen.Head
 
        , tcInferAppHead, tcInferAppHead_maybe
        , tcInferId, tcCheckId, tcInferConLike, obviousSig
-       , tyConOf, tyConOfET, fieldNotInType
+       , tyConOf, tyConOfET
        , nonBidirectionalErr
 
        , pprArgInst
@@ -57,7 +57,7 @@ import GHC.Tc.Zonk.TcType
 
 
 import GHC.Core.FamInstEnv    ( FamInstEnvs )
-import GHC.Core.UsageEnv      ( singleUsageUE )
+import GHC.Core.UsageEnv      ( singleUsageUE, UsageEnv )
 import GHC.Core.PatSyn( PatSyn, patSynName )
 import GHC.Core.ConLike( ConLike(..) )
 import GHC.Core.DataCon
@@ -66,7 +66,6 @@ import GHC.Core.TyCo.Rep
 import GHC.Core.Type
 
 import GHC.Types.Id
-import GHC.Types.Id.Info
 import GHC.Types.Name
 import GHC.Types.Name.Reader
 import GHC.Types.SrcLoc
@@ -75,7 +74,6 @@ import GHC.Types.Error
 
 import GHC.Builtin.Types( multiplicityTy )
 import GHC.Builtin.Names
-import GHC.Builtin.Names.TH( liftStringName, liftName )
 
 import GHC.Driver.DynFlags
 import GHC.Utils.Misc
@@ -83,8 +81,6 @@ import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
 import GHC.Data.Maybe
-import Control.Monad
-import GHC.Rename.Unbound (WhatLooking(WL_Anything))
 
 
 
@@ -178,6 +174,7 @@ data HsExprArg (p :: TcPass) where -- See Note [HsExprArg]
                , eaql_larg    :: LHsExpr GhcRn       -- Original application, for
                                                      -- location and error msgs
                , eaql_tc_fun  :: (HsExpr GhcTc, AppCtxt) -- Typechecked head
+               , eaql_fun_ue  :: UsageEnv -- Usage environment of the typechecked head (QLA5)
                , eaql_args    :: [HsExprArg 'TcpInst]    -- Args: instantiated, not typechecked
                , eaql_wanted  :: WantedConstraints
                , eaql_encl    :: Bool                  -- True <=> we have already qlUnified
@@ -323,6 +320,7 @@ splitHsApps e = go e (top_ctxt 0 e) []
         ctxt' = case splice of
             HsUntypedSpliceExpr _ (L l _) -> set l ctxt -- l :: SrcAnn AnnListItem
             HsQuasiQuote _ _ (L l _)      -> set l ctxt -- l :: SrcAnn NoEpAnns
+            (XUntypedSplice (HsImplicitLiftSplice _ _ _ (L l _))) -> set l ctxt
 
     -- See Note [Looking through ExpandedThingRn]
     go (XExpr (ExpandedThingRn o e)) ctxt args
@@ -558,7 +556,7 @@ tcInferAppHead (fun,ctxt)
     do { mb_tc_fun <- tcInferAppHead_maybe fun
        ; case mb_tc_fun of
             Just (fun', fun_sigma) -> return (fun', fun_sigma)
-            Nothing -> tcInfer (tcExpr fun) }
+            Nothing -> runInferRho (tcExpr fun) }
 
 tcInferAppHead_maybe :: HsExpr GhcRn
                      -> TcM (Maybe (HsExpr GhcTc, TcSigmaType))
@@ -650,12 +648,6 @@ tyConOf fam_inst_envs ty0
 -- Variant of tyConOf that works for ExpTypes
 tyConOfET :: FamInstEnvs -> ExpRhoType -> Maybe TyCon
 tyConOfET fam_inst_envs ty0 = tyConOf fam_inst_envs =<< checkingExpType_maybe ty0
-
-fieldNotInType :: RecSelParent -> RdrName -> TcRnMessage
-fieldNotInType p rdr
-  = mkTcRnNotInScope rdr $
-    UnknownSubordinate (text "field of type" <+> quotes (ppr p))
-
 
 {- *********************************************************************
 *                                                                      *
@@ -764,6 +756,8 @@ tcInferOverLit lit@(OverLit { ol_val = val
     --   where fromInteger is gotten by looking up from_name, and
     --   the (3 :: Integer) is returned by mkOverLit
     -- Ditto the string literal "foo" to (fromString ("foo" :: String))
+    --
+    -- See Note [Typechecking overloaded literals] in GHC.Tc.Gen.Expr
     do { hs_lit <- mkOverLit val
        ; from_id <- tcLookupId from_name
        ; (wrap1, from_ty) <- topInstantiate (LiteralOrigin lit) (idType from_id)
@@ -778,11 +772,12 @@ tcInferOverLit lit@(OverLit { ol_val = val
        ; let lit_expr = L (l2l loc) $ mkHsWrapCo co $
                         HsLit noExtField hs_lit
              from_expr = mkHsWrap (wrap2 <.> wrap1) $
-                         HsVar noExtField (L loc from_id)
+                         mkHsVar (L loc from_id)
              witness = HsApp noExtField (L (l2l loc) from_expr) lit_expr
-             lit' = lit { ol_ext = OverLitTc { ol_rebindable = rebindable
-                                             , ol_witness = witness
-                                             , ol_type = res_ty } }
+             lit' = OverLit { ol_val = val
+                            , ol_ext = OverLitTc { ol_rebindable = rebindable
+                                                 , ol_witness = witness
+                                                 , ol_type = res_ty } }
        ; return (HsOverLit noExtField lit', res_ty) }
 
 {- *********************************************************************
@@ -793,43 +788,33 @@ tcInferOverLit lit@(OverLit { ol_val = val
 
 tcCheckId :: Name -> ExpRhoType -> TcM (HsExpr GhcTc)
 tcCheckId name res_ty
-  = do { (expr, actual_res_ty) <- tcInferId (noLocA name)
+  = do { (expr, actual_res_ty) <- tcInferId (noLocA $ noUserRdr name)
        ; traceTc "tcCheckId" (vcat [ppr name, ppr actual_res_ty, ppr res_ty])
        ; addFunResCtxt expr [] actual_res_ty res_ty $
          tcWrapResultO (OccurrenceOf name) rn_fun expr actual_res_ty res_ty }
   where
-    rn_fun = HsVar noExtField (noLocA name)
+    rn_fun = mkHsVar (noLocA name)
 
 ------------------------
-tcInferId :: LocatedN Name -> TcM (HsExpr GhcTc, TcSigmaType)
+tcInferId :: LocatedN (WithUserRdr Name) -> TcM (HsExpr GhcTc, TcSigmaType)
 -- Look up an occurrence of an Id
 -- Do not instantiate its type
-tcInferId lname@(L _ id_name)
+tcInferId lname@(L loc (WithUserRdr rdr id_name))
+
   | id_name `hasKey` assertIdKey
-  = do { dflags <- getDynFlags
+  = -- See Note [Overview of assertions]
+    do { dflags <- getDynFlags
        ; if gopt Opt_IgnoreAsserts dflags
          then tc_infer_id lname
-         else tc_infer_assert lname }
+         else tc_infer_id (L loc $ WithUserRdr rdr assertErrorName) }
 
   | otherwise
-  = do { (expr, ty) <- tc_infer_id lname
-       ; traceTc "tcInferId" (ppr id_name <+> dcolon <+> ppr ty)
-       ; return (expr, ty) }
+  = tc_infer_id lname
 
-tc_infer_assert :: LocatedN Name -> TcM (HsExpr GhcTc, TcSigmaType)
--- Deal with an occurrence of 'assert'
--- See Note [Adding the implicit parameter to 'assert']
-tc_infer_assert (L loc assert_name)
-  = do { assert_error_id <- tcLookupId assertErrorName
-       ; (wrap, id_rho) <- topInstantiate (OccurrenceOf assert_name)
-                                          (idType assert_error_id)
-       ; return (mkHsWrap wrap (HsVar noExtField (L loc assert_error_id)), id_rho)
-       }
-
-tc_infer_id :: LocatedN Name -> TcM (HsExpr GhcTc, TcSigmaType)
-tc_infer_id (L loc id_name)
+tc_infer_id :: LocatedN (WithUserRdr Name) -> TcM (HsExpr GhcTc, TcSigmaType)
+tc_infer_id (L loc (WithUserRdr rdr id_name))
  = do { thing <- tcLookup id_name
-      ; case thing of
+      ; (expr,ty) <- case thing of
              ATcId { tct_id = id }
                -> do { check_local_id id
                      ; return_id id }
@@ -841,15 +826,48 @@ tc_infer_id (L loc id_name)
 
              AGlobal (AConLike cl) -> tcInferConLike cl
 
-             (tcTyThingTyCon_maybe -> Just tc) -> failIllegalTyCon WL_Anything (tyConName tc)
-             ATyVar name _ -> failIllegalTyVal name
+             (tcTyThingTyCon_maybe -> Just tc) -> failIllegalTyCon WL_Term (WithUserRdr rdr (tyConName tc))
+             ATyVar name _ -> failIllegalTyVar (WithUserRdr rdr name)
 
-             _ -> failWithTc $ TcRnExpectedValueId thing }
+             _ -> failWithTc $ TcRnExpectedValueId thing
+
+       ; traceTc "tcInferId" (ppr id_name <+> dcolon <+> ppr ty)
+       ; return (expr, ty) }
   where
-    return_id id = return (HsVar noExtField (L loc id), idType id)
+    return_id id = return (mkHsVar (L loc id), idType id)
 
-{- Note [Suppress hints with RequiredTypeArguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [Overview of assertions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If you write (assert pred x) then
+
+  * If `-fignore-asserts` (which sets Opt_IgnoreAsserts) is on, the code is
+    typechecked as written, but `assert`, defined in GHC.Internal.Base
+       assert _pred r = r
+    simply ignores `pred`
+
+  * But without `-fignore-asserts`, GHC rewrites it to (assertError pred e)
+    and that is defined in GHC.Internal.IO.Exception as
+        assertError :: (?callStack :: CallStack) => Bool -> a -> a
+    which does test the predicate and, if it is not True, throws an exception,
+    capturing the CallStack.
+
+    This rewrite is done in `tcInferId`.
+
+So `-fignore-asserts` makes the assertion go away altogether, which may be good for
+production code.
+
+The reason that `assert` and `assertError` are defined in very different modules
+is a historical accident.
+
+Note: the Haddock for `assert` is on `GHC.Internal.Base.assert`, since that is
+what appears in the user's source proram.
+
+It's not entirely kosher to rewrite `assert` to `assertError`, because there's no
+way to "undo" if you want to see the original source code in the typechecker
+output.  We can fix this if it becomes a problem.
+
+Note [Suppress hints with RequiredTypeArguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When a type variable is used at the term level, GHC assumes the user might
 have made a typo and suggests a term variable with a similar name.
 
@@ -895,8 +913,7 @@ suppressing them entirely if RequiredTypeArguments is in effect.
 
 check_local_id :: Id -> TcM ()
 check_local_id id
-  = do { checkThLocalId id
-       ; tcEmitBindingUsage $ singleUsageUE id }
+  = do { tcEmitBindingUsage $ singleUsageUE id }
 
 check_naughty :: OccName -> TcId -> TcM ()
 check_naughty lbl id
@@ -928,7 +945,7 @@ tcInferDataCon con
                 -- in GHC.Core.DataCon.
 
        ; return ( XExpr (ConLikeTc (RealDataCon con) tvs all_arg_tys)
-                , mkInvisForAllTys tvbs $ mkPhiTy full_theta $
+                , mkForAllTys tvbs $ mkPhiTy full_theta $
                   mkScaledFunTys scaled_arg_tys res ) }
   where
     linear_to_poly :: Scaled Type -> TcM (Scaled Type)
@@ -947,16 +964,8 @@ tcInferPatSyn ps
 nonBidirectionalErr :: Name -> TcRnMessage
 nonBidirectionalErr = TcRnPatSynNotBidirectional
 
-{- Note [Adding the implicit parameter to 'assert']
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The typechecker transforms (assert e1 e2) to (assertError e1 e2).
-This isn't really the Right Thing because there's no way to "undo"
-if you want to see the original source code in the typechecker
-output.  We'll have fix this in due course, when we care more about
-being able to reconstruct the exact original program.
-
-Note [Typechecking data constructors]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [Typechecking data constructors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 As per Note [Polymorphisation of linear fields] in
 GHC.Core.Multiplicity, linear fields of data constructors get a
 polymorphic multiplicity when the data constructor is used as a term:
@@ -1058,80 +1067,6 @@ Wrinkles
 ************************************************************************
 -}
 
-checkThLocalId :: Id -> TcM ()
--- The renamer has already done checkWellStaged,
---   in RnSplice.checkThLocalName, so don't repeat that here.
--- Here we just add constraints for cross-stage lifting
-checkThLocalId id
-  = do  { mb_local_use <- getStageAndBindLevel (idName id)
-        ; case mb_local_use of
-             Just (top_lvl, bind_lvl, use_stage)
-                | thLevel use_stage > bind_lvl
-                -> checkCrossStageLifting top_lvl id use_stage
-             _  -> return ()   -- Not a locally-bound thing, or
-                               -- no cross-stage link
-    }
-
---------------------------------------
-checkCrossStageLifting :: TopLevelFlag -> Id -> ThStage -> TcM ()
--- If we are inside typed brackets, and (use_lvl > bind_lvl)
--- we must check whether there's a cross-stage lift to do
--- Examples   \x -> [|| x ||]
---            [|| map ||]
---
--- This is similar to checkCrossStageLifting in GHC.Rename.Splice, but
--- this code is applied to *typed* brackets.
-
-checkCrossStageLifting top_lvl id (Brack _ (TcPending ps_var lie_var q))
-  | isTopLevel top_lvl
-  = when (isExternalName id_name) (keepAlive id_name)
-    -- See Note [Keeping things alive for Template Haskell] in GHC.Rename.Splice
-
-  | otherwise
-  =     -- Nested identifiers, such as 'x' in
-        -- E.g. \x -> [|| h x ||]
-        -- We must behave as if the reference to x was
-        --      h $(lift x)
-        -- We use 'x' itself as the splice proxy, used by
-        -- the desugarer to stitch it all back together.
-        -- If 'x' occurs many times we may get many identical
-        -- bindings of the same splice proxy, but that doesn't
-        -- matter, although it's a mite untidy.
-    do  { let id_ty = idType id
-        ; checkTc (isTauTy id_ty) $
-          TcRnTHError $ TypedTHError $ SplicePolymorphicLocalVar id
-               -- If x is polymorphic, its occurrence sites might
-               -- have different instantiations, so we can't use plain
-               -- 'x' as the splice proxy name.  I don't know how to
-               -- solve this, and it's probably unimportant, so I'm
-               -- just going to flag an error for now
-
-        ; lift <- if isStringTy id_ty then
-                     do { sid <- tcLookupId GHC.Builtin.Names.TH.liftStringName
-                                     -- See Note [Lifting strings]
-                        ; return (HsVar noExtField (noLocA sid)) }
-                  else
-                     setConstraintVar lie_var   $
-                          -- Put the 'lift' constraint into the right LIE
-                     newMethodFromName (OccurrenceOf id_name)
-                                       GHC.Builtin.Names.TH.liftName
-                                       [getRuntimeRep id_ty, id_ty]
-
-                   -- Warning for implicit lift (#17804)
-        ; addDetailedDiagnostic (TcRnImplicitLift $ idName id)
-
-                   -- Update the pending splices
-        ; ps <- readMutVar ps_var
-        ; let pending_splice = PendingTcSplice id_name
-                                 (nlHsApp (mkLHsWrap (applyQuoteWrapper q) (noLocA lift))
-                                          (nlHsVar id))
-        ; writeMutVar ps_var (pending_splice : ps)
-
-        ; return () }
-  where
-    id_name = idName id
-
-checkCrossStageLifting _ _ _ = return ()
 
 {-
 Note [Lifting strings]
@@ -1151,6 +1086,35 @@ Note [Local record selectors]
 Record selectors for TyCons in this module are ordinary local bindings,
 which show up as ATcIds rather than AGlobals.  So we need to check for
 naughtiness in both branches.  c.f. GHC.Tc.TyCl.Utils.mkRecSelBinds.
+
+Note [Explicit Level Imports]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This is the overview note which explains the whole implementation of ExplicitLevelImports
+
+GHC Proposal: https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0682-explicit-level-imports.rst
+Paper: https://mpickering.github.io/papers/explicit-level-imports.pdf
+
+The feature is turned on by the `ExplicitLevelImports` extension.
+At the source level, the user marks imports with `quote` or `splice` to introduce
+them at level 1 or -1.
+
+The function GHC.Tc.Utils.Monad.getCurrentAndBindLevel. computes the levels
+at which a Name is available:
+  - for top-level Names, this information is stored in its GRE; it is either local
+    (level 0) or imported, in which case the levels it is imported at are stored in the
+    'ImpDeclSpec's for the GRE. The function 'greLevels' retrieves this information.
+  - for locally-bound Names, this information is stored in the ThBindEnv.
+GHC.Rename.Splice.checkCrossLevelLifting checks that levels in user-written programs
+are correct.
+
+Instances are checked by `checkWellLevelledDFun`, which computes the level of an
+instance by calling `checkWellLevelledInstanceWhat`, which sees what is available at by looking at the module graph.
+
+That's it for the main implementation of the feature; the rest is modifications
+to the driver parts of the code to use this information. For example, in downsweep,
+we only enable code generation for modules needed at the runtime stage.
+See Note [-fno-code mode].
+
 -}
 
 
@@ -1190,37 +1154,11 @@ addFunResCtxt fun args fun_res_ty env_ty thing_inside
                      -- is not deeply skolemised, so still use tcSplitNestedSigmaTys
                  (args_fun, res_fun) = tcSplitFunTys fun_tau
                  (args_env, res_env) = tcSplitFunTys env_tau
-                 n_fun = length args_fun
-                 n_env = length args_env
-                 info  | -- Check for too few args
-                         --  fun_tau = a -> b, res_tau = Int
-                         n_fun > n_env
-                       , not_fun res_env
-                       = text "Probable cause:" <+> quotes (ppr fun)
-                         <+> text "is applied to too few arguments"
-
-                       | -- Check for too many args
-                         -- fun_tau = a -> Int,   res_tau = a -> b -> c -> d
-                         -- The final guard suppresses the message when there
-                         -- aren't enough args to drop; eg. the call is (f e1)
-                         n_fun < n_env
-                       , not_fun res_fun
-                       , (n_fun + count isValArg args) >= n_env
-                          -- Never suggest that a naked variable is
-                                           -- applied to too many args!
-                       = text "Possible cause:" <+> quotes (ppr fun)
-                         <+> text "is applied to too many arguments"
-
-                       | otherwise
-                       = Outputable.empty
-
+                 info =
+                  FunResCtxt fun (count isValArg args) res_fun res_env
+                    (length args_fun) (length args_env)
            ; return info }
 
-    not_fun ty   -- ty is definitely not an arrow type,
-                 -- and cannot conceivably become one
-      = case tcSplitTyConApp_maybe ty of
-          Just (tc, _) -> isAlgTyCon tc
-          Nothing      -> False
 
 {-
 Note [Splitting nested sigma types in mismatched function types]
@@ -1272,25 +1210,15 @@ mis-match in the number of value arguments.
 ********************************************************************* -}
 
 addStmtCtxt :: ExprStmt GhcRn -> TcRn a -> TcRn a
-addStmtCtxt stmt thing_inside
-  = do let err_doc = pprStmtInCtxt (HsDoStmt (DoExpr Nothing)) stmt
-       addErrCtxt err_doc thing_inside
-  where
-    pprStmtInCtxt :: HsStmtContextRn -> StmtLR GhcRn GhcRn (LHsExpr GhcRn) -> SDoc
-    pprStmtInCtxt ctxt stmt
-      = vcat [ hang (text "In a stmt of"
-                     <+> pprAStmtContext ctxt <> colon) 2 (pprStmt stmt)
-             ]
+addStmtCtxt stmt =
+  addErrCtxt (StmtErrCtxt (HsDoStmt (DoExpr Nothing)) stmt)
 
 addExprCtxt :: HsExpr GhcRn -> TcRn a -> TcRn a
 addExprCtxt e thing_inside
   = case e of
-      HsUnboundVar {} -> thing_inside
-      _ -> addErrCtxt (exprCtxt e) thing_inside
-   -- The HsUnboundVar special case addresses situations like
+      HsHole _ -> thing_inside
+      _ -> addErrCtxt (ExprCtxt e) thing_inside
+   -- The HsHole special case addresses situations like
    --    f x = _
    -- when we don't want to say "In the expression: _",
    -- because it is mentioned in the error message itself
-
-exprCtxt :: HsExpr GhcRn -> SDoc
-exprCtxt expr = hang (text "In the expression:") 2 (ppr (stripParensHsExpr expr))

@@ -37,7 +37,6 @@ import GHC.Core.Utils   ( exprIsTrivial, isDefaultAlt, isExpandableApp,
                           mkCastMCo, mkTicks )
 import GHC.Core.Opt.Arity   ( joinRhsArity, isOneShotBndr )
 import GHC.Core.Coercion
-import GHC.Core.Predicate   ( isDictId )
 import GHC.Core.Type
 import GHC.Core.TyCo.FVs    ( tyCoVarsOfMCo )
 
@@ -65,6 +64,7 @@ import GHC.Builtin.Names( runRWKey )
 import GHC.Unit.Module( Module )
 
 import Data.List (mapAccumL)
+import Data.List.NonEmpty (NonEmpty (..))
 
 {-
 ************************************************************************
@@ -1026,14 +1026,14 @@ occAnalNonRecBody env bndr thing_inside
 -----------------
 occAnalNonRecRhs :: OccEnv -> TopLevelFlag -> ImpRuleEdges
                 -> JoinPointHood -> Id -> CoreExpr
-                 -> ([UsageDetails], Id, CoreExpr)
+                 -> (NonEmpty UsageDetails, Id, CoreExpr)
 occAnalNonRecRhs !env lvl imp_rule_edges mb_join bndr rhs
   | null rules, null imp_rule_infos
   =  -- Fast path for common case of no rules. This is only worth
      -- 0.1% perf on average, but it's also only a line or two of code
-    ( [adj_rhs_uds, adj_unf_uds],              final_bndr_no_rules,   final_rhs )
+    ( adj_rhs_uds :| adj_unf_uds : [], final_bndr_no_rules, final_rhs )
   | otherwise
-  = (adj_rhs_uds : adj_unf_uds : adj_rule_uds, final_bndr_with_rules, final_rhs )
+  = ( adj_rhs_uds :| adj_unf_uds : adj_rule_uds, final_bndr_with_rules, final_rhs )
   where
     --------- Right hand side ---------
     -- For join points, set occ_encl to OccVanilla, via setTailCtxt.  If we have
@@ -1804,7 +1804,7 @@ mkLoopBreakerNodes :: OccEnv -> TopLevelFlag
 --   d) adjust each RHS's usage details according to
 --      the binder's (new) shotness and join-point-hood
 mkLoopBreakerNodes !env lvl body_uds details_s
-  = WUD final_uds (zipWithEqual "mkLoopBreakerNodes" mk_lb_node details_s bndrs')
+  = WUD final_uds (zipWithEqual mk_lb_node details_s bndrs')
   where
     WUD final_uds bndrs' = tagRecBinders lvl body_uds details_s
 
@@ -2500,7 +2500,7 @@ occAnal env (Tick tickish body)
       -- For a non-soft tick scope, we can inline lambdas only, so we
       -- abandon tail calls, and do markAllInsideLam too: usage_lam
 
-      |  Breakpoint _ _ ids _ <- tickish
+      | Breakpoint _ _ ids <- tickish
       = -- Never substitute for any of the Ids in a Breakpoint
         addManyOccs usage_lam (mkVarSet ids)
 
@@ -3327,8 +3327,8 @@ Some tricky corners:
 (BS5) We have to apply the occ_bs_env substitution uniformly,
       including to (local) rules and unfoldings.
 
-(BS6) We must be very careful with dictionaries.
-      See Note [Care with binder-swap on dictionaries]
+(BS6) For interest (only),
+      see Historical Note [Care with binder-swap on dictionaries]
 
 Note [Case of cast]
 ~~~~~~~~~~~~~~~~~~~
@@ -3338,9 +3338,13 @@ We'd like to eliminate the inner case.  That is the motivation for
 equation (2) in Note [Binder swap].  When we get to the inner case, we
 inline x, cancel the casts, and away we go.
 
-Note [Care with binder-swap on dictionaries]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-This Note explains why we need isDictId in scrutOkForBinderSwap.
+Historical Note [Care with binder-swap on dictionaries]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This Note is now out-dated; it has been rendered irrelevant by
+Note [Unary class magic] in GHC.Core.TyCon.  I'm leaving it here in
+case we are every tempted to return to newtype classes.
+
+This (historical) Note explains why we need isDictId in scrutOkForBinderSwap.
 Consider this tricky example (#21229, #21470):
 
   class Sing (b :: Bool) where sing :: Bool
@@ -3386,6 +3390,16 @@ Conclusion:
 
 Hence the subtle isDictId in scrutOkForBinderSwap.
 
+Why this Note is now outdated.  Using Note [Unary class magic] in GHC.Core.TyCon
+the program above becomes
+  h = \ @(a :: Bool) ($dSing :: Sing a)
+      case sing @a $dSing of (wild::Bool)
+        True  -> f @'True $dSing
+        False -> f @a     $dSing
+so the issue of binder-swapping doesn't arise.
+
+End of Historical Note.
+
 Note [Zap case binders in proxy bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 From the original
@@ -3429,21 +3443,17 @@ scrutOkForBinderSwap :: OutExpr -> BinderSwapDecision
 -- If (scrutOkForBinderSwap e = DoBinderSwap v mco, then
 --    v = e |> mco
 -- See Note [Case of cast]
--- See Note [Care with binder-swap on dictionaries]
+-- See Historical Note [Care with binder-swap on dictionaries]
 --
 -- We use this same function in SpecConstr, and Simplify.Iteration,
 -- when something binder-swap-like is happening
-scrutOkForBinderSwap (Var v)    = DoBinderSwap v MRefl
-scrutOkForBinderSwap (Cast (Var v) co)
-  | not (isDictId v)             = DoBinderSwap v (MCo (mkSymCo co))
-        -- Cast: see Note [Case of cast]
-        -- isDictId: see Note [Care with binder-swap on dictionaries]
-        -- The isDictId rejects a Constraint/Constraint binder-swap, perhaps
-        -- over-conservatively. But I have never seen one, so I'm leaving
-        -- the code as simple as possible. Losing the binder-swap in a
-        -- rare case probably has very low impact.
-scrutOkForBinderSwap (Tick _ e) = scrutOkForBinderSwap e  -- Drop ticks
-scrutOkForBinderSwap _          = NoBinderSwap
+scrutOkForBinderSwap e
+  = case e of
+      Tick _ e        -> scrutOkForBinderSwap e  -- Drop ticks
+      Var v           -> DoBinderSwap v MRefl
+      Cast (Var v) co -> DoBinderSwap v (MCo (mkSymCo co))
+                         -- Cast: see Note [Case of cast]
+      _               -> NoBinderSwap
 
 lookupBndrSwap :: OccEnv -> Id -> (CoreExpr, Id)
 -- See Note [The binder-swap substitution]

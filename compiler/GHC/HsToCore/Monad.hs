@@ -94,7 +94,8 @@ import GHC.Unit.Module.ModGuts
 import GHC.Types.Name.Reader
 import GHC.Types.SourceFile
 import GHC.Types.Id
-import GHC.Types.Var (EvId)
+import GHC.Types.Var (EvVar)
+import GHC.Types.Var.Set( VarSet, emptyVarSet, extendVarSetList )
 import GHC.Types.SrcLoc
 import GHC.Types.TypeEnv
 import GHC.Types.Unique.Supply
@@ -117,7 +118,6 @@ import qualified GHC.Data.Strict as Strict
 
 import Data.IORef
 import GHC.Driver.Env.KnotVars
-import qualified Data.Set as S
 import GHC.IO.Unsafe (unsafeInterleaveIO)
 
 {-
@@ -266,17 +266,20 @@ mkDsEnvsFromTcGbl hsc_env msg_var tcg_env
              ptc = initPromotionTickContext (hsc_dflags hsc_env)
              -- re-use existing next_wrapper_num to ensure uniqueness
              next_wrapper_num_var = tcg_next_wrapper_num tcg_env
+             tcg_comp_env = tcg_complete_match_env tcg_env
 
        ; ds_complete_matches <-
            liftIO $ unsafeInterleaveIO $
+             -- Note [Lazily loading COMPLETE pragmas]
+             -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
              -- This call to 'unsafeInterleaveIO' ensures we only do this work
              -- when we need to look at the COMPLETE pragmas, avoiding doing work
              -- when we don't need them.
              --
              -- Relevant test case: MultiLayerModulesTH_Make, which regresses
              -- in allocations by ~5% if we don't do this.
-           traverse (lookupCompleteMatch type_env hsc_env) $
-             localAndImportedCompleteMatches (tcg_complete_matches tcg_env) hsc_env eps
+           traverse (lookupCompleteMatch type_env hsc_env) =<<
+             localAndImportedCompleteMatches tcg_comp_env eps
        ; return $ mkDsEnvs unit_env this_mod rdr_env type_env fam_inst_env ptc
                            msg_var cc_st_var next_wrapper_num_var ds_complete_matches
        }
@@ -333,8 +336,8 @@ initDsWithModGuts hsc_env (ModGuts { mg_module = this_mod, mg_binds = binds
              bindsToIds (NonRec v _)   = [v]
              bindsToIds (Rec    binds) = map fst binds
              ids = concatMap bindsToIds binds
-       ; ds_complete_matches <- traverse (lookupCompleteMatch type_env hsc_env) $
-            localAndImportedCompleteMatches local_complete_matches hsc_env eps
+       ; ds_complete_matches <- traverse (lookupCompleteMatch type_env hsc_env) =<<
+            localAndImportedCompleteMatches local_complete_matches eps
        ; let
              envs  = mkDsEnvs unit_env this_mod rdr_env type_env
                               fam_inst_env ptc msg_var cc_st_var
@@ -406,7 +409,7 @@ mkDsEnvs unit_env mod rdr_env type_env fam_inst_env ptc msg_var cc_st_var
         lcl_env = DsLclEnv { dsl_meta        = emptyNameEnv
                            , dsl_loc         = real_span
                            , dsl_nablas      = initNablas
-                           , dsl_unspecables = mempty
+                           , dsl_unspecables = Just emptyVarSet
                            }
     in (gbl_env, lcl_env)
 
@@ -469,13 +472,17 @@ getPmNablas = do { env <- getLclEnv; return (dsl_nablas env) }
 updPmNablas :: Nablas -> DsM a -> DsM a
 updPmNablas nablas = updLclEnv (\env -> env { dsl_nablas = nablas })
 
-addUnspecables :: S.Set EvId -> DsM a -> DsM a
-addUnspecables unspecables = updLclEnv (\env -> env{ dsl_unspecables = unspecables `mappend` dsl_unspecables env })
+addUnspecables :: [EvVar] -> DsM a -> DsM a
+addUnspecables new_unspecables
+  = updLclEnv (\env -> case dsl_unspecables env of
+                          Nothing -> env
+                          Just us -> env { dsl_unspecables
+                                             = Just (us `extendVarSetList` new_unspecables) })
 
 zapUnspecables :: DsM a -> DsM a
-zapUnspecables = updLclEnv (\env -> env{ dsl_unspecables = mempty })
+zapUnspecables = updLclEnv (\env -> env{ dsl_unspecables = Nothing })
 
-getUnspecables :: DsM (S.Set EvId)
+getUnspecables :: DsM (Maybe VarSet)
 getUnspecables = dsl_unspecables <$> getLclEnv
 
 getSrcSpanDs :: DsM SrcSpan

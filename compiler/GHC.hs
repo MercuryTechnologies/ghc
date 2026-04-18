@@ -4,6 +4,7 @@
 {-# LANGUAGE TupleSections, NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE LambdaCase #-}
 
 -- -----------------------------------------------------------------------------
 --
@@ -37,7 +38,9 @@ module GHC (
         setSessionDynFlags,
         setUnitDynFlags,
         getProgramDynFlags, setProgramDynFlags,
+        setProgramHUG, setProgramHUG_,
         getInteractiveDynFlags, setInteractiveDynFlags,
+        normaliseInteractiveDynFlags, initialiseInteractiveDynFlags,
         interpretPackageEnv,
 
         -- * Logging
@@ -54,6 +57,7 @@ module GHC (
         addTarget,
         removeTarget,
         guessTarget,
+        guessTargetId,
 
         -- * Loading\/compiling the program
         depanal, depanalE,
@@ -82,6 +86,7 @@ module GHC (
         getModuleGraph,
         isLoaded,
         isLoadedModule,
+        isLoadedHomeModule,
         topSortModuleGraph,
 
         -- * Inspecting modules
@@ -99,33 +104,37 @@ module GHC (
         findGlobalAnns,
         mkNamePprCtxForModule,
         ModIface,
-        ModIface_(
-          mi_module,
-          mi_sig_of,
-          mi_hsc_src,
-          mi_src_hash,
-          mi_hi_bytes,
-          mi_deps,
-          mi_usages,
-          mi_exports,
-          mi_used_th,
-          mi_fixities,
-          mi_warns,
-          mi_anns,
-          mi_insts,
-          mi_fam_insts,
-          mi_rules,
-          mi_decls,
-          mi_extra_decls,
-          mi_top_env,
-          mi_hpc,
-          mi_trust,
-          mi_trust_pkg,
-          mi_complete_matches,
-          mi_docs,
-          mi_final_exts,
-          mi_ext_fields
-        ),
+        ModIface_( mi_mod_info
+                 , mi_module
+                 , mi_sig_of
+                 , mi_hsc_src
+                 , mi_iface_hash
+                 , mi_deps
+                 , mi_public
+                 , mi_exports
+                 , mi_fixities
+                 , mi_warns
+                 , mi_anns
+                 , mi_decls
+                 , mi_defaults
+                 , mi_simplified_core
+                 , mi_top_env
+                 , mi_insts
+                 , mi_fam_insts
+                 , mi_rules
+                 , mi_trust
+                 , mi_trust_pkg
+                 , mi_complete_matches
+                 , mi_docs
+                 , mi_abi_hashes
+                 , mi_ext_fields
+                 , mi_hi_bytes
+                 , mi_self_recomp_info
+                 , mi_fix_fn
+                 , mi_decl_warn_fn
+                 , mi_export_warn_fn
+                 , mi_hash_fn
+                 ),
         pattern ModIface,
         SafeHaskellMode(..),
 
@@ -150,6 +159,7 @@ module GHC (
         getBindings, getInsts, getNamePprCtx,
         findModule, lookupModule,
         findQualifiedModule, lookupQualifiedModule,
+        lookupLoadedHomeModuleByModuleName, lookupAllQualifiedModuleNames,
         renamePkgQualM, renameRawPkgQualM,
         isModuleTrusted, moduleTrustReqs,
         getNamesInScope,
@@ -191,7 +201,7 @@ module GHC (
         getResumeContext,
         GHC.obtainTermFromId, GHC.obtainTermFromVal, reconstructType,
         modInfoModBreaks,
-        ModBreaks(..), BreakIndex,
+        ModBreaks(..), BreakTickIndex,
         BreakpointId(..), InternalBreakpointId(..),
         GHC.Runtime.Eval.back,
         GHC.Runtime.Eval.forward,
@@ -336,6 +346,7 @@ import GHC.Driver.Errors
 import GHC.Driver.Errors.Types
 import GHC.Driver.CmdLine
 import GHC.Driver.Session
+import GHC.Driver.Session.Inspect
 import GHC.Driver.Backend
 import GHC.Driver.Config.Finder (initFinderOpts)
 import GHC.Driver.Config.Parser (initParserOpts)
@@ -368,7 +379,7 @@ import GHC.Builtin.Types.Prim ( alphaTyVars )
 import GHC.Data.StringBuffer
 import GHC.Data.FastString
 import qualified GHC.LanguageExtensions as LangExt
-import GHC.Rename.Names (renamePkgQual, renameRawPkgQual, gresFromAvails)
+import GHC.Rename.Names (renamePkgQual, renameRawPkgQual)
 
 import GHC.Tc.Utils.Monad    ( finalSafeMode, fixSafeInstances, initIfaceTcRn )
 import GHC.Tc.Types
@@ -415,15 +426,11 @@ import GHC.Types.Target
 import GHC.Types.Basic
 import GHC.Types.TyThing
 import GHC.Types.Name.Env
-import GHC.Types.Name.Ppr
 import GHC.Types.TypeEnv
-import GHC.Types.Breakpoint
 import GHC.Types.PkgQual
-import GHC.Types.Unique.FM
 
 import GHC.Unit
-import GHC.Unit.Env
-import GHC.Unit.External
+import GHC.Unit.Env as UnitEnv
 import GHC.Unit.Finder
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.ModGuts
@@ -431,6 +438,7 @@ import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.Graph
 import GHC.Unit.Home.ModInfo
+import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Settings
 
 import Control.Applicative ((<|>))
@@ -438,6 +446,7 @@ import Control.Concurrent
 import Control.Monad
 import Control.Monad.Catch as MC
 import Data.Foldable
+import Data.Function ((&))
 import Data.IORef
 import Data.List (isPrefixOf)
 import Data.Typeable    ( Typeable )
@@ -453,6 +462,7 @@ import System.Environment ( getEnv, getProgName )
 import System.Exit      ( exitWith, ExitCode(..) )
 import System.FilePath
 import System.IO.Error  ( isDoesNotExistError )
+
 
 -- %************************************************************************
 -- %*                                                                      *
@@ -666,7 +676,7 @@ setUnitDynFlagsNoCheck uid dflags1 = do
           , homeUnitEnv_home_unit = Just home_unit
           }
 
-  let unit_env = ue_updateHomeUnitEnv upd uid (hsc_unit_env hsc_env)
+  let unit_env = UnitEnv.ue_updateHomeUnitEnv upd uid (hsc_unit_env hsc_env)
 
   let dflags = updated_dflags
 
@@ -684,7 +694,7 @@ setUnitDynFlagsNoCheck uid dflags1 = do
   let !unit_env1 =
         if homeUnitId_ dflags /= uid
           then
-            ue_renameUnitId
+            UnitEnv.renameUnitId
                   uid
                   (homeUnitId_ dflags)
                   unit_env0
@@ -702,9 +712,9 @@ setTopSessionDynFlags :: GhcMonad m => DynFlags -> m ()
 setTopSessionDynFlags dflags = do
   hsc_env <- getSession
   logger  <- getLogger
-  lookup_cache  <- liftIO $ newMVar emptyUFM
+  lookup_cache  <- liftIO $ mkInterpSymbolCache
 
-  -- Interpreter
+  -- see Note [Target code interpreter]
   interp <- if
     -- Wasm dynamic linker
     | ArchWasm32 <- platformArch $ targetPlatform dflags
@@ -715,11 +725,7 @@ setTopSessionDynFlags dflags = do
 #if defined(wasm32_HOST_ARCH)
         let libdir = sorry "cannot spawn child process on wasm"
 #else
-        libdir <- liftIO $ do
-          libdirs <- Loader.getGccSearchDirectory logger dflags "libraries"
-          case libdirs of
-            [_, libdir] -> pure libdir
-            _ -> panic "corrupted wasi-sdk installation"
+        libdir <- liftIO $ last <$> Loader.getGccSearchDirectory logger dflags "libraries"
 #endif
         let profiled = ways dflags `hasWay` WayProf
             way_tag = if profiled then "_p" else ""
@@ -728,10 +734,17 @@ setTopSessionDynFlags dflags = do
                 { wasmInterpDyLD = dyld,
                   wasmInterpLibDir = libdir,
                   wasmInterpOpts = getOpts dflags opt_i,
+                  wasmInterpBrowser = gopt Opt_GhciBrowser dflags,
+                  wasmInterpBrowserHost = ghciBrowserHost dflags,
+                  wasmInterpBrowserPort = ghciBrowserPort dflags,
+                  wasmInterpBrowserRedirectWasiConsole = gopt Opt_GhciBrowserRedirectWasiConsole dflags,
+                  wasmInterpBrowserPuppeteerLaunchOpts = ghciBrowserPuppeteerLaunchOpts dflags,
+                  wasmInterpBrowserPlaywrightBrowserType = ghciBrowserPlaywrightBrowserType dflags,
+                  wasmInterpBrowserPlaywrightLaunchOpts = ghciBrowserPlaywrightLaunchOpts dflags,
                   wasmInterpTargetPlatform = targetPlatform dflags,
                   wasmInterpProfiled = profiled,
                   wasmInterpHsSoSuffix = way_tag ++ dynLibSuffix (ghcNameVersion dflags),
-                  wasmInterpUnitState = ue_units $ hsc_unit_env hsc_env
+                  wasmInterpUnitState = ue_homeUnitState $ hsc_unit_env hsc_env
                 }
         pure $ Just $ Interp (ExternalInterp $ ExtWasm $ ExtInterpState cfg s) loader lookup_cache
 
@@ -825,7 +838,7 @@ setProgramDynFlags_ invalidate_needed dflags = do
           let cached_unit_dbs = homeUnitEnv_unit_dbs homeUnitEnv
               dflags = homeUnitEnv_dflags homeUnitEnv
               old_hpt = homeUnitEnv_hpt homeUnitEnv
-              home_units = unitEnv_keys (ue_home_unit_graph old_unit_env)
+              home_units = HUG.allUnits (ue_home_unit_graph old_unit_env)
 
           (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags cached_unit_dbs home_units
 
@@ -838,12 +851,13 @@ setProgramDynFlags_ invalidate_needed dflags = do
             , homeUnitEnv_home_unit = Just home_unit
             }
 
-        let dflags1 = homeUnitEnv_dflags $ unitEnv_lookup (ue_currentUnit old_unit_env) home_unit_graph
+        let dflags1 = homeUnitEnv_dflags $ HUG.unitEnv_lookup (ue_currentUnit old_unit_env) home_unit_graph
         let unit_env = UnitEnv
               { ue_platform        = targetPlatform dflags1
               , ue_namever         = ghcNameVersion dflags1
               , ue_home_unit_graph = home_unit_graph
               , ue_current_unit    = ue_currentUnit old_unit_env
+              , ue_module_graph    = ue_module_graph old_unit_env
               , ue_eps             = ue_eps old_unit_env
               }
         modifySession $ \h -> hscSetFlags dflags1 h{ hsc_unit_env = unit_env }
@@ -852,6 +866,114 @@ setProgramDynFlags_ invalidate_needed dflags = do
   when invalidate_needed $ invalidateModSummaryCache
   return changed
 
+-- | Sets the program 'HomeUnitGraph'.
+--
+-- Sets the given 'HomeUnitGraph' as the 'HomeUnitGraph' of the current
+-- session. If the package flags change, we reinitialise the 'UnitState'
+-- of all 'HomeUnitEnv's in the current session.
+--
+-- This function unconditionally invalidates the module graph cache.
+--
+-- Precondition: the given 'HomeUnitGraph' must have the same keys as the 'HomeUnitGraph'
+-- of the current session. I.e., assuming the new 'HomeUnitGraph' is called
+-- 'new_hug', then:
+--
+-- @
+--  do
+--    hug <- hsc_HUG \<$\> getSession
+--    pure $ unitEnv_keys new_hug == unitEnv_keys hug
+-- @
+--
+-- If this precondition is violated, the function will crash.
+--
+-- Conceptually, similar to 'setProgramDynFlags', but performs the same check
+-- for all 'HomeUnitEnv's.
+setProgramHUG :: GhcMonad m => HomeUnitGraph -> m Bool
+setProgramHUG =
+  setProgramHUG_ True
+
+-- | Same as 'setProgramHUG', but gives you control over whether you want to
+-- invalidate the module graph cache.
+setProgramHUG_ :: GhcMonad m => Bool -> HomeUnitGraph -> m Bool
+setProgramHUG_ invalidate_needed new_hug0 = do
+  logger <- getLogger
+
+  hug0 <- hsc_HUG <$> getSession
+  (changed, new_hug1) <- checkNewHugDynFlags logger hug0 new_hug0
+
+  if changed
+    then do
+      unit_env0 <- hsc_unit_env <$> getSession
+      home_unit_graph <- HUG.unitEnv_traverseWithKey
+        (updateHomeUnit logger unit_env0 new_hug1)
+        (ue_home_unit_graph unit_env0)
+
+      let dflags1 = homeUnitEnv_dflags $ HUG.unitEnv_lookup (ue_currentUnit unit_env0) home_unit_graph
+      let unit_env = UnitEnv
+            { ue_platform        = targetPlatform dflags1
+            , ue_namever         = ghcNameVersion dflags1
+            , ue_home_unit_graph = home_unit_graph
+            , ue_current_unit    = ue_currentUnit unit_env0
+            , ue_eps             = ue_eps unit_env0
+            , ue_module_graph    = ue_module_graph unit_env0
+            }
+      modifySession $ \h ->
+        -- hscSetFlags takes care of updating the logger as well.
+        hscSetFlags dflags1 h{ hsc_unit_env = unit_env }
+    else do
+      modifySession (\env ->
+        env
+          -- Set the new 'HomeUnitGraph'.
+          & hscUpdateHUG (const new_hug1)
+          -- hscSetActiveUnitId makes sure that the 'hsc_dflags'
+          -- are up-to-date.
+          & hscSetActiveUnitId (hscActiveUnitId env)
+          -- Make sure the logger is also updated.
+          & hscUpdateLoggerFlags)
+
+  when invalidate_needed $ invalidateModSummaryCache
+  pure changed
+  where
+    checkNewHugDynFlags :: GhcMonad m => Logger -> HomeUnitGraph -> HomeUnitGraph -> m (Bool, HomeUnitGraph)
+    checkNewHugDynFlags logger old_hug new_hug = do
+      -- Traverse the new HUG and check its 'DynFlags'.
+      -- The old 'HUG' is used to check whether package flags have changed.
+      hugWithCheck <- HUG.unitEnv_traverseWithKey
+        (\unitId homeUnit -> do
+          let newFlags = homeUnitEnv_dflags homeUnit
+              oldFlags = homeUnitEnv_dflags (HUG.unitEnv_lookup unitId old_hug)
+          checkedFlags <- checkNewDynFlags logger newFlags
+          pure
+            ( packageFlagsChanged oldFlags checkedFlags
+            , homeUnit { homeUnitEnv_dflags = checkedFlags }
+            )
+        )
+        new_hug
+      let
+        -- Did any of the package flags change?
+        changed = or $ fmap fst hugWithCheck
+        hug = fmap snd hugWithCheck
+      pure (changed, hug)
+
+    updateHomeUnit :: GhcMonad m => Logger -> UnitEnv -> HomeUnitGraph -> (UnitId -> HomeUnitEnv -> m HomeUnitEnv)
+    updateHomeUnit logger unit_env updates = \uid homeUnitEnv -> do
+      let cached_unit_dbs = homeUnitEnv_unit_dbs homeUnitEnv
+          dflags = case HUG.unitEnv_lookup_maybe uid updates of
+            Nothing -> homeUnitEnv_dflags homeUnitEnv
+            Just env -> homeUnitEnv_dflags env
+          old_hpt = homeUnitEnv_hpt homeUnitEnv
+          home_units = HUG.allUnits (ue_home_unit_graph unit_env)
+
+      (dbs,unit_state,home_unit,mconstants) <- liftIO $ initUnits logger dflags cached_unit_dbs home_units
+
+      updated_dflags <- liftIO $ updatePlatformConstants dflags mconstants
+      pure HomeUnitEnv
+        { homeUnitEnv_units = unit_state
+        , homeUnitEnv_unit_dbs = Just dbs
+        , homeUnitEnv_dflags = updated_dflags
+        , homeUnitEnv_hpt = old_hpt
+        , homeUnitEnv_home_unit = Just home_unit
+        }
 
 -- When changing the DynFlags, we want the changes to apply to future
 -- loads, but without completely discarding the program.  But the
@@ -874,7 +996,7 @@ setProgramDynFlags_ invalidate_needed dflags = do
 --
 invalidateModSummaryCache :: GhcMonad m => m ()
 invalidateModSummaryCache =
-  modifySession $ \h -> h { hsc_mod_graph = mapMG inval (hsc_mod_graph h) }
+  modifySession $ \hsc_env -> setModuleGraph (mapMG inval (hsc_mod_graph hsc_env)) hsc_env
  where
   inval ms = ms { ms_hs_hash = fingerprint0 }
 
@@ -891,24 +1013,8 @@ getProgramDynFlags = getSessionDynFlags
 setInteractiveDynFlags :: GhcMonad m => DynFlags -> m ()
 setInteractiveDynFlags dflags = do
   logger <- getLogger
-  dflags' <- checkNewDynFlags logger dflags
-  dflags'' <- checkNewInteractiveDynFlags logger dflags'
-  modifySessionM $ \hsc_env0 -> do
-    let ic0 = hsc_IC hsc_env0
-
-    -- Initialise (load) plugins in the interactive environment with the new
-    -- DynFlags
-    plugin_env <- liftIO $ initializePlugins $ mkInteractiveHscEnv $
-                    hsc_env0 { hsc_IC = ic0 { ic_dflags = dflags'' }}
-
-    -- Update both plugins cache and DynFlags in the interactive context.
-    return $ hsc_env0
-                { hsc_IC = ic0
-                    { ic_plugins = hsc_plugins plugin_env
-                    , ic_dflags  = hsc_dflags  plugin_env
-                    }
-                }
-
+  icdflags <- normaliseInteractiveDynFlags logger dflags
+  modifySessionM (initialiseInteractiveDynFlags icdflags)
 
 -- | Get the 'DynFlags' used to evaluate interactive expressions.
 getInteractiveDynFlags :: GhcMonad m => m DynFlags
@@ -922,7 +1028,7 @@ parseDynamicFlags
     -> [Located String]
     -> m (DynFlags, [Located String], Messages DriverMessage)
 parseDynamicFlags logger dflags cmdline = do
-  (dflags1, leftovers, warns) <- parseDynamicFlagsCmdLine dflags cmdline
+  (dflags1, leftovers, warns) <- parseDynamicFlagsCmdLine logger dflags cmdline
   -- flags that have just been read are used by the logger when loading package
   -- env (this is checked by T16318)
   let logger1 = setLogFlags logger (initLogFlags dflags1)
@@ -1013,17 +1119,49 @@ normalise_hyp fp
 
 -----------------------------------------------------------------------------
 
+-- | Normalise the 'DynFlags' for us in an interactive context.
+--
+-- Makes sure unsupported Flags and other incosistencies are reported and removed.
+normaliseInteractiveDynFlags :: MonadIO m => Logger -> DynFlags -> m DynFlags
+normaliseInteractiveDynFlags logger dflags = do
+  dflags' <- checkNewDynFlags logger dflags
+  checkNewInteractiveDynFlags logger dflags'
+
+-- | Given a set of normalised 'DynFlags' (see 'normaliseInteractiveDynFlags')
+-- for the interactive context, initialize the 'InteractiveContext'.
+--
+-- Initialized plugins and sets the 'DynFlags' as the 'ic_dflags' of the
+-- 'InteractiveContext'.
+initialiseInteractiveDynFlags :: GhcMonad m => DynFlags -> HscEnv -> m HscEnv
+initialiseInteractiveDynFlags dflags hsc_env0 = do
+  let ic0 = hsc_IC hsc_env0
+
+  -- Initialise (load) plugins in the interactive environment with the new
+  -- DynFlags
+  plugin_env <- liftIO $ initializePlugins $ mkInteractiveHscEnv $
+                  hsc_env0 { hsc_IC = ic0 { ic_dflags = dflags }}
+
+  -- Update both plugins cache and DynFlags in the interactive context.
+  return $ hsc_env0
+              { hsc_IC = ic0
+                  { ic_plugins = hsc_plugins plugin_env
+                  , ic_dflags  = hsc_dflags  plugin_env
+                  }
+              }
+
 -- | Checks the set of new DynFlags for possibly erroneous option
 -- combinations when invoking 'setSessionDynFlags' and friends, and if
 -- found, returns a fixed copy (if possible).
 checkNewDynFlags :: MonadIO m => Logger -> DynFlags -> m DynFlags
 checkNewDynFlags logger dflags = do
   -- See Note [DynFlags consistency]
-  let (dflags', warnings) = makeDynFlagsConsistent dflags
+  let (dflags', warnings, infoverb) = makeDynFlagsConsistent dflags
   let diag_opts = initDiagOpts dflags
       print_config = initPrintConfig dflags
   liftIO $ printOrThrowDiagnostics logger print_config diag_opts
     $ fmap GhcDriverMessage $ warnsToMessages diag_opts warnings
+  when (logVerbAtLeast logger 3) $
+    mapM_ (\(L _loc m) -> liftIO $ logInfo logger m) infoverb
   return dflags'
 
 checkNewInteractiveDynFlags :: MonadIO m => Logger -> DynFlags -> m DynFlags
@@ -1073,7 +1211,7 @@ removeTarget target_id
   where
    filter targets = [ t | t@Target { targetId = id } <- targets, id /= target_id ]
 
--- | Attempts to guess what Target a string refers to.  This function
+-- | Attempts to guess what 'Target' a string refers to.  This function
 -- implements the @--make@/GHCi command-line syntax for filenames:
 --
 --   - if the string looks like a Haskell source filename, then interpret it
@@ -1082,27 +1220,52 @@ removeTarget target_id
 --   - if adding a .hs or .lhs suffix yields the name of an existing file,
 --     then use that
 --
---   - otherwise interpret the string as a module name
+--   - If it looks like a module name, interpret it as such
 --
+--   - otherwise, this function throws a 'GhcException'.
 guessTarget :: GhcMonad m => String -> Maybe UnitId -> Maybe Phase -> m Target
 guessTarget str mUnitId (Just phase)
    = do
      tuid <- unitIdOrHomeUnit mUnitId
      return (Target (TargetFile str (Just phase)) True tuid Nothing)
-guessTarget str mUnitId Nothing
+guessTarget str mUnitId Nothing = do
+  targetId <- guessTargetId str
+  toTarget targetId
+     where
+         obj_allowed
+                | '*':_ <- str = False
+                | otherwise    = True
+         toTarget tid = do
+           tuid <- unitIdOrHomeUnit mUnitId
+           pure $ Target tid obj_allowed tuid Nothing
+
+-- | Attempts to guess what 'TargetId' a string refers to.  This function
+-- implements the @--make@/GHCi command-line syntax for filenames:
+--
+--   - if the string looks like a Haskell source filename, then interpret it
+--     as such
+--
+--   - if adding a .hs or .lhs suffix yields the name of an existing file,
+--     then use that
+--
+--   - If it looks like a module name, interpret it as such
+--
+--   - otherwise, this function throws a 'GhcException'.
+guessTargetId :: GhcMonad m => String -> m TargetId
+guessTargetId str
    | isHaskellSrcFilename file
-   = target (TargetFile file Nothing)
+   = pure (TargetFile file Nothing)
    | otherwise
    = do exists <- liftIO $ doesFileExist hs_file
         if exists
-           then target (TargetFile hs_file Nothing)
+           then pure (TargetFile hs_file Nothing)
            else do
         exists <- liftIO $ doesFileExist lhs_file
         if exists
-           then target (TargetFile lhs_file Nothing)
+           then pure (TargetFile lhs_file Nothing)
            else do
         if looksLikeModuleName file
-           then target (TargetModule (mkModuleName file))
+           then pure (TargetModule (mkModuleName file))
            else do
         dflags <- getDynFlags
         liftIO $ throwGhcExceptionIO
@@ -1110,16 +1273,12 @@ guessTarget str mUnitId Nothing
                  text "target" <+> quotes (text file) <+>
                  text "is not a module name or a source file"))
      where
-         (file,obj_allowed)
-                | '*':rest <- str = (rest, False)
-                | otherwise       = (str,  True)
+        file
+          | '*':rest <- str = rest
+          | otherwise       = str
 
-         hs_file  = file <.> "hs"
-         lhs_file = file <.> "lhs"
-
-         target tid = do
-           tuid <- unitIdOrHomeUnit mUnitId
-           pure $ Target tid obj_allowed tuid Nothing
+        hs_file  = file <.> "hs"
+        lhs_file = file <.> "lhs"
 
 -- | Unwrap 'UnitId' or retrieve the 'UnitId'
 -- of the current 'HomeUnit'.
@@ -1240,11 +1399,11 @@ type TypecheckedSource = LHsBinds GhcTc
 --
 -- This function ignores boot modules and requires that there is only one
 -- non-boot module with the given name.
-getModSummary :: GhcMonad m => ModuleName -> m ModSummary
+getModSummary :: GhcMonad m => Module -> m ModSummary
 getModSummary mod = do
    mg <- liftM hsc_mod_graph getSession
    let mods_by_name = [ ms | ms <- mgModSummaries mg
-                      , ms_mod_name ms == mod
+                      , ms_mod ms == mod
                       , isBootSummary ms == NotBoot ]
    case mods_by_name of
      [] -> do dflags <- getDynFlags
@@ -1275,7 +1434,9 @@ typecheckModule pmod = do
  liftIO $ do
    let ms          = modSummary pmod
    let lcl_dflags  = ms_hspp_opts ms -- take into account pragmas (OPTIONS_GHC, etc.)
-   let lcl_hsc_env = hscSetFlags lcl_dflags hsc_env
+   let lcl_hsc_env =
+          hscSetFlags lcl_dflags $
+          hscSetActiveUnitId (toUnitId $ moduleUnit $ ms_mod ms) hsc_env
    let lcl_logger  = hsc_logger lcl_hsc_env
    (tc_gbl_env, rn_info) <- hscTypecheckRename lcl_hsc_env ms $
                         HsParsedModule { hpm_module = parsedSource pmod,
@@ -1296,7 +1457,7 @@ typecheckModule pmod = do
            minf_instances = fixSafeInstances safe $ instEnvElts $ md_insts details,
            minf_iface     = Nothing,
            minf_safe      = safe,
-           minf_modBreaks = emptyModBreaks
+           minf_modBreaks = Nothing
          }}
 
 -- | Desugar a typechecked module.
@@ -1406,155 +1567,6 @@ compileCore simplify fn = do
           cm_binds   = mg_binds mg,
           cm_safe    = safe_mode
          }
-
--- %************************************************************************
--- %*                                                                      *
---             Inspecting the session
--- %*                                                                      *
--- %************************************************************************
-
--- | Get the module dependency graph.
-getModuleGraph :: GhcMonad m => m ModuleGraph -- ToDo: DiGraph ModSummary
-getModuleGraph = liftM hsc_mod_graph getSession
-
--- | Return @True@ \<==> module is loaded.
-isLoaded :: GhcMonad m => ModuleName -> m Bool
-isLoaded m = withSession $ \hsc_env ->
-  return $! isJust (lookupHpt (hsc_HPT hsc_env) m)
-
-isLoadedModule :: GhcMonad m => UnitId -> ModuleName -> m Bool
-isLoadedModule uid m = withSession $ \hsc_env ->
-  return $! isJust (lookupHug (hsc_HUG hsc_env) uid m)
-
--- | Return the bindings for the current interactive session.
-getBindings :: GhcMonad m => m [TyThing]
-getBindings = withSession $ \hsc_env ->
-    return $ icInScopeTTs $ hsc_IC hsc_env
-
--- | Return the instances for the current interactive session.
-getInsts :: GhcMonad m => m ([ClsInst], [FamInst])
-getInsts = withSession $ \hsc_env ->
-    let (inst_env, fam_env) = ic_instances (hsc_IC hsc_env)
-    in return (instEnvElts inst_env, fam_env)
-
-getNamePprCtx :: GhcMonad m => m NamePprCtx
-getNamePprCtx = withSession $ \hsc_env -> do
-  return $ icNamePprCtx (hsc_unit_env hsc_env) (hsc_IC hsc_env)
-
--- | Container for information about a 'Module'.
-data ModuleInfo = ModuleInfo {
-        minf_type_env  :: TypeEnv,
-        minf_exports   :: [AvailInfo],
-        minf_instances :: [ClsInst],
-        minf_iface     :: Maybe ModIface,
-        minf_safe      :: SafeHaskellMode,
-        minf_modBreaks :: ModBreaks
-  }
-        -- We don't want HomeModInfo here, because a ModuleInfo applies
-        -- to package modules too.
-
-
--- | Request information about a loaded 'Module'
-getModuleInfo :: GhcMonad m => Module -> m (Maybe ModuleInfo)  -- XXX: Maybe X
-getModuleInfo mdl = withSession $ \hsc_env -> do
-  if moduleUnitId mdl `S.member` hsc_all_home_unit_ids hsc_env
-        then liftIO $ getHomeModuleInfo hsc_env mdl
-        else liftIO $ getPackageModuleInfo hsc_env mdl
-
-getPackageModuleInfo :: HscEnv -> Module -> IO (Maybe ModuleInfo)
-getPackageModuleInfo hsc_env mdl
-  = do  eps <- hscEPS hsc_env
-        iface <- hscGetModuleInterface hsc_env mdl
-        let
-            avails = mi_exports iface
-            pte    = eps_PTE eps
-            tys    = [ ty | name <- concatMap availNames avails,
-                            Just ty <- [lookupTypeEnv pte name] ]
-
-        return (Just (ModuleInfo {
-                        minf_type_env  = mkTypeEnv tys,
-                        minf_exports   = avails,
-                        minf_instances = error "getModuleInfo: instances for package module unimplemented",
-                        minf_iface     = Just iface,
-                        minf_safe      = getSafeMode $ mi_trust iface,
-                        minf_modBreaks = emptyModBreaks
-                }))
-
-availsToGlobalRdrEnv :: HasDebugCallStack => HscEnv -> Module -> [AvailInfo] -> IfGlobalRdrEnv
-availsToGlobalRdrEnv hsc_env mod avails
-  = forceGlobalRdrEnv rdr_env
-    -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
-  where
-    rdr_env = mkGlobalRdrEnv (gresFromAvails hsc_env (Just imp_spec) avails)
-      -- We're building a GlobalRdrEnv as if the user imported
-      -- all the specified modules into the global interactive module
-    imp_spec = ImpSpec { is_decl = decl, is_item = ImpAll}
-    decl = ImpDeclSpec { is_mod = mod, is_as = moduleName mod,
-                         is_qual = False, is_isboot = NotBoot, is_pkg_qual = NoPkgQual,
-                         is_dloc = srcLocSpan interactiveSrcLoc }
-
-getHomeModuleInfo :: HscEnv -> Module -> IO (Maybe ModuleInfo)
-getHomeModuleInfo hsc_env mdl =
-  case lookupHugByModule mdl (hsc_HUG hsc_env) of
-    Nothing  -> return Nothing
-    Just hmi -> do
-      let details  = hm_details hmi
-          iface    = hm_iface hmi
-      return (Just (ModuleInfo {
-                        minf_type_env  = md_types details,
-                        minf_exports   = md_exports details,
-                         -- NB: already forced. See Note [Forcing GREInfo] in GHC.Types.GREInfo.
-                        minf_instances = instEnvElts $ md_insts details,
-                        minf_iface     = Just iface,
-                        minf_safe      = getSafeMode $ mi_trust iface
-                       ,minf_modBreaks = getModBreaks hmi
-                        }))
-
--- | The list of top-level entities defined in a module
-modInfoTyThings :: ModuleInfo -> [TyThing]
-modInfoTyThings minf = typeEnvElts (minf_type_env minf)
-
-modInfoExports :: ModuleInfo -> [Name]
-modInfoExports minf = concatMap availNames $! minf_exports minf
-
-modInfoExportsWithSelectors :: ModuleInfo -> [Name]
-modInfoExportsWithSelectors minf = concatMap availNames $! minf_exports minf
-
--- | Returns the instances defined by the specified module.
--- Warning: currently unimplemented for package modules.
-modInfoInstances :: ModuleInfo -> [ClsInst]
-modInfoInstances = minf_instances
-
-modInfoIsExportedName :: ModuleInfo -> Name -> Bool
-modInfoIsExportedName minf name = elemNameSet name (availsToNameSet (minf_exports minf))
-
-mkNamePprCtxForModule ::
-  GhcMonad m =>
-  Module     ->
-  ModuleInfo ->
-  m NamePprCtx
-mkNamePprCtxForModule mod minf = withSession $ \hsc_env -> do
-  let name_ppr_ctx = mkNamePprCtx ptc (hsc_unit_env hsc_env) (availsToGlobalRdrEnv hsc_env mod (minf_exports minf))
-      ptc = initPromotionTickContext (hsc_dflags hsc_env)
-  return name_ppr_ctx
-
-modInfoLookupName :: GhcMonad m =>
-                     ModuleInfo -> Name
-                  -> m (Maybe TyThing) -- XXX: returns a Maybe X
-modInfoLookupName minf name = withSession $ \hsc_env -> do
-   case lookupTypeEnv (minf_type_env minf) name of
-     Just tyThing -> return (Just tyThing)
-     Nothing      -> liftIO (lookupType hsc_env name)
-
-modInfoIface :: ModuleInfo -> Maybe ModIface
-modInfoIface = minf_iface
-
--- | Retrieve module safe haskell mode
-modInfoSafe :: ModuleInfo -> SafeHaskellMode
-modInfoSafe = minf_safe
-
-modInfoModBreaks :: ModuleInfo -> ModBreaks
-modInfoModBreaks = minf_modBreaks
 
 isDictonaryId :: Id -> Bool
 isDictonaryId id = isDictTy (idType id)
@@ -1769,7 +1781,7 @@ modNotLoadedError :: DynFlags -> Module -> ModLocation -> IO a
 modNotLoadedError dflags m loc = throwGhcExceptionIO $ CmdLineError $ showSDoc dflags $
    text "module is not loaded:" <+>
    quotes (ppr (moduleName m)) <+>
-   parens (text (expectJust "modNotLoadedError" (ml_hs_file loc)))
+   parens (text (expectJust (ml_hs_file loc)))
 
 renamePkgQualM :: GhcMonad m => ModuleName -> Maybe FastString -> m PkgQual
 renamePkgQualM mn p = withSession $ \hsc_env -> pure (renamePkgQual (hsc_unit_env hsc_env) mn p)
@@ -1806,11 +1818,55 @@ lookupQualifiedModule NoPkgQual mod_name = withSession $ \hsc_env -> do
 lookupQualifiedModule pkgqual mod_name = findQualifiedModule pkgqual mod_name
 
 lookupLoadedHomeModule :: GhcMonad m => UnitId -> ModuleName -> m (Maybe Module)
-lookupLoadedHomeModule uid mod_name = withSession $ \hsc_env -> do
-  liftIO $ trace_if (hsc_logger hsc_env) (text "lookupLoadedHomeModule" <+> ppr mod_name <+> ppr uid)
-  case lookupHug  (hsc_HUG hsc_env) uid mod_name  of
+lookupLoadedHomeModule uid mod_name = withSession $ \hsc_env -> liftIO $ do
+  trace_if (hsc_logger hsc_env) (text "lookupLoadedHomeModule" <+> ppr mod_name <+> ppr uid)
+  HUG.lookupHug (hsc_HUG hsc_env) uid mod_name >>= \case
     Just mod_info      -> return (Just (mi_module (hm_iface mod_info)))
     _not_a_home_module -> return Nothing
+
+-- | Lookup the given 'ModuleName' in the 'HomeUnitGraph'.
+--
+-- Returns 'Nothing' if no 'Module' has the given 'ModuleName'.
+-- Otherwise, returns all 'Module's that have the given 'ModuleName'.
+--
+-- A 'ModuleName' is generally not enough to uniquely identify a 'Module', since
+-- there can be multiple units exposing the same 'ModuleName' in the case of
+-- multiple home units.
+-- Thus, this function may return more than one possible 'Module'.
+-- We leave it up to the caller to decide how to handle the ambiguity.
+-- For example, GHCi may prompt the user to clarify which 'Module' is the correct one.
+--
+lookupLoadedHomeModuleByModuleName :: GhcMonad m => ModuleName -> m (Maybe [Module])
+lookupLoadedHomeModuleByModuleName mod_name = withSession $ \hsc_env -> liftIO $ do
+  trace_if (hsc_logger hsc_env) (text "lookupLoadedHomeModuleByModuleName" <+> ppr mod_name)
+  HUG.lookupAllHug (hsc_HUG hsc_env) mod_name >>= \case
+    []        -> return Nothing
+    mod_infos -> return (Just (mi_module . hm_iface <$> mod_infos))
+
+-- | Given a 'ModuleName' and 'PkgQual', lookup all 'Module's that may fit the criteria.
+--
+-- Identically to 'lookupLoadedHomeModuleByModuleName', there may be more than one
+-- 'Module' in the 'HomeUnitGraph' that has the given 'ModuleName'.
+--
+-- The result is guaranteed to be non-empty, if no 'Module' can be found,
+-- this function throws an error.
+lookupAllQualifiedModuleNames :: GhcMonad m => PkgQual -> ModuleName -> m [Module]
+lookupAllQualifiedModuleNames NoPkgQual mod_name = withSession $ \hsc_env -> do
+  home <- lookupLoadedHomeModuleByModuleName mod_name
+  case home of
+    Just m  -> return m
+    Nothing -> liftIO $ do
+      let fc     = hsc_FC hsc_env
+      let units  = hsc_units hsc_env
+      let dflags = hsc_dflags hsc_env
+      let fopts  = initFinderOpts dflags
+      res <- findExposedPackageModule fc fopts units mod_name NoPkgQual
+      case res of
+        Found _ m -> return [m]
+        err       -> throwOneError $ noModError hsc_env noSrcSpan mod_name err
+lookupAllQualifiedModuleNames pkgqual mod_name = do
+  m <- findQualifiedModule pkgqual mod_name
+  pure [m]
 
 -- | Check that a module is safe to import (according to Safe Haskell).
 --
@@ -1842,14 +1898,17 @@ getGHCiMonad :: GhcMonad m => m Name
 getGHCiMonad = fmap (ic_monad . hsc_IC) getSession
 
 getHistorySpan :: GhcMonad m => History -> m SrcSpan
-getHistorySpan h = withSession $ \hsc_env ->
-    return $ GHC.Runtime.Eval.getHistorySpan hsc_env h
+getHistorySpan h = withSession $ \hsc_env -> liftIO $ GHC.Runtime.Eval.getHistorySpan (hsc_HUG hsc_env) h
 
 obtainTermFromVal :: GhcMonad m => Int ->  Bool -> Type -> a -> m Term
 obtainTermFromVal bound force ty a = withSession $ \hsc_env ->
     liftIO $ GHC.Runtime.Eval.obtainTermFromVal hsc_env bound force ty a
 
-obtainTermFromId :: GhcMonad m => Int -> Bool -> Id -> m Term
+obtainTermFromId :: GhcMonad m
+                 => Int -- ^ How many times to recurse for subterms
+                 -> Bool -- ^ Whether to force the expression
+                 -> Id
+                 -> m Term
 obtainTermFromId bound force id = withSession $ \hsc_env ->
     liftIO $ GHC.Runtime.Eval.obtainTermFromId hsc_env bound force id
 

@@ -17,8 +17,6 @@
 --
 -------------------------------------------------------------------------------
 
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-
 module GHC.Driver.Session (
         -- * Dynamic flags and associated configuration types
         DumpFlag(..),
@@ -79,6 +77,9 @@ module GHC.Driver.Session (
         packageTrustOn,
         safeDirectImpsReq, safeImplicitImpsReq,
         unsafeFlags, unsafeFlagsForInfer,
+
+        -- ** base
+        baseUnitId,
 
         -- ** System tool settings and locations
         Settings(..),
@@ -161,6 +162,7 @@ module GHC.Driver.Session (
         updOptLevel,
         setTmpDir,
         setUnitId,
+        setHomeUnitId,
 
         TurnOnFlag,
         turnOn,
@@ -204,6 +206,9 @@ module GHC.Driver.Session (
         setUnsafeGlobalDynFlags,
 
         -- * SSE and AVX
+        isSse3Enabled,
+        isSsse3Enabled,
+        isSse4_1Enabled,
         isSse4_2Enabled,
         isBmiEnabled,
         isBmi2Enabled,
@@ -232,6 +237,7 @@ import GHC.Prelude
 import GHC.Platform
 import GHC.Platform.Ways
 import GHC.Platform.Profile
+import GHC.Platform.ArchOS
 
 import GHC.Unit.Types
 import GHC.Unit.Parser
@@ -246,6 +252,7 @@ import GHC.Driver.Plugins.External
 import GHC.Settings.Config
 import GHC.Core.Unfold
 import GHC.Driver.CmdLine
+import GHC.Utils.Logger
 import GHC.Utils.Panic
 import GHC.Utils.Misc
 import GHC.Utils.Constants (debugIsOn)
@@ -264,7 +271,7 @@ import GHC.Data.FastString
 import GHC.Utils.TmpFs
 import GHC.Utils.Fingerprint
 import GHC.Utils.Outputable
-import GHC.Utils.Error (emptyDiagOpts)
+import GHC.Utils.Error (emptyDiagOpts, logInfo)
 import GHC.Settings
 import GHC.CmmToAsm.CFG.Weight
 import GHC.Core.Opt.CallerCC
@@ -282,6 +289,7 @@ import Data.Functor.Identity
 import Data.Ord
 import Data.Char
 import Data.List (intercalate, sortBy, partition)
+import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -390,6 +398,7 @@ settings :: DynFlags -> Settings
 settings dflags = Settings
   { sGhcNameVersion = ghcNameVersion dflags
   , sFileSettings = fileSettings dflags
+  , sUnitSettings = unitSettings dflags
   , sTargetPlatform = targetPlatform dflags
   , sToolSettings = toolSettings dflags
   , sPlatformMisc = platformMisc dflags
@@ -487,6 +496,10 @@ opt_las               :: DynFlags -> [String]
 opt_las dflags = toolSettings_opt_las $ toolSettings dflags
 opt_i                 :: DynFlags -> [String]
 opt_i dflags= toolSettings_opt_i $ toolSettings dflags
+
+
+setBaseUnitId :: String -> DynP ()
+setBaseUnitId s = upd $ \d -> d { unitSettings = UnitSettings (stringToUnitId s) }
 
 -----------------------------------------------------------------------------
 
@@ -699,15 +712,15 @@ setDumpPrefixForce f d = d { dumpPrefixForce = f}
 -- XXX HACK: Prelude> words "'does not' work" ===> ["'does","not'","work"]
 -- Config.hs should really use Option.
 setPgmP   f = alterToolSettings (\s -> s { toolSettings_pgm_P   = (pgm, map Option args)})
-  where (pgm:args) = words f
+  where pgm:|args = expectNonEmpty $ words f
 -- XXX HACK: Prelude> words "'does not' work" ===> ["'does","not'","work"]
 -- Config.hs should really use Option.
 setPgmJSP   f = alterToolSettings (\s -> s { toolSettings_pgm_JSP   = (pgm, map Option args)})
-  where (pgm:args) = words f
+  where pgm:|args = expectNonEmpty $ words f
 -- XXX HACK: Prelude> words "'does not' work" ===> ["'does","not'","work"]
 -- Config.hs should really use Option.
 setPgmCmmP f = alterToolSettings (\s -> s { toolSettings_pgm_CmmP = (pgm, map Option args)})
-  where (pgm:args) = words f
+  where pgm:|args = expectNonEmpty $ words f
 addOptl   f = alterToolSettings (\s -> s { toolSettings_opt_l   = f : toolSettings_opt_l s})
 addOptc   f = alterToolSettings (\s -> s { toolSettings_opt_c   = f : toolSettings_opt_c s})
 addOptcxx f = alterToolSettings (\s -> s { toolSettings_opt_cxx = f : toolSettings_opt_cxx s})
@@ -799,7 +812,7 @@ updOptLevel n = fst . updOptLevelChanged n
 -- the parsed 'DynFlags', the left-over arguments, and a list of warnings.
 -- Throws a 'UsageError' if errors occurred during parsing (such as unknown
 -- flags or missing arguments).
-parseDynamicFlagsCmdLine :: MonadIO m => DynFlags -> [Located String]
+parseDynamicFlagsCmdLine :: MonadIO m => Logger -> DynFlags -> [Located String]
                          -> m (DynFlags, [Located String], Messages DriverMessage)
                             -- ^ Updated 'DynFlags', left-over arguments, and
                             -- list of warnings.
@@ -809,7 +822,7 @@ parseDynamicFlagsCmdLine = parseDynamicFlagsFull flagsAll True
 -- | Like 'parseDynamicFlagsCmdLine' but does not allow the package flags
 -- (-package, -hide-package, -ignore-package, -hide-all-packages, -package-db).
 -- Used to parse flags set in a modules pragma.
-parseDynamicFilePragma :: MonadIO m => DynFlags -> [Located String]
+parseDynamicFilePragma :: MonadIO m => Logger -> DynFlags -> [Located String]
                        -> m (DynFlags, [Located String], Messages DriverMessage)
                           -- ^ Updated 'DynFlags', left-over arguments, and
                           -- list of warnings.
@@ -858,10 +871,11 @@ parseDynamicFlagsFull
     :: forall m. MonadIO m
     => [Flag (CmdLineP DynFlags)]    -- ^ valid flags to match against
     -> Bool                          -- ^ are the arguments from the command line?
+    -> Logger                        -- ^ logger
     -> DynFlags                      -- ^ current dynamic flags
     -> [Located String]              -- ^ arguments to parse
     -> m (DynFlags, [Located String], Messages DriverMessage)
-parseDynamicFlagsFull activeFlags cmdline dflags0 args = do
+parseDynamicFlagsFull activeFlags cmdline logger dflags0 args = do
   ((leftover, errs, cli_warns), dflags1) <- processCmdLineP activeFlags dflags0 args
 
   -- See Note [Handling errors when parsing command-line flags]
@@ -877,7 +891,7 @@ parseDynamicFlagsFull activeFlags cmdline dflags0 args = do
       throwGhcExceptionIO (CmdLineError ("combination not supported: " ++
                                intercalate "/" (map wayDesc (Set.toAscList theWays))))
 
-  let (dflags3, consistency_warnings) = makeDynFlagsConsistent dflags2
+  let (dflags3, consistency_warnings, infoverb) = makeDynFlagsConsistent dflags2
 
   -- Set timer stats & heap size
   when (enableTimeStats dflags3) $ liftIO enableTimingStats
@@ -890,6 +904,9 @@ parseDynamicFlagsFull activeFlags cmdline dflags0 args = do
   -- create message envelopes using final DynFlags: #23402
   let diag_opts = initDiagOpts dflags3
       warns = warnsToMessages diag_opts $ mconcat [consistency_warnings, sh_warns, cli_warns]
+
+  when (logVerbAtLeast logger 3) $
+    mapM_ (\(L _loc m) -> liftIO $ logInfo logger m) infoverb
 
   return (dflags3, leftover, warns)
 
@@ -1660,6 +1677,8 @@ dynamic_flags_deps = [
                                                   d { sseVersion = Just SSE2 }))
   , make_ord_flag defGhcFlag "msse3"        (noArg (\d ->
                                                   d { sseVersion = Just SSE3 }))
+  , make_ord_flag defGhcFlag "mssse3"       (noArg (\d ->
+                                                  d { sseVersion = Just SSSE3 }))
   , make_ord_flag defGhcFlag "msse4"        (noArg (\d ->
                                                   d { sseVersion = Just SSE4 }))
   , make_ord_flag defGhcFlag "msse4.2"      (noArg (\d ->
@@ -1827,6 +1846,19 @@ dynamic_flags_deps = [
       (intSuffix (\n d -> d {maxForcedSpecArgs = n}))
   , make_ord_flag defGhciFlag "fghci-hist-size"
       (intSuffix (\n d -> d {ghciHistSize = n}))
+
+  -- wasm ghci browser mode
+  , make_ord_flag defGhciFlag "fghci-browser-host"
+      $ hasArg $ \f d -> d { ghciBrowserHost = f }
+  , make_ord_flag defGhciFlag "fghci-browser-port"
+      $ intSuffix $ \n d -> d { ghciBrowserPort = n }
+  , make_ord_flag defGhciFlag "fghci-browser-puppeteer-launch-opts"
+      $ hasArg $ \f d -> d { ghciBrowserPuppeteerLaunchOpts = Just f }
+  , make_ord_flag defGhciFlag "fghci-browser-playwright-browser-type"
+      $ hasArg $ \f d -> d { ghciBrowserPlaywrightBrowserType = Just f }
+  , make_ord_flag defGhciFlag "fghci-browser-playwright-launch-opts"
+      $ hasArg $ \f d -> d { ghciBrowserPlaywrightLaunchOpts = Just f }
+
   , make_ord_flag defGhcFlag "fmax-inline-alloc-size"
       (intSuffix (\n d -> d { maxInlineAllocSize = n }))
   , make_ord_flag defGhcFlag "fmax-inline-memcpy-insns"
@@ -2053,6 +2085,7 @@ package_flags_deps = [
       (NoArg (setGeneralFlag Opt_DistrustAllPackages))
   , make_ord_flag defFlag "trust"                 (HasArg trustPackage)
   , make_ord_flag defFlag "distrust"              (HasArg distrustPackage)
+  , make_ord_flag defFlag "base-unit-id"          (HasArg setBaseUnitId)
   ]
   where
     setPackageEnv env = upd $ \s -> s { packageEnv = Just env }
@@ -2233,7 +2266,9 @@ wWarningFlagsDeps = [minBound..maxBound] >>= \x -> case x of
   Opt_WarnAmbiguousFields -> warnSpec x
   Opt_WarnAutoOrphans -> depWarnSpec x "it has no effect"
   Opt_WarnCPPUndef -> warnSpec x
-  Opt_WarnBadlyStagedTypes -> warnSpec x
+  Opt_WarnBadlyLevelledTypes ->
+    warnSpec x ++
+    subWarnSpec "badly-staged-types" x "it is renamed to -Wbadly-levelled-types"
   Opt_WarnUnbangedStrictPatterns -> warnSpec x
   Opt_WarnDeferredTypeErrors -> warnSpec x
   Opt_WarnDeferredOutOfScopeVariables -> warnSpec x
@@ -2347,10 +2382,15 @@ wWarningFlagsDeps = [minBound..maxBound] >>= \x -> case x of
   Opt_WarnImplicitRhsQuantification -> warnSpec x
   Opt_WarnIncompleteExportWarnings -> warnSpec x
   Opt_WarnIncompleteRecordSelectors -> warnSpec x
-  Opt_WarnDataKindsTC -> warnSpec x
-  Opt_WarnDeprecatedTypeAbstractions -> warnSpec x
+  Opt_WarnDataKindsTC
+    -> depWarnSpec x "DataKinds violations are now always an error"
   Opt_WarnDefaultedExceptionContext -> warnSpec x
   Opt_WarnViewPatternSignatures -> warnSpec x
+  Opt_WarnUselessSpecialisations -> warnSpec x
+  Opt_WarnDeprecatedPragmas -> warnSpec x
+  Opt_WarnRuleLhsEqualities -> warnSpec x
+  Opt_WarnUnusableUnpackPragmas -> warnSpec x
+  Opt_WarnPatternNamespaceSpecifier -> warnSpec x
 
 warningGroupsDeps :: [(Deprecation, FlagSpec WarningGroup)]
 warningGroupsDeps = map mk warningGroups
@@ -2455,10 +2495,19 @@ fFlagsDeps = [
   flagSpec "gen-manifest"                     Opt_GenManifest,
   flagSpec "ghci-history"                     Opt_GhciHistory,
   flagSpec "ghci-leak-check"                  Opt_GhciLeakCheck,
+  flagSpec "inter-module-far-jumps"               Opt_InterModuleFarJumps,
   flagSpec "validate-ide-info"                Opt_ValidateHie,
   flagGhciSpec "local-ghci-history"           Opt_LocalGhciHistory,
   flagGhciSpec "no-it"                        Opt_NoIt,
   flagSpec "ghci-sandbox"                     Opt_GhciSandbox,
+
+  -- wasm ghci browser mode
+  flagGhciSpec "ghci-browser"                 Opt_GhciBrowser,
+  flagGhciSpec "ghci-browser-redirect-wasi-console" Opt_GhciBrowserRedirectWasiConsole,
+
+  -- load all targets on GHCi startup
+  flagGhciSpec "load-initial-targets"         Opt_GhciDoLoadTargets,
+
   flagSpec "helpful-errors"                   Opt_HelpfulErrors,
   flagSpec "hpc"                              Opt_Hpc,
   flagSpec "ignore-asserts"                   Opt_IgnoreAsserts,
@@ -2521,6 +2570,8 @@ fFlagsDeps = [
   flagSpec "use-rpaths"                       Opt_RPath,
   flagSpec "write-interface"                  Opt_WriteInterface,
   flagSpec "write-if-simplified-core"         Opt_WriteIfSimplifiedCore,
+  flagSpec "write-if-self-recomp"             Opt_WriteSelfRecompInfo,
+  flagSpec "write-if-self-recomp-flags"       Opt_WriteSelfRecompFlags,
   flagSpec "write-ide-info"                   Opt_WriteHie,
   flagSpec "unbox-small-strict-fields"        Opt_UnboxSmallStrictFields,
   flagSpec "unbox-strict-fields"              Opt_UnboxStrictFields,
@@ -2532,9 +2583,12 @@ fFlagsDeps = [
   flagSpec "catch-nonexhaustive-cases"        Opt_CatchNonexhaustiveCases,
   flagSpec "alignment-sanitisation"           Opt_AlignmentSanitisation,
   flagSpec "check-prim-bounds"                Opt_DoBoundsChecking,
+  flagSpec "add-bco-name"                     Opt_AddBcoName,
   flagSpec "num-constant-folding"             Opt_NumConstantFolding,
   flagSpec "core-constant-folding"            Opt_CoreConstantFolding,
   flagSpec "fast-pap-calls"                   Opt_FastPAPCalls,
+  flagSpec "spec-eval"                        Opt_SpecEval,
+  flagSpec "spec-eval-dictfun"                Opt_SpecEvalDictFun,
   flagSpec "cmm-control-flow"                 Opt_CmmControlFlow,
   flagSpec "show-warning-groups"              Opt_ShowWarnGroups,
   flagSpec "hide-source-paths"                Opt_HideSourcePaths,
@@ -2925,12 +2979,17 @@ unSetExtensionFlag f = upd (unSetExtensionFlag' f)
 setExtensionFlag', unSetExtensionFlag' :: LangExt.Extension -> DynFlags -> DynFlags
 setExtensionFlag' f dflags = foldr ($) (xopt_set dflags f) deps
   where
-    deps = [ if turn_on then setExtensionFlag'   d
-                        else unSetExtensionFlag' d
-           | (f', turn_on, d) <- impliedXFlags, f' == f ]
+    deps :: [DynFlags -> DynFlags]
+    deps = [ setExtension d
+           | (f', d) <- impliedXFlags, f' == f ]
         -- When you set f, set the ones it implies
         -- NB: use setExtensionFlag recursively, in case the implied flags
         --     implies further flags
+
+    setExtension :: OnOff LangExt.Extension -> DynFlags -> DynFlags
+    setExtension = \ case
+      On extension -> setExtensionFlag' extension
+      Off extension -> unSetExtensionFlag' extension
 
 unSetExtensionFlag' f dflags = xopt_unset dflags f
    -- When you un-set f, however, we don't un-set the things it implies
@@ -3061,6 +3120,9 @@ parseUnitArg =
 setUnitId :: String -> DynFlags -> DynFlags
 setUnitId p d = d { homeUnitId_ = stringToUnitId p }
 
+setHomeUnitId :: UnitId -> DynFlags -> DynFlags
+setHomeUnitId p d = d { homeUnitId_ = p }
+
 setWorkingDirectory :: String -> DynFlags -> DynFlags
 setWorkingDirectory p d = d { workingDirectory =  Just p }
 
@@ -3153,7 +3215,7 @@ setMainIs arg = parse parse_main_f arg
 
     -- dummy parser state.
     p_state str = initParserState
-              (mkParserOpts mempty emptyDiagOpts [] False False False True)
+              (mkParserOpts mempty emptyDiagOpts False False False True)
               (stringToStringBuffer str)
               (mkRealSrcLoc (mkFastString []) 1 1)
 
@@ -3401,11 +3463,15 @@ compilerInfo dflags
        ("Project Patch Level1",        cProjectPatchLevel1),
        ("Project Patch Level2",        cProjectPatchLevel2),
        ("Project Unit Id",             cProjectUnitId),
+       ("ghc-internal Unit Id",        cGhcInternalUnitId), -- See Note [Special unit-ids]
        ("Booter version",              cBooterVersion),
        ("Stage",                       cStage),
        ("Build platform",              cBuildPlatformString),
        ("Host platform",               cHostPlatformString),
        ("Target platform",             platformMisc_targetPlatformString $ platformMisc dflags),
+       ("target os string",            stringEncodeOS (platformOS (targetPlatform dflags))),
+       ("target arch string",          stringEncodeArch (platformArch (targetPlatform dflags))),
+       ("target word size in bits",    show (platformWordSizeInBits (targetPlatform dflags))),
        ("Have interpreter",            showBool $ platformMisc_ghcWithInterpreter $ platformMisc dflags),
        ("Object splitting supported",  showBool False),
        ("Have native code generator",  showBool $ platformNcgSupported platform),
@@ -3451,6 +3517,26 @@ compilerInfo dflags
     expandDirectories :: FilePath -> Maybe FilePath -> String -> String
     expandDirectories topd mtoold = expandToolDir useInplaceMinGW mtoold . expandTopDir topd
 
+-- Note [Special unit-ids]
+-- ~~~~~~~~~~~~~~~~~~~~~~~
+-- Certain units are special to the compiler:
+-- - Wired-in identifiers reference a specific unit-id of `ghc-internal`.
+-- - GHC plugins must be linked against a specific unit-id of `ghc`,
+--   namely the same one as the compiler.
+-- - When using Template Haskell, the result of executing splices refer to
+--   the Template Haskell ASTs created using constructors from `ghc-internal`,
+--   and must be linked against the same `ghc-internal` unit-id as the compiler.
+--
+-- We therefore expose the unit-id of `ghc-internal` ("ghc-internal Unit Id") and
+-- ghc ("Project Unit Id") through `ghc --info`.
+--
+-- This allows build tools to act accordingly, eg, if a user wishes to build a
+-- GHC plugin, `cabal-install` might force them to use the exact `ghc` unit
+-- that the compiler was linked against.
+-- See:
+--  - https://github.com/haskell/cabal/issues/10087
+--  - https://github.com/commercialhaskell/stack/issues/6749
+
 {- -----------------------------------------------------------------------------
 Note [DynFlags consistency]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3475,12 +3561,35 @@ combination when parsing flags, we also need to check when we update
 the flags; this is because API clients may parse flags but update the
 DynFlags afterwords, before finally running code inside a session (see
 T10052 and #10052).
+
+Host ways vs Build ways mismatch
+--------------------------------
+Many consistency checks aim to fix the situation where the wanted build ways
+are not compatible with the ways the compiler is built in. This happens when
+using the interpreter, TH, and the runtime linker, where the compiler cannot
+load objects compiled for ways not matching its own.
+
+For instance, a profiled-dynamic object can only be loaded by a
+profiled-dynamic compiler (and not any other kind of compiler).
+
+This incompatibility is traditionally solved in either of two ways:
+
+(1) Force the "wanted" build ways to match the compiler ways exactly,
+    guaranteeing they match.
+
+(2) Force the use of the external interpreter. When interpreting is offloaded
+    to the external interpreter it no longer matters what are the host compiler ways.
+
+In the checks and fixes performed by `makeDynFlagsConsistent`, the choice
+between the two does not seem uniform. TODO: Make this choice more evident and uniform.
 -}
 
 -- | Resolve any internal inconsistencies in a set of 'DynFlags'.
 -- Returns the consistent 'DynFlags' as well as a list of warnings
--- to report to the user.
-makeDynFlagsConsistent :: DynFlags -> (DynFlags, [Warn])
+-- to report to the user, and a list of verbose info msgs.
+--
+-- See Note [DynFlags consistency]
+makeDynFlagsConsistent :: DynFlags -> (DynFlags, [Warn], [Located SDoc])
 -- Whenever makeDynFlagsConsistent does anything, it starts over, to
 -- ensure that a later change doesn't invalidate an earlier check.
 -- Be careful not to introduce potential loops!
@@ -3571,13 +3680,49 @@ makeDynFlagsConsistent dflags
 
  | LinkMergedObj <- ghcLink dflags
  , Nothing <- outputFile dflags
- = pgmError "--output must be specified when using --merge-objs"
+    = pgmError "--output must be specified when using --merge-objs"
 
- | otherwise = (dflags, mempty)
+ | platformTablesNextToCode platform
+   && os == OSMinGW32
+   && arch == ArchAArch64
+    = case backendCodeOutput (backend dflags) of
+        LlvmCodeOutput -> pgmError "-fllvm is incompatible with enabled TablesNextToCode at Windows Aarch64"
+        NcgCodeOutput -> pgmError "-fasm is incompatible with enabled TablesNextToCode at Windows Aarch64"
+        _ -> (dflags, mempty, mempty)
+
+  -- When we do ghci, force using dyn ways if the target RTS linker
+  -- only supports dynamic code
+ | LinkInMemory <- ghcLink dflags
+ , sTargetRTSLinkerOnlySupportsSharedLibs $ settings dflags
+ , not (ways dflags `hasWay` WayDyn && gopt Opt_ExternalInterpreter dflags)
+    = flip loopNoWarn "Forcing dynamic way because target RTS linker only supports dynamic code" $
+        -- See checkOptions, -fexternal-interpreter is
+        -- required when using --interactive with a non-standard
+        -- way (-prof, -static, or -dynamic).
+        setGeneralFlag' Opt_ExternalInterpreter $
+        addWay' WayDyn dflags
+
+ | LinkInMemory <- ghcLink dflags
+ , not (gopt Opt_ExternalInterpreter dflags)
+ , targetWays_ dflags /= hostFullWays
+    = flip loopNoWarn "Forcing build ways to match the compiler ways because we're using the internal interpreter" $
+        let dflags_a = dflags { targetWays_ = hostFullWays }
+            dflags_b = foldl gopt_set dflags_a
+                     $ concatMap (wayGeneralFlags platform)
+                                 hostFullWays
+            dflags_c = foldl gopt_unset dflags_b
+                     $ concatMap (wayUnsetGeneralFlags platform)
+                                 hostFullWays
+        in dflags_c
+
+ | otherwise = (dflags, mempty, mempty)
     where loc = mkGeneralSrcSpan (fsLit "when making flags consistent")
           loop updated_dflags warning
               = case makeDynFlagsConsistent updated_dflags of
-                (dflags', ws) -> (dflags', L loc (DriverInconsistentDynFlags warning) : ws)
+                (dflags', ws, is) -> (dflags', L loc (DriverInconsistentDynFlags warning) : ws, is)
+          loopNoWarn updated_dflags doc
+              = case makeDynFlagsConsistent updated_dflags of
+                (dflags', ws, is) -> (dflags', ws, L loc (text doc):is)
           platform = targetPlatform dflags
           arch = platformArch platform
           os   = platformOS   platform

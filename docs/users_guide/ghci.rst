@@ -251,8 +251,8 @@ We can compile ``D``, then load the whole program, like this:
 
 .. code-block:: none
 
-    ghci> :! ghc -c -dynamic D.hs
-    ghci> :load A
+    ghci> :! ghc -c -this-unit-id interactive-session -dynamic D.hs
+    ghci> :load A B C D
     Compiling B                ( B.hs, interpreted )
     Compiling C                ( C.hs, interpreted )
     Compiling A                ( A.hs, interpreted )
@@ -267,6 +267,10 @@ compilation.
 Note the :ghc-flag:`-dynamic` flag to GHC: GHCi uses dynamically-linked object
 code (if you are on a platform that supports it), and so in order to use
 compiled code with GHCi it must be compiled for dynamic linking.
+
+Also, note the :ghc-flag:`-this-unit-id ⟨unit-id⟩` `interactive-session` to GHC: GHCi
+can only use the object code of a module loaded via :ghci-cmd:`:load`,
+if the object code has been compiled for the `interactive-session`.
 
 At any time you can use the command :ghci-cmd:`:show modules` to get a list of
 the modules currently loaded into GHCi:
@@ -301,8 +305,8 @@ So let's try compiling one of the other modules:
 
 .. code-block:: none
 
-    *ghci> :! ghc -c C.hs
-    *ghci> :load A
+    *ghci> :! ghc -c -this-unit-id interactive-session -dynamic C.hs
+    *ghci> :load A B C D
     Compiling D                ( D.hs, interpreted )
     Compiling B                ( B.hs, interpreted )
     Compiling C                ( C.hs, interpreted )
@@ -316,7 +320,7 @@ rejected ``C``\'s object file. Ok, so let's also compile ``D``:
 
 .. code-block:: none
 
-    *ghci> :! ghc -c D.hs
+    *ghci> :! ghc -c -this-unit-id interactive-session -dynamic D.hs
     *ghci> :reload
     Ok, modules loaded: A, B, C, D.
 
@@ -325,7 +329,7 @@ picked up by :ghci-cmd:`:reload`, only :ghci-cmd:`:load`:
 
 .. code-block:: none
 
-    *ghci> :load A
+    *ghci> :load A B C D
     Compiling B                ( B.hs, interpreted )
     Compiling A                ( A.hs, interpreted )
     Ok, modules loaded: A, B, C (C.o), D (D.o).
@@ -1064,39 +1068,22 @@ For example:
       ghci> reverse ([] :: [Int])
       []
 
-However, it is tiresome for the user to have to specify the type, so
-GHCi extends Haskell's type-defaulting rules (Section 4.3.4 of the
-Haskell 2010 Report) as follows. The standard rules take each group of
-constraints ``(C1 a, C2 a, ..., Cn a)`` for each type variable ``a``,
-and defaults the type variable if
+However, it is tiresome for the user to have to specify the type, so at the GHCi
+prompt, or with GHC if the :extension:`ExtendedDefaultRules` flag is given,
+the usual defaulting rules are relaxed (see :ref:`extended-class-defaulting`
+for more details on the precise algorithm used):
 
-1. The type variable ``a`` appears in no other constraints
+-  Instead of only considering numeric classes (e.g. ``Num``, ``RealFloat`` etc),
+   any **interactive class** (defined below) is allowed.
 
-2. All the classes ``Ci`` are standard.
-
-3. At least one of the classes ``Ci`` is numeric.
-
-At the GHCi prompt, or with GHC if the :extension:`ExtendedDefaultRules` flag
-is given, the types are instead resolved with the following method:
-
-Find all the unsolved constraints. Then:
-
--  Find those that are of form ``(C a)`` where ``a`` is a type variable, and
-   partition those constraints into groups that share a common type variable ``a``.
-
--  Keep only the groups in which at least one of the classes is an
-   **interactive class** (defined below).
-
--  Now, for each remaining group G, try each type ``ty`` from the default-type list
-   in turn; if setting ``a = ty`` would allow the constraints in G to be completely
-   solved. If so, default ``a`` to ``ty``.
+-  Only consider constraints of the form ``C v``, for an interactive class ``C``,
+   when deciding what to default.
+   In particular, drop the requirement that the type variable must not appear
+   in non-unary or non-standard constraints; instead, such constraints will
+   simply not be considered when assigning a default type.
 
 -  The unit type ``()`` and the list type ``[]`` are added to the start of
    the standard list of types which are tried when doing type defaulting.
-
-Note that any multi-parameter constraints ``(D a b)`` or ``(D [a] Int)`` do not
-participate in the process (either to help or to hinder); but they must of course
-be soluble once the defaulting process is complete.
 
 The last point means that, for example, this program: ::
 
@@ -2100,6 +2087,19 @@ mostly obvious.
     that any previously loaded modules have been correctly garbage
     collected. Emits messages if a leak is detected.
 
+.. ghc-flag:: -fload-initial-targets
+    :shortdesc: Load targets on GHCi startup.
+    :type: dynamic
+    :reverse: -fno-load-initial-targets
+    :category:
+
+    :default: on
+    :since: 9.14.1
+
+    Compile all targets on GHCi startup.
+    By disabling this flag you can speed up the initial start time of GHCi.
+    When targets are needed, they can be loaded by using the :ghci-cmd:`:reload`.
+
 Packages
 ~~~~~~~~
 
@@ -2444,8 +2444,6 @@ commonly used commands.
 
 .. ghci-cmd:: :doc; ⟨name⟩
 
-    (Experimental: This command will likely change significantly in GHC 8.8.)
-
     Displays the documentation for the given name. Currently the command is
     restricted to displaying the documentation directly on the declaration
     in question, ignoring documentation for arguments, constructors etc.
@@ -2515,6 +2513,22 @@ commonly used commands.
     printed; if ⟨name⟩ is a function, then its type will be printed. If
     ⟨name⟩ has been loaded from a source file, then GHCi will also
     display the location of its definition in the source.
+
+    GHCi outputs type declarations (type synonyms, newtypes and datatypes,
+    classes, type and data families) with semantically significant invisible
+    @-binders.
+
+    An invisible binder is considered significant when it meets at least
+    one of the following two criteria:
+
+    - It visibly occurs in the declaration's body
+
+    - It is followed by a significant binder, so it affects positioning
+
+    For non-generative type declarations (type synonyms and type families)
+    there is one additional criterion:
+
+    - It is not followed by a visible binder, so it affects the arity of a type declaration
 
     For types and classes, GHCi also summarises instances that mention
     them. To avoid showing irrelevant information, an instance is shown
@@ -2758,7 +2772,7 @@ commonly used commands.
 
     Quits GHCi. You can also quit by typing :kbd:`Control-D` at the prompt.
 
-.. ghci-cmd:: :reload;[!]
+.. ghci-cmd:: :reload;[!] [none | ⟨mod1⟩ ...]
 
     Attempts to reload the current target set (see :ghci-cmd:`:load`) if any of
     the modules in the set, or any dependent module, has changed. Note
@@ -2771,6 +2785,11 @@ commonly used commands.
     Effectively, the :ghc-flag:`-fdefer-type-errors` flag is set before loading
     and unset after loading if the flag has not already been set before.
     See :ref:`defer-type-errors` for further motivation and details.
+
+    If given a module name target, GHCi will load all modules in the module graph
+    up to the given module name ``⟨mod1⟩``. If multiple name targets are given, all module
+    targets will be loaded.
+    To unload all currently loaded targets, the target ``none`` unloads all targets.
 
 .. ghci-cmd:: :run
 
@@ -2982,6 +3001,37 @@ commonly used commands.
     :ghci-cmd:`:steplocal` is not possible if this last breakpoint was
     hit by an error (:ghc-flag:`-fbreak-on-error`) or an
     exception (:ghc-flag:`-fbreak-on-exception`).
+
+.. ghci-cmd:: :stepout
+
+    :since: 9.14.1
+
+    Stop at the first breakpoint immediately after returning from the current
+    function scope.
+
+    Known limitations: because a function tail-call does not push a stack
+    frame, if step-out is used inside of a function that was tail-called,
+    execution will not be returned to its caller, but rather its caller's
+    first non-tail caller. On the other hand, it means the debugger
+    follows the more realistic execution of the program.
+    In the following example:
+
+    .. code-block:: none
+
+    f = do
+       a
+       b <--- (1) set breakpoint then step in here
+       c
+    b = do
+       ...
+       d <--- (2) step-into this tail call
+    d = do
+       ...
+       something <--- (3) step-out here
+       ...
+
+    Stepping-out will stop execution at the `c` invokation in `f`, rather than
+    stopping at `b`.
 
 .. ghci-cmd:: :stepmodule
 

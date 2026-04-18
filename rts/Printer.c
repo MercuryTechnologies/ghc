@@ -151,13 +151,20 @@ printClosure( const StgClosure *obj )
     case FUN_1_0: case FUN_0_1:
     case FUN_1_1: case FUN_0_2: case FUN_2_0:
     case FUN_STATIC:
-        debugBelch("FUN/%d(",(int)itbl_to_fun_itbl(info)->f.arity);
-        printPtr((StgPtr)obj->header.info);
+        {
+            debugBelch("FUN/%d(",(int)itbl_to_fun_itbl(info)->f.arity);
+            printPtr((StgPtr)obj->header.info);
+
+            InfoProvEnt ipe;
+            if (lookupIPE(obj->header.info, &ipe)) {
+                debugBelch(", %s", ipe.prov.table_name);
+            }
 #if defined(PROFILING)
-        debugBelch(", %s", obj->header.prof.ccs->cc->label);
+            debugBelch(", %s", obj->header.prof.ccs->cc->label);
 #endif
-        printStdObjPayload(obj);
-        break;
+            printStdObjPayload(obj);
+            break;
+        }
 
     case PRIM:
         debugBelch("PRIM(");
@@ -175,13 +182,19 @@ printClosure( const StgClosure *obj )
     case THUNK_1_0: case THUNK_0_1:
     case THUNK_1_1: case THUNK_0_2: case THUNK_2_0:
     case THUNK_STATIC:
+        {
             /* ToDo: will this work for THUNK_STATIC too? */
 #if defined(PROFILING)
             printThunkObject((StgThunk *)obj,GET_PROF_DESC(info));
 #else
             printThunkObject((StgThunk *)obj,"THUNK");
+            InfoProvEnt ipe;
+            if (lookupIPE(obj->header.info, &ipe)) {
+                debugBelch(", %s", ipe.prov.table_name);
+            }
 #endif
             break;
+        }
 
     case THUNK_SELECTOR:
         printStdObjHdr(obj, "THUNK_SELECTOR");
@@ -256,6 +269,17 @@ printClosure( const StgClosure *obj )
     case RET_BIG:
     case RET_FUN:
     */
+
+    case ANN_FRAME:
+        {
+            StgAnnFrame* frame = (StgAnnFrame*)obj;
+            debugBelch("ANN_FRAME(");
+            printPtr((StgPtr)GET_INFO((StgClosure *)frame));
+            debugBelch(",");
+            printPtr((StgPtr)frame->ann);
+            debugBelch(")\n");
+            break;
+        }
 
     case UPDATE_FRAME:
         {
@@ -1110,6 +1134,7 @@ const char *closure_type_names[] = {
  [RET_FUN]               = "RET_FUN",
  [UPDATE_FRAME]          = "UPDATE_FRAME",
  [CATCH_FRAME]           = "CATCH_FRAME",
+ [ANN_FRAME]             = "ANN_FRAME",
  [UNDERFLOW_FRAME]       = "UNDERFLOW_FRAME",
  [STOP_FRAME]            = "STOP_FRAME",
  [BLOCKING_QUEUE]        = "BLOCKING_QUEUE",
@@ -1142,7 +1167,7 @@ const char *closure_type_names[] = {
  [CONTINUATION]          = "CONTINUATION",
 };
 
-#if N_CLOSURE_TYPES != 65
+#if N_CLOSURE_TYPES != 66
 #error Closure types changed: update Printer.c!
 #endif
 

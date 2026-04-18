@@ -75,7 +75,9 @@ templateHaskellNames = [
     funDName, valDName, dataDName, newtypeDName, typeDataDName, tySynDName,
     classDName, instanceWithOverlapDName,
     standaloneDerivWithStrategyDName, sigDName, kiSigDName, forImpDName,
-    pragInlDName, pragOpaqueDName, pragSpecDName, pragSpecInlDName, pragSpecInstDName,
+    pragInlDName, pragOpaqueDName,
+    pragSpecDName, pragSpecInlDName, pragSpecEDName, pragSpecInlEDName,
+    pragSpecInstDName,
     pragRuleDName, pragCompleteDName, pragAnnDName, pragSCCFunDName, pragSCCFunNamedDName,
     defaultSigDName, defaultDName,
     dataFamilyDName, openTypeFamilyDName, closedTypeFamilyDName,
@@ -177,7 +179,7 @@ templateHaskellNames = [
     modNameTyConName,
 
     -- Quasiquoting
-    quoteDecName, quoteTypeName, quoteExpName, quotePatName]
+    quasiQuoterTyConName, quoteDecName, quoteTypeName, quoteExpName, quotePatName]
 
 thSyn, thLib, qqLib, liftLib :: Module
 thSyn = mkTHModule (fsLit "GHC.Internal.TH.Syntax")
@@ -214,7 +216,7 @@ qTyConName, nameTyConName, fieldExpTyConName, patTyConName,
     fieldPatTyConName, expTyConName, decTyConName, typeTyConName,
     matchTyConName, clauseTyConName, funDepTyConName, predTyConName,
     codeTyConName, injAnnTyConName, overlapTyConName, decsTyConName,
-    modNameTyConName :: Name
+    modNameTyConName, quasiQuoterTyConName :: Name
 qTyConName             = thTc (fsLit "Q")              qTyConKey
 nameTyConName          = thTc (fsLit "Name")           nameTyConKey
 fieldExpTyConName      = thTc (fsLit "FieldExp")       fieldExpTyConKey
@@ -232,6 +234,7 @@ codeTyConName          = thTc (fsLit "Code")           codeTyConKey
 injAnnTyConName        = thTc (fsLit "InjectivityAnn") injAnnTyConKey
 overlapTyConName       = thTc (fsLit "Overlap")        overlapTyConKey
 modNameTyConName       = thTc (fsLit "ModName")        modNameTyConKey
+quasiQuoterTyConName   = mk_known_key_name tcName qqLib (fsLit "QuasiQuoter") quasiQuoterTyConKey
 
 returnQName, bindQName, sequenceQName, newNameName, liftName,
     mkNameName, mkNameG_vName, mkNameG_fldName, mkNameG_dName, mkNameG_tcName,
@@ -386,7 +389,8 @@ recSName    = libFun (fsLit "recS")    recSIdKey
 -- data Dec = ...
 funDName, valDName, dataDName, newtypeDName, typeDataDName, tySynDName, classDName,
     instanceWithOverlapDName, sigDName, kiSigDName, forImpDName, pragInlDName,
-    pragSpecDName, pragSpecInlDName, pragSpecInstDName, pragRuleDName,
+    pragSpecDName, pragSpecInlDName, pragSpecEDName, pragSpecInlEDName,
+    pragSpecInstDName, pragRuleDName,
     pragAnnDName, pragSCCFunDName, pragSCCFunNamedDName,
     standaloneDerivWithStrategyDName, defaultSigDName, defaultDName,
     dataInstDName, newtypeInstDName, tySynInstDName, dataFamilyDName,
@@ -411,6 +415,8 @@ pragInlDName                     = libFun (fsLit "pragInlD")                    
 pragOpaqueDName                  = libFun (fsLit "pragOpaqueD")                  pragOpaqueDIdKey
 pragSpecDName                    = libFun (fsLit "pragSpecD")                    pragSpecDIdKey
 pragSpecInlDName                 = libFun (fsLit "pragSpecInlD")                 pragSpecInlDIdKey
+pragSpecEDName                   = libFun (fsLit "pragSpecED")                   pragSpecEDIdKey
+pragSpecInlEDName                = libFun (fsLit "pragSpecInlED")                pragSpecInlEDIdKey
 pragSpecInstDName                = libFun (fsLit "pragSpecInstD")                pragSpecInstDIdKey
 pragRuleDName                    = libFun (fsLit "pragRuleD")                    pragRuleDIdKey
 pragCompleteDName                = libFun (fsLit "pragCompleteD")                pragCompleteDIdKey
@@ -712,7 +718,7 @@ expTyConKey, matchTyConKey, clauseTyConKey, qTyConKey, expQTyConKey,
     predQTyConKey, decsQTyConKey, ruleBndrTyConKey, tySynEqnTyConKey,
     roleTyConKey, codeTyConKey, injAnnTyConKey, kindTyConKey,
     overlapTyConKey, derivClauseTyConKey, derivStrategyTyConKey, decsTyConKey,
-    modNameTyConKey  :: Unique
+    modNameTyConKey, quasiQuoterTyConKey :: Unique
 expTyConKey             = mkPreludeTyConUnique 200
 matchTyConKey           = mkPreludeTyConUnique 201
 clauseTyConKey          = mkPreludeTyConUnique 202
@@ -748,6 +754,7 @@ tyVarBndrSpecTyConKey   = mkPreludeTyConUnique 237
 codeTyConKey            = mkPreludeTyConUnique 238
 modNameTyConKey         = mkPreludeTyConUnique 239
 tyVarBndrVisTyConKey    = mkPreludeTyConUnique 240
+quasiQuoterTyConKey     = mkPreludeTyConUnique 241
 
 {- *********************************************************************
 *                                                                      *
@@ -962,7 +969,8 @@ funDIdKey, valDIdKey, dataDIdKey, newtypeDIdKey, tySynDIdKey, classDIdKey,
     infixLWithSpecDIdKey, infixRWithSpecDIdKey, infixNWithSpecDIdKey,
     roleAnnotDIdKey, patSynDIdKey, patSynSigDIdKey, pragCompleteDIdKey,
     implicitParamBindDIdKey, kiSigDIdKey, defaultDIdKey, pragOpaqueDIdKey,
-    typeDataDIdKey, pragSCCFunDKey, pragSCCFunNamedDKey :: Unique
+    typeDataDIdKey, pragSCCFunDKey, pragSCCFunNamedDKey,
+    pragSpecEDIdKey, pragSpecInlEDIdKey :: Unique
 funDIdKey                         = mkPreludeMiscIdUnique 320
 valDIdKey                         = mkPreludeMiscIdUnique 321
 dataDIdKey                        = mkPreludeMiscIdUnique 322
@@ -1001,6 +1009,8 @@ pragOpaqueDIdKey                  = mkPreludeMiscIdUnique 354
 typeDataDIdKey                    = mkPreludeMiscIdUnique 355
 pragSCCFunDKey                    = mkPreludeMiscIdUnique 356
 pragSCCFunNamedDKey               = mkPreludeMiscIdUnique 357
+pragSpecEDIdKey                   = mkPreludeMiscIdUnique 358
+pragSpecInlEDIdKey                = mkPreludeMiscIdUnique 359
 
 -- type Cxt = ...
 cxtIdKey :: Unique

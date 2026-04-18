@@ -150,10 +150,6 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
             --   (and should) do without this for all libraries except
             --   the RTS; all we need to do is to pass the correct
             --   HSfoo_dyn.dylib files to the link command.
-            --   This feature requires Mac OS X 10.3 or later; there is
-            --   a similar feature, -flat_namespace -undefined suppress,
-            --   which works on earlier versions, but it has other
-            --   disadvantages.
             -- -single_module
             --   Build the dynamic library as a single "module", i.e. no
             --   dynamic binding nonsense when referring to symbols from
@@ -208,7 +204,7 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
                  -- libraries in the runInjectRpaths phase below.
                  --
                  -- See Note [Dynamic linking on macOS]
-                 ++ [ Option "-Wl,-dead_strip_dylibs", Option "-Wl,-headerpad,8000" ]
+                 ++ [ Option "-Wl,-dead_strip_dylibs", Option "-Wl,-headerpad,16000" ]
               )
             -- Make sure to honour -fno-use-rpaths if set on darwin as well; see #20004
             when (gopt Opt_RPath dflags) $

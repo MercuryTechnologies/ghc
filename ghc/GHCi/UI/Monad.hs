@@ -24,9 +24,7 @@ module GHCi.UI.Monad (
         runStmt, runDecls, runDecls', resume, recordBreak, revertCAFs,
         ActionStats(..), runAndPrintStats, runWithStats, printStats,
 
-        printForUserNeverQualify,
-        printForUserGlobalRdrEnv,
-        printForUser, printForUserPartWay, prettyLocations,
+        prettyLocations,
 
         compileGHCiExpr,
         initInterpBuffering,
@@ -42,7 +40,6 @@ import GHC.Driver.Monad hiding (liftIO)
 import GHC.Utils.Outputable
 import qualified GHC.Driver.Ppr as Ppr
 import GHC.Types.Name.Occurrence
-import GHC.Types.Name.Reader
 import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Driver.Env
@@ -51,20 +48,18 @@ import GHC.Types.SafeHaskell
 import GHC.Driver.Make (ModIfaceCache(..))
 import GHC.Unit
 import GHC.Types.Name.Reader as RdrName (mkOrig)
-import qualified GHC.Types.Name.Ppr as Ppr (mkNamePprCtx)
 import GHC.Builtin.Names (gHC_INTERNAL_GHCI_HELPERS)
 import GHC.Runtime.Interpreter
 import GHC.Runtime.Context
 import GHCi.RemoteTypes
-import GHCi.UI.Exception (printGhciException)
 import GHC.Hs (ImportDecl, GhcPs, GhciLStmt, LHsDecl)
 import GHC.Hs.Utils
 import GHC.Utils.Misc
 import GHC.Utils.Logger
+import GHC.Runtime.Debugger.Breakpoints
 
 import GHC.Utils.Exception hiding (uninterruptibleMask, mask, catch)
 import Numeric
-import Data.Array
 import Data.IORef
 import Data.Time
 import System.Environment
@@ -82,6 +77,8 @@ import qualified Data.IntMap.Strict as IntMap
 import qualified GHC.Data.EnumSet as EnumSet
 import qualified GHC.LanguageExtensions as LangExt
 
+import GHCi.UI.Print
+
 -----------------------------------------------------------------------------
 -- GHCi monad
 
@@ -94,7 +91,6 @@ data GHCiState = GHCiState
         prompt_cont    :: PromptFunction,
         editor         :: String,
         stop           :: String,
-        multiMode      :: Bool,
         localConfig    :: LocalConfigBehaviour,
         options        :: [GHCiOption],
         line_number    :: !Int,         -- ^ input line
@@ -104,6 +100,14 @@ data GHCiState = GHCiState
             -- ^ 'tickarrays' caches the 'TickArray' for loaded modules,
             -- so that we don't rebuild it each time the user sets
             -- a breakpoint.
+
+        internalBreaks :: BreakpointOccurrences,
+            -- ^ Keep a mapping from the source-level 'BreakpointId' to the
+            -- occurrences of that breakpoint across modules.
+            -- When we want to stop at a source 'BreakpointId', we essentially
+            -- trigger a breakpoint for all 'InternalBreakpointId's matching
+            -- the same source-id.
+
         ghci_commands  :: [Command],
             -- ^ available ghci commands
         ghci_macros    :: [Command],
@@ -155,13 +159,10 @@ data GHCiState = GHCiState
             -- "import Prelude hiding (map)"
 
         ghc_e :: Bool, -- ^ True if this is 'ghc -e' (or runghc)
-
-        short_help :: String,
-            -- ^ help text to display to a user
         long_help  :: String,
         lastErrorLocations :: IORef [(FastString, Int)],
 
-        mod_infos  :: !(Map ModuleName ModInfo),
+        mod_infos  :: !(Map Module ModInfo),
 
         flushStdHandles :: ForeignHValue,
             -- ^ @hFlush stdout; hFlush stderr@ in the interpreter
@@ -169,8 +170,6 @@ data GHCiState = GHCiState
             -- ^ @hSetBuffering NoBuffering@ for stdin/stdout/stderr
         ifaceCache :: ModIfaceCache
      }
-
-type TickArray = Array Int [(GHC.BreakIndex,RealSrcSpan)]
 
 -- | A GHCi command
 data Command
@@ -247,16 +246,15 @@ data LocalConfigBehaviour
 
 data BreakLocation
    = BreakLocation
-   { breakModule :: !GHC.Module
-   , breakLoc    :: !SrcSpan
-   , breakTick   :: {-# UNPACK #-} !Int
+   { breakLoc    :: !SrcSpan
+   , breakId     :: !GHC.BreakpointId
+     -- ^ The 'BreakpointId' uniquely identifies a source-level breakpoint
    , breakEnabled:: !Bool
    , onBreakCmd  :: String
    }
 
 instance Eq BreakLocation where
-  loc1 == loc2 = breakModule loc1 == breakModule loc2 &&
-                 breakTick loc1   == breakTick loc2
+  loc1 == loc2 = breakId loc1 == breakId loc2
 
 prettyLocations :: IntMap.IntMap BreakLocation -> SDoc
 prettyLocations  locs =
@@ -265,7 +263,7 @@ prettyLocations  locs =
       False -> vcat $ map (\(i, loc) -> brackets (int i) <+> ppr loc) $ IntMap.toAscList locs
 
 instance Outputable BreakLocation where
-   ppr loc = (ppr $ breakModule loc) <+> ppr (breakLoc loc) <+> pprEnaDisa <+>
+   ppr loc = (ppr $ GHC.bi_tick_mod $ breakId loc) <+> ppr (breakLoc loc) <+> pprEnaDisa <+>
                 if null (onBreakCmd loc)
                    then empty
                    else doubleQuotes (text (onBreakCmd loc))
@@ -367,36 +365,6 @@ unsetOption opt
  = do st <- getGHCiState
       setGHCiState (st{ options = filter (/= opt) (options st) })
 
-printForUserNeverQualify :: GhcMonad m => SDoc -> m ()
-printForUserNeverQualify doc = do
-  dflags <- GHC.getInteractiveDynFlags
-  liftIO $ Ppr.printForUser dflags stdout neverQualify AllTheWay doc
-
-printForUserGlobalRdrEnv :: (GhcMonad m, Outputable info)
-                         => Maybe (GlobalRdrEnvX info) -> SDoc -> m ()
-printForUserGlobalRdrEnv mb_rdr_env doc = do
-  dflags <- GHC.getInteractiveDynFlags
-  name_ppr_ctx <- mkNamePprCtxFromGlobalRdrEnv dflags mb_rdr_env
-  liftIO $ Ppr.printForUser dflags stdout name_ppr_ctx AllTheWay doc
-    where
-      mkNamePprCtxFromGlobalRdrEnv _ Nothing = GHC.getNamePprCtx
-      mkNamePprCtxFromGlobalRdrEnv dflags (Just rdr_env) =
-        withSession $ \ hsc_env ->
-        let unit_env = hsc_unit_env hsc_env
-            ptc = initPromotionTickContext dflags
-        in  return $ Ppr.mkNamePprCtx ptc unit_env rdr_env
-
-printForUser :: GhcMonad m => SDoc -> m ()
-printForUser doc = do
-  name_ppr_ctx <- GHC.getNamePprCtx
-  dflags <- GHC.getInteractiveDynFlags
-  liftIO $ Ppr.printForUser dflags stdout name_ppr_ctx AllTheWay doc
-
-printForUserPartWay :: GhcMonad m => SDoc -> m ()
-printForUserPartWay doc = do
-  name_ppr_ctx <- GHC.getNamePprCtx
-  dflags <- GHC.getInteractiveDynFlags
-  liftIO $ Ppr.printForUser dflags stdout name_ppr_ctx DefaultDepth doc
 
 -- | Run a single Haskell expression
 runStmt
@@ -437,14 +405,14 @@ runDecls' decls = do
                   return Nothing)
         (Just <$> GHC.runParsedDecls decls)
 
-resume :: GhciMonad m => (SrcSpan -> Bool) -> GHC.SingleStep -> Maybe Int -> m GHC.ExecResult
-resume canLogSpan step mbIgnoreCnt = do
+resume :: GhciMonad m => GHC.SingleStep -> Maybe Int -> m GHC.ExecResult
+resume step mbIgnoreCnt = do
   st <- getGHCiState
   reifyGHCi $ \x ->
     withProgName (progname st) $
     withArgs (args st) $
       reflectGHCi x $ do
-        GHC.resumeExec canLogSpan step mbIgnoreCnt
+        GHC.resumeExec step mbIgnoreCnt
 
 -- --------------------------------------------------------------------------
 -- timing & statistics

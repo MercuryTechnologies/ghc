@@ -19,6 +19,7 @@ def job_triple(job_name):
         'release-x86_64-windows-release': 'x86_64-unknown-mingw32',
         'release-x86_64-windows-int_native-release': 'x86_64-unknown-mingw32-int_native',
         'release-x86_64-linux-rocky8-release': 'x86_64-rocky8-linux',
+        'release-x86_64-linux-ubuntu24_04-release': 'x86_64-ubuntu24_04-linux',
         'release-x86_64-linux-ubuntu22_04-release': 'x86_64-ubuntu22_04-linux',
         'release-x86_64-linux-ubuntu20_04-release': 'x86_64-ubuntu20_04-linux',
         'release-x86_64-linux-ubuntu18_04-release': 'x86_64-ubuntu18_04-linux',
@@ -31,20 +32,19 @@ def job_triple(job_name):
         'release-x86_64-linux-deb10-release+debug_info': 'x86_64-deb10-linux-dwarf',
         'release-x86_64-linux-deb10-release': 'x86_64-deb10-linux',
         'release-x86_64-linux-deb9-release': 'x86_64-deb9-linux',
-        'release-x86_64-linux-centos7-release': 'x86_64-centos7-linux',
-        'release-x86_64-linux-alpine3_12-release+fully_static': 'x86_64-alpine3_12-linux-static',
-        'release-x86_64-linux-alpine3_12-release': 'x86_64-alpine3_12-linux',
+        'release-x86_64-linux-alpine3_12-release+fully_static+no_split_sections': 'x86_64-alpine3_12-linux-static',
+        'release-x86_64-linux-alpine3_22-release+no_split_sections': 'x86_64-alpine3_22-linux',
         'release-x86_64-linux-alpine3_12-int_native-release+fully_static': 'x86_64-alpine3_12-linux-static-int_native',
-        'release-x86_64-linux-alpine3_20-release': 'x86_64-alpine3_20-linux',
         'release-x86_64-darwin-release': 'x86_64-apple-darwin',
         'release-i386-linux-deb12-release': 'i386-deb12-linux',
         'release-i386-linux-deb10-release': 'i386-deb10-linux',
         'release-i386-linux-deb9-release': 'i386-deb9-linux',
+        'release-i386-linux-alpine3_22-release+no_split_sections': 'i386-alpine3_22-linux',
         'release-armv7-linux-deb10-release': 'armv7-deb10-linux',
         'release-aarch64-linux-deb10-release': 'aarch64-deb10-linux',
         'release-aarch64-linux-deb11-release': 'aarch64-deb11-linux',
         'release-aarch64-linux-deb12-release': 'aarch64-deb12-linux',
-        'release-aarch64-linux-alpine3_18-release+no_split_sections': 'aarch64-alpine3_18-linux',
+        'release-aarch64-linux-alpine3_22-release+no_split_sections': 'aarch64-alpine3_22-linux',
         'release-aarch64-darwin-release': 'aarch64-apple-darwin',
 
         'source-tarball': 'src',
@@ -132,8 +132,11 @@ def fetch_artifacts(release: str, pipeline_id: int,
                 for f in doc_files:
                     subprocess.run(['tar', '-xf', f, '-C', dest])
                     logging.info(f'extracted docs {f} to {dest}')
-                index_path = destdir / 'index.html'
+                index_path = destdir / 'docs' / 'index.html'
                 index_path.replace(dest / 'index.html')
+                pdfs = list(destdir.glob('*.pdf'))
+                for f in pdfs:
+                  f.replace(dest / f.name)
             elif job.name == 'hackage-doc-tarball':
                 dest = dest_dir / 'hackage_docs'
                 logging.info(f'moved hackage_docs to {dest}')

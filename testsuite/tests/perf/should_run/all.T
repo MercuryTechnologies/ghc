@@ -43,6 +43,7 @@ test('T3586',
      [collect_runtime_residency(2),
       collect_stats('bytes allocated', 5),
       only_ways(['normal']),
+      when(have_cpu_feature('pni') or have_cpu_feature('sse3'), extra_hc_opts('-optc-msse3')),
       ],
      compile_and_run,
      ['-O'])
@@ -415,3 +416,20 @@ test('T18964', [collect_stats('bytes allocated', 1), only_ways(['normal'])], com
 test('T23021', [collect_stats('bytes allocated', 1), only_ways(['normal'])], compile_and_run, ['-O2'])
 test('T25055', [collect_stats('bytes allocated', 2), only_ways(['normal'])], compile_and_run, ['-O2'])
 test('T17949', [collect_stats('bytes allocated', 1), only_ways(['normal'])], compile_and_run, ['-O2'])
+
+test('ByteCodeAsm',
+               [ extra_run_opts('"' + config.libdir + '"')
+               , js_broken(22261)
+               , collect_stats('bytes allocated', 10),
+               ],
+               compile_and_run,
+               ['-package ghc'])
+
+# Check that $s$wspecMe doesn't have any dictionary args after specialization in addition to perf stats
+# See also #19747
+test('SpecTyFamRun', [ grep_errmsg(r'foo')
+                    , extra_files(['SpecTyFam_Import.hs'])
+                    , only_ways(['optasm'])
+                    , collect_stats('bytes allocated', 5)],
+     multimod_compile_and_run,
+     ['SpecTyFamRun', '-O2'])

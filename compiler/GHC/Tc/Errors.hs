@@ -1,12 +1,11 @@
-
-{-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE MultiWayIf          #-}
-{-# LANGUAGE NamedFieldPuns      #-}
-{-# LANGUAGE ParallelListComp    #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE FlexibleContexts      #-}
+{-# LANGUAGE LambdaCase            #-}
+{-# LANGUAGE MultiWayIf            #-}
+{-# LANGUAGE NamedFieldPuns        #-}
+{-# LANGUAGE ParallelListComp      #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE TupleSections         #-}
 
 module GHC.Tc.Errors(
        reportUnsolved, reportAllUnsolved, warnAllUnsolved,
@@ -37,10 +36,9 @@ import GHC.Tc.Utils.TcType
 import GHC.Tc.Zonk.TcType
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.Evidence
-import GHC.Tc.Types.EvTerm
 import GHC.Tc.Instance.Family
 import GHC.Tc.Utils.Instantiate
-import {-# SOURCE #-} GHC.Tc.Errors.Hole ( findValidHoleFits, getHoleFitDispConfig, pprHoleFit )
+import {-# SOURCE #-} GHC.Tc.Errors.Hole ( findValidHoleFits, getHoleFitDispConfig )
 
 import GHC.Types.Name
 import GHC.Types.Name.Reader
@@ -61,7 +59,7 @@ import GHC.Core.Predicate
 import GHC.Core.Type
 import GHC.Core.Coercion
 import GHC.Core.TyCo.Ppr     ( pprTyVars )
-import GHC.Core.TyCo.Tidy    ( tidyAvoiding )
+import GHC.Core.TyCo.Tidy
 import GHC.Core.InstEnv
 import GHC.Core.TyCon
 import GHC.Core.DataCon
@@ -267,7 +265,9 @@ report_unsolved type_errors expr_holes
 important :: SolverReportErrCtxt -> TcSolverReportMsg -> SolverReport
 important ctxt doc
   = SolverReport { sr_important_msg = SolverReportWithCtxt ctxt doc
-                 , sr_supplementary = [] }
+                 , sr_supplementary = []
+                 , sr_hints         = noHints
+                 }
 
 add_relevant_bindings :: RelevantBindings -> SolverReport -> SolverReport
 add_relevant_bindings binds report@(SolverReport { sr_supplementary = supp })
@@ -398,13 +398,6 @@ warnRedundantConstraints ctxt env info redundant_evs
  | null redundant_evs
  = return ()
 
- -- Do not report redundant constraints for quantified constraints
- -- See (RC4) in Note [Tracking redundant constraints]
- -- Fortunately it is easy to spot implications constraints that arise
- -- from quantified constraints, from their SkolInfo
- | InstSkol (IsQC {}) _ <- info
- = return ()
-
  | SigSkol user_ctxt _ _ <- info
  -- When dealing with a user-written type signature,
  -- we want to add "In the type signature for f".
@@ -423,20 +416,16 @@ warnRedundantConstraints ctxt env info redundant_evs
                         -> TcRn ()
    report_redundant_msg show_info lcl_env
      = do { msg <-
-              mkErrorReport
-                lcl_env
+              mkErrorReport lcl_env
                 (TcRnRedundantConstraints redundant_evs (info, show_info))
-                (Just ctxt)
-                []
+                (Just ctxt) [] []
           ; reportDiagnostic msg }
 
 reportBadTelescope :: SolverReportErrCtxt -> CtLocEnv -> SkolemInfoAnon -> [TcTyVar] -> TcM ()
 reportBadTelescope ctxt env (ForAllSkol telescope) skols
-  = do { msg <- mkErrorReport
-                  env
+  = do { msg <- mkErrorReport env
                   (TcRnSolverReport report ErrorWithoutFlag)
-                  (Just ctxt)
-                  []
+                  (Just ctxt) [] []
        ; reportDiagnostic msg }
   where
     report = SolverReportWithCtxt ctxt $ BadTelescope telescope skols
@@ -450,10 +439,9 @@ reportBadTelescope _ _ skol_info skols
 -- See Note [Constraints to ignore].
 ignoreConstraint :: Ct -> Bool
 ignoreConstraint ct
-  | AssocFamPatOrigin <- ctOrigin ct
-  = True
-  | otherwise
-  = False
+  = case ctOrigin ct of
+      AssocFamPatOrigin         -> True  -- See (CIG1)
+      _                         -> False
 
 -- | Makes an error item from a constraint, calculating whether or not
 -- the item should be suppressed. See Note [Wanteds rewrite Wanteds]
@@ -469,13 +457,12 @@ mkErrorItem ct
   = do { let loc = ctLoc ct
              flav = ctFlavour ct
 
-       ; (suppress, m_evdest) <- case ctEvidence ct of
-         -- For this `suppress` stuff
-         -- see Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint
-           CtGiven {} -> return (False, Nothing)
-           CtWanted { ctev_rewriters = rewriters, ctev_dest = dest }
-             -> do { rewriters' <- zonkRewriterSet rewriters
-                   ; return (not (isEmptyRewriterSet rewriters'), Just dest) }
+             (suppress, m_evdest) = case ctEvidence ct of
+                   -- For this `suppress` stuff
+                   -- see Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint
+                     CtGiven {} -> (False, Nothing)
+                     CtWanted (WantedCt { ctev_rewriters = rws, ctev_dest = dest })
+                                -> (not (isEmptyRewriterSet rws), Just dest)
 
        ; let m_reason = case ct of
                 CIrredCan (IrredCt { ir_reason = reason }) -> Just reason
@@ -506,7 +493,7 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
                                          , text "tidy_errs =" <+> ppr tidy_errs ])
 
          -- Catch an awkward (and probably rare) case in which /all/ errors are
-         -- suppressed: see Wrinkle (WRW2) in Note [Prioritise Wanteds with empty
+         -- suppressed: see Wrinkle (PER2) in Note [Prioritise Wanteds with empty
          -- RewriterSet] in GHC.Tc.Types.Constraint.
          --
          -- Unless we are sure that an error will be reported some other way
@@ -550,15 +537,15 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
        ; when (null simples) $ reportMultiplicityCoercionErrs ctxt_for_insols mult_co_errs
 
           -- See Note [Suppressing confusing errors]
-       ; let (suppressed_items, items0) = partition suppress tidy_items
+       ; let (suppressed_items, reportable_items) = partition suppressItem tidy_items
        ; traceTc "reportWanteds suppressed:" (ppr suppressed_items)
-       ; (ctxt1, items1) <- tryReporters ctxt_for_insols report1 items0
+       ; (ctxt1, items1) <- tryReporters ctxt_for_insols report1 reportable_items
 
          -- Now all the other constraints.  We suppress errors here if
          -- any of the first batch failed, or if the enclosing context
          -- says to suppress
        ; let ctxt2 = ctxt1 { cec_suppress = cec_suppress ctxt || cec_suppress ctxt1 }
-       ; (ctxt3, leftovers) <- tryReporters ctxt2 report2 items1
+       ; (_, leftovers) <- tryReporters ctxt2 report2 items1
        ; massertPpr (null leftovers)
            (text "The following unsolved Wanted constraints \
                  \have not been reported to the user:"
@@ -569,12 +556,16 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
             -- wanted insoluble here; but do suppress inner insolubles
             -- if there's a *given* insoluble here (= inaccessible code)
 
-            -- Only now, if there are no errors, do we report suppressed ones
-            -- See Note [Suppressing confusing errors]
-            -- We don't need to update the context further because of the
-            -- whenNoErrs guard
-       ; whenNoErrs $
-         do { (_, more_leftovers) <- tryReporters ctxt3 report3 suppressed_items
+         -- If there are no other errors to report, report suppressed errors.
+         -- See Note [Suppressing confusing errors].  NB: with -fdefer-type-errors
+         -- we might have reported warnings only from `reportable_items`, but we
+         -- still want to suppress the `suppressed_items`.
+       ; when (null reportable_items) $
+         do { (_, more_leftovers) <- tryReporters ctxt_for_insols (report1++report2)
+                                                  suppressed_items
+                 -- ctxt_for_insols: the suppressed errors can be Int~Bool, which
+                 -- will have made the incoming `ctxt` be True; don't make that
+                 -- suppress the Int~Bool error!
             ; massertPpr (null more_leftovers) (ppr more_leftovers) } }
  where
     env       = cec_tidy ctxt
@@ -597,48 +588,59 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
           DE_Multiplicity mult_co loc
             -> (es1, es2, es3, (mult_co, loc):es4)
 
-      -- See Note [Suppressing confusing errors]
-    suppress :: ErrorItem -> Bool
-    suppress item
-      | Wanted <- ei_flavour item
-      = is_ww_fundep_item item
-      | otherwise
-      = False
-
     -- report1: ones that should *not* be suppressed by
     --          an insoluble somewhere else in the tree
     -- It's crucial that anything that is considered insoluble
     -- (see GHC.Tc.Utils.insolublWantedCt) is caught here, otherwise
     -- we might suppress its error message, and proceed on past
     -- type checking to get a Lint error later
-    report1 = [ ("custom_error", is_user_type_error, True,  mkUserTypeErrorReporter)
-                 -- (Handles TypeError and Unsatisfiable)
+    report1 = [ -- We put implicit lifting errors first, because are solid errors
+                -- See "Implicit lifting" in GHC.Tc.Gen.Splice
+                -- Note [Lifecycle of an untyped splice, and PendingRnSplice]
+                ("implicit lifting", is_implicit_lifting, True, mkImplicitLiftingReporter)
 
+              -- Next, solid equality errors
               , given_eq_spec
               , ("insoluble2",      utterly_wrong,  True, mkGroupReporter mkEqErr)
               , ("skolem eq1",      very_wrong,     True, mkSkolReporter)
               , ("FixedRuntimeRep", is_FRR,         True, mkGroupReporter mkFRRErr)
               , ("skolem eq2",      skolem_eq,      True, mkSkolReporter)
+
+              -- Next, custom type errors
+              -- See Note [Custom type errors in constraints] in GHC.Tc.Types.Constraint
+              --
+              -- Put custom type errors /after/ solid equality errors.  In #26255 we
+              -- had a custom error (T <= F alpha) which was suppressing a far more
+              -- informative (K Int ~ [K alpha]). That mismatch between K and [] is
+              -- definitely wrong; and if it was fixed we'd know alpha:=Int, and hence
+              -- perhaps be able to solve T <= F alpha, by reducing F Int.
+              --
+              -- But put custom type errors /before/ "non-tv eq", because if we have
+              --     () ~ TypeError blah
+              -- we want to report it as a custom error, /not/ as a mis-match
+              -- between TypeError and ()!  Also see the Assert example
+              -- in Note [Custom type errors in constraints]
+              , ("custom_error", is_user_type_error, True,  mkUserTypeErrorReporter)
+                 -- (Handles TypeError and Unsatisfiable)
+
+              -- "non-tv-eq": equalities (ty1 ~ ty2) where ty1 is not a tyvar
               , ("non-tv eq",       non_tv_eq,      True, mkSkolReporter)
 
                   -- The only remaining equalities are alpha ~ ty,
                   -- where alpha is untouchable; and representational equalities
                   -- Prefer homogeneous equalities over hetero, because the
                   -- former might be holding up the latter.
-                  -- See Note [Equalities with incompatible kinds] in GHC.Tc.Solver.Equality
+                  -- See Note [Equalities with heterogeneous kinds] in GHC.Tc.Solver.Equality
               , ("Homo eqs",      is_homo_equality,  True,  mkGroupReporter mkEqErr)
               , ("Other eqs",     is_equality,       True,  mkGroupReporter mkEqErr)
+
               ]
 
     -- report2: we suppress these if there are insolubles elsewhere in the tree
     report2 = [ ("Implicit params", is_ip,           False, mkGroupReporter mkIPErr)
               , ("Irreds",          is_irred,        False, mkGroupReporter mkIrredErr)
-              , ("Dicts",           is_dict,         False, mkGroupReporter mkDictErr) ]
-
-    -- report3: suppressed errors should be reported as categorized by either report1
-    -- or report2. Keep this in sync with the suppress function above
-    report3 = [ ("wanted/wanted fundeps", is_ww_fundep, True, mkGroupReporter mkEqErr)
-              ]
+              , ("Dicts",           is_dict,         False, mkGroupReporter mkDictErr)
+              , ("Quantified",      is_qc,           False, mkGroupReporter mkQCErr) ]
 
     -- rigid_nom_eq, rigid_nom_tv_eq,
     is_dict, is_equality, is_ip, is_FRR, is_irred :: ErrorItem -> Pred -> Bool
@@ -675,6 +677,11 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
     -- See also Note [Implementation of Unsatisfiable constraints], point (F).
     is_user_type_error item _ = containsUserTypeError (errorItemPred item)
 
+    is_implicit_lifting item _ =
+      case (errorItemOrigin item) of
+        ImplicitLiftOrigin {} -> True
+        _ -> False
+
     is_homo_equality _ (EqPred _ ty1 ty2)
       = typeKind ty1 `tcEqType` typeKind ty2
     is_homo_equality _ _
@@ -692,9 +699,8 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
     is_irred _ (IrredPred {}) = True
     is_irred _ _              = False
 
-     -- See situation (1) of Note [Suppressing confusing errors]
-    is_ww_fundep item _ = is_ww_fundep_item item
-    is_ww_fundep_item = isWantedWantedFunDepOrigin . errorItemOrigin
+    is_qc _ (ForAllPred {}) = True
+    is_qc _ _               = False
 
     given_eq_spec  -- See Note [Given errors]
       | has_gadt_match_here
@@ -721,6 +727,16 @@ reportWanteds ctxt tc_lvl wc@(WC { wc_simple = simples, wc_impl = implics
       = has_gadt_match implics
 
 ---------------
+suppressItem :: ErrorItem -> Bool
+ -- See Note [Suppressing confusing errors]
+suppressItem item
+  | Wanted <- ei_flavour item
+  , let orig = errorItemOrigin item
+  = isWantedSuperclassOrigin orig       -- See (SCE1)
+    || isWantedWantedFunDepOrigin orig  -- See (SCE2)
+  | otherwise
+  = False
+
 isSkolemTy :: TcLevel -> Type -> Bool
 -- The type is a skolem tyvar
 isSkolemTy tc_lvl ty
@@ -743,9 +759,25 @@ isTyFun_maybe ty = case tcSplitTyConApp_maybe ty of
 Certain errors we might encounter are potentially confusing to users.
 If there are any other errors to report, at all, we want to suppress these.
 
-Which errors (only 1 case right now):
+Which errors are suppressed?
 
-1) Errors which arise from the interaction of two Wanted fun-dep constraints.
+(SCE1) Superclasses of Wanteds.  These are generated only in case they trigger functional
+   dependencies.  If such a constraint is unsolved, then its "parent" constraint must
+   also be unsolved, and is much more informative to the user.  Example (#26255):
+        class (MinVersion <= F era) => Era era where { ... }
+        f :: forall era. EraFamily era -> IO ()
+        f = ..blah...   -- [W] Era era
+   Here we have simply omitted "Era era =>" from f's type.  But we'll end up with
+   /two/ Wanted constraints:
+        [W] d1 :  Era era
+        [W] d2 : MinVersion <= F era  -- Superclass of d1
+   We definitely want to report d1 and not d2!  Happily it's easy to filter out those
+   superclass-Wanteds, becuase their Origin betrays them.
+
+   See test T18851 for an example of how it is (just, barely) possible for the /only/
+   errors to be superclass-of-Wanted constraints.
+
+(SCE2) Errors which arise from the interaction of two Wanted fun-dep constraints.
    Example:
 
      class C a b | a -> b where
@@ -788,7 +820,7 @@ they will remain unfilled, and might have been used to rewrite another constrain
 
 Currently, the constraints to ignore are:
 
-1) Constraints generated in order to unify associated type instance parameters
+(CIG1) Constraints generated in order to unify associated type instance parameters
    with class parameters. Here are two illustrative examples:
 
      class C (a :: k) where
@@ -815,6 +847,9 @@ Currently, the constraints to ignore are:
    with this origin are dropped entirely during error message reporting.
 
    If there is any trouble, checkValidFamInst bleats, aborting compilation.
+
+(Note: Aug 25: this seems a rather tricky corner;
+               c.f. Note [Suppressing confusing errors])
 
 Note [Implementation of Unsatisfiable constraints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -961,7 +996,7 @@ mkSkolReporter :: Reporter
 -- Suppress duplicates with either the same LHS, or same location
 -- Pre-condition: all items are equalities
 mkSkolReporter ctxt items
-  = mapM_ (reportGroup mkEqErr ctxt) (group (toList items))
+  = mapM_ (reportGroup (mkEqErr ctxt) ctxt) (group (toList items))
   where
      group [] = []
      group (item:items) = (item :| yeses) : group noes
@@ -1032,7 +1067,7 @@ zonkTidyTcLclEnvs tidy_env lcls = foldM go (tidy_env, emptyNameEnv) (concatMap c
 reportNotConcreteErrs :: SolverReportErrCtxt -> [NotConcreteError] -> TcM ()
 reportNotConcreteErrs _ [] = return ()
 reportNotConcreteErrs ctxt errs@(err0:_)
-  = do { msg <- mkErrorReport (ctLocEnv (nce_loc err0)) diag (Just ctxt) []
+  = do { msg <- mkErrorReport (ctLocEnv (nce_loc err0)) diag (Just ctxt) [] []
        ; reportDiagnostic msg }
 
   where
@@ -1051,11 +1086,11 @@ reportNotConcreteErrs ctxt errs@(err0:_)
           | frr_errs <- go frr_errs errs
           = case err of
               NCE_FRR
-                { nce_frr_origin = frr_orig
-                , nce_reasons = _not_conc } ->
+                { nce_frr_origin = frr_orig } ->
                 FRR_Info
                   { frr_info_origin       = frr_orig
-                  , frr_info_not_concrete = Nothing }
+                  , frr_info_not_concrete = Nothing
+                  , frr_info_other_origin = Nothing }
                 : frr_errs
 
 reportMultiplicityCoercionErrs :: SolverReportErrCtxt -> [(TcCoercion, CtLoc)] -> TcM ()
@@ -1063,7 +1098,7 @@ reportMultiplicityCoercionErrs ctxt errs = mapM_ reportOne errs
   where
     reportOne :: (TcCoercion, CtLoc) -> TcM ()
     reportOne (_co, loc)
-      = do { msg <- mkErrorReport (ctLocEnv loc) diag (Just ctxt) []
+      = do { msg <- mkErrorReport (ctLocEnv loc) diag (Just ctxt) [] []
            ; reportDiagnostic msg }
 
     diag = TcRnSolverReport
@@ -1087,7 +1122,7 @@ mkUserTypeErrorReporter :: Reporter
 mkUserTypeErrorReporter ctxt
   = mapM_ $ \item -> do { let err = important ctxt $ mkUserTypeError item
                         ; maybeReportError ctxt (item :| []) err
-                        ; addDeferredBinding ctxt err item }
+                        ; addSolverDeferredBinding err item }
 
 mkUserTypeError :: ErrorItem -> TcSolverReportMsg
 mkUserTypeError item
@@ -1100,21 +1135,41 @@ mkUserTypeError item
   where
     pty = errorItemPred item
 
+mkImplicitLiftingReporter :: Reporter
+mkImplicitLiftingReporter ctxt
+  = mapM_ $ \item -> do { let err = mkImplicitLiftingError item
+                        ; msg <- mkErrorReport (ctLocEnv (errorItemCtLoc item)) err (Just ctxt) [] []
+                        ; reportDiagnostic msg
+                        ; addDeferredBinding ctxt [] [] err item
+                        }
+
+  where
+    mkImplicitLiftingError :: ErrorItem -> TcRnMessage
+    mkImplicitLiftingError item =
+      case errorItemOrigin item of
+        ImplicitLiftOrigin (HsImplicitLiftSplice bound used gre name) ->
+          TcRnBadlyLevelled (LevelCheckSplice (getName name) gre) bound used (Just item) (cec_defer_type_errors ctxt)
+        _ -> pprPanic "mkImplicitLiftingError" (ppr item)
+
 mkGivenErrorReporter :: Reporter
 -- See Note [Given errors]
 mkGivenErrorReporter ctxt (item:|_)
   = do { (ctxt, relevant_binds, item) <- relevantBindings True ctxt item
-       ; let (implic:_) = cec_encl ctxt
-                 -- Always non-empty when mkGivenErrorReporter is called
+       ; let implic =
+               case cec_encl ctxt of
+                -- cec_encl is always non-empty when mkGivenErrorReporter is called
+                 outer_implic:_ -> outer_implic
+                 _ -> pprPanic "mkGivenErrorReporter" (ppr item)
+
              loc'  = setCtLocEnv (ei_loc item) (ic_env implic)
              item' = item { ei_loc = loc' }
                    -- For given constraints we overwrite the env (and hence src-loc)
                    -- with one from the immediately-enclosing implication.
                    -- See Note [Inaccessible code]
+
        ; eq_err_msg <- mkEqErr_help ctxt item' ty1 ty2
-       ; let supplementary = [ SupplementaryBindings relevant_binds ]
-             msg = TcRnInaccessibleCode implic (SolverReportWithCtxt ctxt eq_err_msg)
-       ; msg <- mkErrorReport (ctLocEnv loc') msg (Just ctxt) supplementary
+       ; let msg = TcRnInaccessibleCode implic (SolverReportWithCtxt ctxt eq_err_msg)
+       ; msg <- mkErrorReport (ctLocEnv loc') msg (Just ctxt) [SupplementaryBindings relevant_binds] []
        ; reportDiagnostic msg }
   where
     (ty1, ty2)   = getEqPredTys (errorItemPred item)
@@ -1167,7 +1222,7 @@ mkGroupReporter :: (SolverReportErrCtxt -> NonEmpty ErrorItem -> TcM SolverRepor
 -- Group together errors from same location,
 -- and report only the first (to avoid a cascade)
 mkGroupReporter mk_err ctxt items
-  = mapM_ (reportGroup mk_err ctxt) (equivClasses cmp_loc (toList items))
+  = mapM_ (reportGroup (mk_err ctxt) ctxt) (equivClasses cmp_loc (toList items))
 
 eq_lhs_type :: ErrorItem -> ErrorItem -> Bool
 eq_lhs_type item1 item2
@@ -1183,9 +1238,9 @@ cmp_loc item1 item2 = get item1 `compare` get item2
              -- Reduce duplication by reporting only one error from each
              -- /starting/ location even if the end location differs
 
-reportGroup :: (SolverReportErrCtxt -> NonEmpty ErrorItem -> TcM SolverReport) -> Reporter
+reportGroup :: (NonEmpty ErrorItem -> TcM SolverReport) -> Reporter
 reportGroup mk_err ctxt items
-  = do { err <- mk_err ctxt items
+  = do { err <- mk_err items
        ; traceTc "About to maybeReportErr" $
          vcat [ text "Constraint:"             <+> ppr items
               , text "cec_suppress ="          <+> ppr (cec_suppress ctxt)
@@ -1193,7 +1248,7 @@ reportGroup mk_err ctxt items
        ; maybeReportError ctxt items err
            -- But see Note [Always warn with -fdefer-type-errors]
        ; traceTc "reportGroup" (ppr items)
-       ; mapM_ (addDeferredBinding ctxt err) items }
+       ; mapM_ (addSolverDeferredBinding err) items }
            -- Add deferred bindings for all
            -- Redundant if we are going to abort compilation,
            -- but that's hard to know for sure, and if we don't
@@ -1211,7 +1266,8 @@ maybeReportError :: SolverReportErrCtxt
                  -> NonEmpty ErrorItem     -- items covered by the Report
                  -> SolverReport -> TcM ()
 maybeReportError ctxt items@(item1:|_) (SolverReport { sr_important_msg = important
-                                                     , sr_supplementary = supp })
+                                                     , sr_supplementary = supp
+                                                     , sr_hints         = hints })
   = unless (cec_suppress ctxt  -- Some worse error has occurred, so suppress this diagnostic
          || all ei_suppress items) $
                            -- if they're all to be suppressed, report nothing
@@ -1222,16 +1278,26 @@ maybeReportError ctxt items@(item1:|_) (SolverReport { sr_important_msg = import
                   | otherwise                                         = cec_defer_type_errors ctxt
                   -- See Note [No deferring for multiplicity errors]
            diag = TcRnSolverReport important reason
-       msg <- mkErrorReport (ctLocEnv (errorItemCtLoc item1)) diag (Just ctxt) supp
+       msg <- mkErrorReport (ctLocEnv (errorItemCtLoc item1)) diag (Just ctxt) supp hints
        reportDiagnostic msg
 
-addDeferredBinding :: SolverReportErrCtxt -> SolverReport -> ErrorItem -> TcM ()
+addSolverDeferredBinding :: SolverReport -> ErrorItem -> TcM ()
+addSolverDeferredBinding err item =
+  let ctxt = reportContext . sr_important_msg $ err
+      supp = sr_supplementary err
+      hints = sr_hints err
+      important = sr_important_msg err
+  in addDeferredBinding ctxt supp hints (TcRnSolverReport important ErrorWithoutFlag) item
+
+
+addDeferredBinding :: SolverReportErrCtxt -> [SupplementaryInfo] -> [GhcHint] -> TcRnMessage -> ErrorItem -> TcM ()
 -- See Note [Deferring coercion errors to runtime]
-addDeferredBinding ctxt err (EI { ei_evdest = Just dest, ei_pred = item_ty
-                                , ei_loc = loc })
-     -- if evdest is Just, then the constraint was from a wanted
+addDeferredBinding ctxt supp hints msg (EI { ei_evdest = Just dest
+                                           , ei_pred = item_ty
+                                           , ei_loc = loc })
+  -- if evdest is Just, then the constraint was from a wanted
   | deferringAnyBindings ctxt
-  = do { err_tm <- mkErrorTerm ctxt loc item_ty err
+  = do { err_tm <- mkErrorTerm loc item_ty ctxt msg supp hints
        ; let ev_binds_var = cec_binds ctxt
 
        ; case dest of
@@ -1242,14 +1308,26 @@ addDeferredBinding ctxt err (EI { ei_evdest = Just dest, ei_pred = item_ty
                      let co_var = coHoleCoVar hole
                    ; addTcEvBind ev_binds_var $ mkWantedEvBind co_var EvNonCanonical err_tm
                    ; fillCoercionHole hole (mkCoVarCo co_var) } }
-addDeferredBinding _ _ _ = return ()    -- Do not set any evidence for Given
+addDeferredBinding _ _ _ _ _ = return ()    -- Do not set any evidence for Given
 
-mkErrorTerm :: SolverReportErrCtxt -> CtLoc -> Type  -- of the error term
-            -> SolverReport -> TcM EvTerm
-mkErrorTerm ctxt ct_loc ty (SolverReport { sr_important_msg = important, sr_supplementary = supp })
+mkSolverErrorTerm :: CtLoc -> Type  -- of the error term
+                  -> SolverReport -> TcM EvTerm
+mkSolverErrorTerm ct_loc ty err
+  = mkErrorTerm ct_loc ty (reportContext . sr_important_msg $ err)
+                          (TcRnSolverReport (sr_important_msg err) ErrorWithoutFlag)
+                          (sr_supplementary err)
+                          (sr_hints err)
+
+mkErrorTerm :: CtLoc -> Type  -- of the error term
+            -> SolverReportErrCtxt -> TcRnMessage
+            -> [SupplementaryInfo] -> [GhcHint] -> TcM EvTerm
+mkErrorTerm ct_loc ty ctxt msg supp hints
   = do { msg <- mkErrorReport
                   (ctLocEnv ct_loc)
-                  (TcRnSolverReport important ErrorWithoutFlag) (Just ctxt) supp
+                  msg
+                  (Just $ ctxt)
+                  supp
+                  hints
          -- This will be reported at runtime, so we always want "error:" in the report, never "warning:"
        ; dflags <- getDynFlags
        ; let err_msg = pprLocMsgEnvelope (initTcMessageOpts dflags) msg
@@ -1305,73 +1383,21 @@ mkErrorReport :: CtLocEnv
                   -- ^ The context to add, after the main diagnostic
                   -- but before the supplementary information.
                   -- Nothing <=> don't add any context.
-              -> [SolverReportSupplementary]
+              -> [SupplementaryInfo]
                   -- ^ Supplementary information, to be added at the end of the message.
+              -> [GhcHint]
+                  -- ^ Suggested fixes
               -> TcM (MsgEnvelope TcRnMessage)
-mkErrorReport tcl_env msg mb_ctxt supplementary
-  = do { mb_context <- traverse (\ ctxt -> mkErrInfo (cec_tidy ctxt) (ctl_ctxt tcl_env)) mb_ctxt
+mkErrorReport tcl_env msg mb_ctxt supp hints
+  = do { mb_context <- traverse (\ ctxt -> mkErrCtxt (cec_tidy ctxt) (ctl_ctxt tcl_env)) mb_ctxt
        ; unit_state <- hsc_units <$> getTopEnv
        ; hfdc <- getHoleFitDispConfig
        ; let
-           err_info =
-             ErrInfo
-               (fromMaybe empty mb_context)
-               (vcat $ map (pprSolverReportSupplementary hfdc) supplementary)
-       ; let detailed_msg = mkDetailedMessage err_info msg
+           err_info = ErrInfo (fromMaybe [] mb_context) (Just (hfdc, supp)) hints
+           detailed_msg = mkDetailedMessage err_info msg
        ; mkTcRnMessage
            (RealSrcSpan (ctl_loc tcl_env) Strict.Nothing)
            (TcRnMessageWithInfo unit_state $ detailed_msg) }
-
-
-
--- | Pretty-print supplementary information, to add to an error report.
-pprSolverReportSupplementary :: HoleFitDispConfig -> SolverReportSupplementary -> SDoc
--- This function should be in "GHC.Tc.Errors.Ppr",
--- but we need it here because 'TcRnMessageDetails' needs an 'SDoc'.
-pprSolverReportSupplementary hfdc = \case
-  SupplementaryBindings binds -> pprRelevantBindings binds
-  SupplementaryHoleFits fits  -> pprValidHoleFits hfdc fits
-  SupplementaryCts      cts   -> pprConstraintsInclude cts
-
--- | Display a collection of valid hole fits.
-pprValidHoleFits :: HoleFitDispConfig -> ValidHoleFits -> SDoc
--- This function should be in "GHC.Tc.Errors.Ppr",
--- but we need it here because 'TcRnMessageDetails' needs an 'SDoc'.
-pprValidHoleFits hfdc (ValidHoleFits (Fits fits discarded_fits) (Fits refs discarded_refs))
-  = fits_msg $$ refs_msg
-
-  where
-    fits_msg, refs_msg, fits_discard_msg, refs_discard_msg :: SDoc
-    fits_msg = ppUnless (null fits) $
-                    hang (text "Valid hole fits include") 2 $
-                    vcat (map (pprHoleFit hfdc) fits)
-                      $$ ppWhen  discarded_fits fits_discard_msg
-    refs_msg = ppUnless (null refs) $
-                  hang (text "Valid refinement hole fits include") 2 $
-                  vcat (map (pprHoleFit hfdc) refs)
-                    $$ ppWhen discarded_refs refs_discard_msg
-    fits_discard_msg =
-      text "(Some hole fits suppressed;" <+>
-      text "use -fmax-valid-hole-fits=N" <+>
-      text "or -fno-max-valid-hole-fits)"
-    refs_discard_msg =
-      text "(Some refinement hole fits suppressed;" <+>
-      text "use -fmax-refinement-hole-fits=N" <+>
-      text "or -fno-max-refinement-hole-fits)"
-
--- | Add a "Constraints include..." message.
---
--- See Note [Constraints include ...]
-pprConstraintsInclude :: [(PredType, RealSrcSpan)] -> SDoc
--- This function should be in "GHC.Tc.Errors.Ppr",
--- but we need it here because 'TcRnMessageDetails' needs an 'SDoc'.
-pprConstraintsInclude cts
-  = ppUnless (null cts) $
-     hang (text "Constraints include")
-        2 (vcat $ map pprConstraint cts)
-  where
-    pprConstraint (constraint, loc) =
-      ppr constraint <+> nest 2 (parens (text "from" <+> ppr loc))
 
 {- Note [Always warn with -fdefer-type-errors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1469,23 +1495,28 @@ See also 'reportUnsolved'.
 ----------------
 -- | Constructs a new hole error, unless this is deferred. See Note [Constructing Hole Errors].
 mkHoleError :: NameEnv Type -> [ErrorItem] -> SolverReportErrCtxt -> Hole -> TcM (MsgEnvelope TcRnMessage)
-mkHoleError _ _tidy_simples ctxt hole@(Hole { hole_occ = occ, hole_loc = ct_loc })
+mkHoleError _ _tidy_simples ctxt hole@(Hole { hole_sort = sort, hole_occ = occ, hole_loc = ct_loc })
   | isOutOfScopeHole hole
   = do { (imp_errs, hints)
-           <- unknownNameSuggestions (ctl_rdr lcl_env) WL_Anything occ
+           <- unknownNameSuggestions (ctl_rdr lcl_env) what_look occ
        ; let
              err    = SolverReportWithCtxt ctxt
-                    $ ReportHoleError hole
-                    $ OutOfScopeHole imp_errs hints
-             report = SolverReport err []
+                    $ ReportHoleError hole OutOfScopeHole
+             supp   = [ SupplementaryImportErrors imps | imps <- maybeToList (NE.nonEmpty imp_errs) ]
 
-       ; maybeAddDeferredBindings ctxt hole report
-       ; mkErrorReport lcl_env (TcRnSolverReport err (cec_out_of_scope_holes ctxt))
-           Nothing []
-          -- Pass the value 'Nothing' for the context, as it's generally not helpful
-          -- to include the context here.
+       ; maybeAddDeferredBindings hole $ SolverReport err supp hints
+       ; mkErrorReport lcl_env
+           ( TcRnSolverReport err (cec_out_of_scope_holes ctxt)
+           )
+           Nothing supp hints
+             -- Pass the value 'Nothing' for the context, as it's generally not helpful
+             -- to include the context here.
        }
   where
+    what_look = case sort of
+      ExprHole {} -> WL_Term
+      TypeHole {} -> WL_Type
+      ConstraintHole {} -> WL_Type
     lcl_env = ctLocEnv ct_loc
 
  -- general case: not an out-of-scope error
@@ -1514,13 +1545,13 @@ mkHoleError lcl_name_cache tidy_simples ctxt
              err  = SolverReportWithCtxt ctxt
                   $ ReportHoleError hole
                   $ HoleError sort other_tvs grouped_skvs
-             supp = [ SupplementaryBindings rel_binds
-                    , SupplementaryCts      relevant_cts
-                    , SupplementaryHoleFits hole_fits ]
+             supp =    [ SupplementaryBindings rel_binds ]
+                    ++ [ SupplementaryCts      cts | cts <- maybeToList (NE.nonEmpty relevant_cts) ]
+                    ++ [ SupplementaryHoleFits hole_fits ]
 
-       ; maybeAddDeferredBindings ctxt hole (SolverReport err supp)
-
-       ; mkErrorReport lcl_env (TcRnSolverReport err reason) (Just ctxt) supp
+       ; maybeAddDeferredBindings hole (SolverReport err supp noHints)
+       ; let msg = TcRnSolverReport err reason
+       ; mkErrorReport lcl_env msg (Just ctxt) supp noHints
        }
 
   where
@@ -1558,22 +1589,23 @@ so that the correct 'Severity' can be computed out of that later on.
 
 -- | Adds deferred bindings (as errors).
 -- See Note [Adding deferred bindings].
-maybeAddDeferredBindings :: SolverReportErrCtxt
-                         -> Hole
+maybeAddDeferredBindings :: Hole
                          -> SolverReport
                          -> TcM ()
-maybeAddDeferredBindings ctxt hole report = do
+maybeAddDeferredBindings hole report = do
   case hole_sort hole of
     ExprHole (HER ref ref_ty _) -> do
       -- Only add bindings for holes in expressions
       -- not for holes in partial type signatures
       -- cf. addDeferredBinding
       when (deferringAnyBindings ctxt) $ do
-        err_tm <- mkErrorTerm ctxt (hole_loc hole) ref_ty report
+        err_tm <- mkSolverErrorTerm (hole_loc hole) ref_ty report
           -- NB: ref_ty, not hole_ty. hole_ty might be rewritten.
-          -- See Note [Holes] in GHC.Tc.Types.Constraint
+          -- See Note [Holes in expressions] in GHC.Hs.Expr
         writeMutVar ref err_tm
     _ -> pure ()
+  where
+    ctxt = reportContext $ sr_important_msg $ report
 
 -- We unwrap the SolverReportErrCtxt here, to avoid introducing a loop in module
 -- imports
@@ -1594,10 +1626,11 @@ validHoleFits ctxt@(CEC { cec_encl = implics
     mk_wanted :: ErrorItem -> Maybe CtEvidence
     mk_wanted (EI { ei_pred = pred, ei_evdest = m_dest, ei_loc = loc })
       | Just dest <- m_dest
-      = Just (CtWanted { ctev_pred      = pred
-                       , ctev_dest      = dest
-                       , ctev_loc       = loc
-                       , ctev_rewriters = emptyRewriterSet })
+      = Just $ CtWanted $
+          WantedCt { ctev_pred      = pred
+                   , ctev_dest      = dest
+                   , ctev_loc       = loc
+                   , ctev_rewriters = emptyRewriterSet }
       | otherwise
       = Nothing   -- The ErrorItem was a Given
 
@@ -1635,7 +1668,7 @@ mkFRRErr ctxt items
             -- Zonk/tidy to show useful variable names.
           nubOrdBy (nonDetCmpType `on` (frr_type . frr_info_origin)) $
             -- Remove duplicates: only one representation-polymorphism error per type.
-          map (expectJust "mkFRRErr" . fixedRuntimeRepOrigin_maybe) $
+          map (expectJust . fixedRuntimeRepOrigin_maybe) $
           toList items
        ; return $ important ctxt $ FixedRuntimeRepError frr_infos }
 
@@ -1643,21 +1676,25 @@ mkFRRErr ctxt items
 fixedRuntimeRepOrigin_maybe :: HasDebugCallStack => ErrorItem -> Maybe FixedRuntimeRepErrorInfo
 fixedRuntimeRepOrigin_maybe item
   -- An error that arose directly from a representation-polymorphism check.
-  | FRROrigin frr_orig <- errorItemOrigin item
+  | FRROrigin frr_orig <- orig
   = Just $ FRR_Info { frr_info_origin = frr_orig
-                    , frr_info_not_concrete = Nothing }
+                    , frr_info_not_concrete = Nothing
+                    , frr_info_other_origin = Nothing
+                    }
   -- A nominal equality involving a concrete type variable,
   -- such as @alpha[conc] ~# rr[sk]@ or @beta[conc] ~# RR@ for a
   -- type family application @RR@.
   | EqPred NomEq ty1 ty2 <- classifyPredType (errorItemPred item)
   = if | Just (tv1, ConcreteFRR frr1) <- isConcreteTyVarTy_maybe ty1
-       -> Just $ FRR_Info frr1 (Just (tv1, ty2))
+       -> Just $ FRR_Info frr1 (Just (tv1, ty2)) (Just orig)
        | Just (tv2, ConcreteFRR frr2) <- isConcreteTyVarTy_maybe ty2
-       -> Just $ FRR_Info frr2 (Just (tv2, ty1))
+       -> Just $ FRR_Info frr2 (Just (tv2, ty1)) (Just orig)
        | otherwise
        -> Nothing
   | otherwise
   = Nothing
+  where
+    orig = errorItemOrigin item
 
 {-
 Note [Constraints include ...]
@@ -1781,12 +1818,12 @@ mkEqErr_help :: SolverReportErrCtxt
              -> ErrorItem
              -> TcType -> TcType -> TcM TcSolverReportMsg
 mkEqErr_help ctxt item ty1 ty2
-  | Just casted_tv1 <- getCastedTyVar_maybe ty1
-  = mkTyVarEqErr ctxt item casted_tv1 ty2
+  | Just (tv1, _co) <- getCastedTyVar_maybe ty1
+  = mkTyVarEqErr ctxt item tv1 ty2
 
   -- ToDo: explain..  Cf T2627b   Dual (Dual a) ~ a
-  | Just casted_tv2 <- getCastedTyVar_maybe ty2
-  = mkTyVarEqErr ctxt item casted_tv2 ty1
+  | Just (tv2, _co) <- getCastedTyVar_maybe ty2
+  = mkTyVarEqErr ctxt item tv2 ty1
 
   | otherwise
   = reportEqErr ctxt item ty1 ty2
@@ -1819,15 +1856,15 @@ coercible_msg ty1 ty2
     return $ mkCoercibleExplanation rdr_env fam_envs ty1 ty2
 
 mkTyVarEqErr :: SolverReportErrCtxt -> ErrorItem
-             -> (TcTyVar, TcCoercionN) -> TcType -> TcM TcSolverReportMsg
+             -> TcTyVar -> TcType -> TcM TcSolverReportMsg
 -- tv1 and ty2 are already tidied
-mkTyVarEqErr ctxt item casted_tv1 ty2
-  = do { traceTc "mkTyVarEqErr" (ppr item $$ ppr casted_tv1 $$ ppr ty2)
-       ; mkTyVarEqErr' ctxt item casted_tv1 ty2 }
+mkTyVarEqErr ctxt item tv1 ty2
+  = do { traceTc "mkTyVarEqErr" (ppr item $$ ppr tv1 $$ ppr ty2)
+       ; mkTyVarEqErr' ctxt item tv1 ty2 }
 
 mkTyVarEqErr' :: SolverReportErrCtxt -> ErrorItem
-              -> (TcTyVar, TcCoercionN) -> TcType -> TcM TcSolverReportMsg
-mkTyVarEqErr' ctxt item (tv1, co1) ty2
+              -> TcTyVar -> TcType -> TcM TcSolverReportMsg
+mkTyVarEqErr' ctxt item tv1 ty2
 
   -- Is this a representation-polymorphism error, e.g.
   -- alpha[conc] ~# rr[sk] ? If so, handle that first.
@@ -1856,12 +1893,6 @@ mkTyVarEqErr' ctxt item (tv1, co1) ty2
         -- instead of augmenting it.  This is because the details are not likely
         -- to be helpful since this is just an unimplemented feature.
     return main_msg
-
-  -- Incompatible kinds
-  -- This is wrinkle (EIK2) in Note [Equalities with incompatible kinds]
-  -- in GHC.Tc.Solver.Equality
-  | hasCoercionHoleCo co1 || hasCoercionHoleTy ty2
-  = return $ mkBlockedEqErr item
 
   | isSkolemTyVar tv1  -- ty2 won't be a meta-tyvar; we would have
                        -- swapped in Solver.Equality.canEqTyVarHomo
@@ -1938,8 +1969,10 @@ mkTyVarEqErr' ctxt item (tv1, co1) ty2
   -- See Note [Error messages for untouchables]
   | (implic:_) <- cec_encl ctxt   -- Get the innermost context
   , Implic { ic_tclvl = lvl } <- implic
-  = assertPpr (not (isTouchableMetaTyVar lvl tv1))
+  = assertPpr (not (isTouchableMetaTyVar lvl tv1) || hasCoercionHole ty2)
               (ppr tv1 $$ ppr lvl) $ do -- See Note [Error messages for untouchables]
+         -- We can still get touchable meta-tyvars on the LHS if there is an
+         -- unsolved coercion hole, e.g.   (alpha::Type) ~ Int# |> co_hole
     tv_extra <- extraTyVarEqInfo (tv1, Just implic) ty2
     let tv_extra' = tv_extra { thisTyVarIsUntouchable = Just implic }
         msg = Mismatch
@@ -1975,7 +2008,8 @@ mkTyVarEqErr' ctxt item (tv1, co1) ty2
       = Nothing
     frr_reason (ConcreteFRR frr_orig) conc_tv not_conc
       = FRR_Info { frr_info_origin = frr_orig
-                 , frr_info_not_concrete = Just (conc_tv, not_conc) }
+                 , frr_info_not_concrete = Just (conc_tv, not_conc)
+                 , frr_info_other_origin = Just (errorItemOrigin item) }
 
     ty1 = mkTyVarTy tv1
 
@@ -2045,14 +2079,6 @@ misMatchOrCND ctxt item ty1 ty2
     givens  = [ given | given <- getUserGivens ctxt, ic_given_eqs given /= NoGivenEqs ]
               -- Keep only UserGivens that have some equalities.
               -- See Note [Suppress redundant givens during error reporting]
-
--- These are for the "blocked" equalities, as described in GHC.Tc.Solver.Equality
--- Note [Equalities with incompatible kinds], wrinkle (EIK2). There should
--- always be another unsolved wanted around, which will ordinarily suppress
--- this message. But this can still be printed out with -fdefer-type-errors
--- (sigh), so we must produce a message.
-mkBlockedEqErr :: ErrorItem -> TcSolverReportMsg
-mkBlockedEqErr item = BlockedEquality item
 
 {-
 Note [Suppress redundant givens during error reporting]
@@ -2228,6 +2254,15 @@ Warn of loopy local equalities that were dropped.
 ************************************************************************
 -}
 
+mkQCErr :: HasDebugCallStack => SolverReportErrCtxt -> NonEmpty ErrorItem -> TcM SolverReport
+mkQCErr ctxt items
+  | item1 :| _ <- tryFilter (not . ei_suppress) items
+    -- Ignore multiple qc-errors on the same line
+  = do { let msg = mkPlainMismatchMsg $
+                   CouldNotDeduce (getUserGivens ctxt) (item1 :| []) Nothing
+       ; return $ important ctxt msg }
+
+
 mkDictErr :: HasDebugCallStack => SolverReportErrCtxt -> NonEmpty ErrorItem -> TcM SolverReport
 mkDictErr ctxt orig_items
   = do { inst_envs <- tcGetInstEnvs
@@ -2240,8 +2275,16 @@ mkDictErr ctxt orig_items
        -- But we report only one of them (hence 'head') because they all
        -- have the same source-location origin, to try avoid a cascade
        -- of error from one location
-       ; err <- mk_dict_err ctxt (head (no_inst_items ++ overlap_items))
-       ; return $ important ctxt err }
+       ; ( err, (imp_errs, hints) ) <-
+           mk_dict_err ctxt (head (no_inst_items ++ overlap_items))
+       ; return $
+           SolverReport
+             { sr_important_msg = SolverReportWithCtxt ctxt err
+             , sr_supplementary = [ SupplementaryImportErrors imps
+                                  | imps <- maybeToList (NE.nonEmpty imp_errs) ]
+             , sr_hints = hints
+             }
+        }
   where
     items = tryFilter (not . ei_suppress) orig_items
 
@@ -2275,25 +2318,31 @@ mkDictErr ctxt orig_items
 --     matching and unifying instances, and say "The choice depends on the instantion of ...,
 --     and the result of evaluating ...".
 mk_dict_err :: HasCallStack => SolverReportErrCtxt -> (ErrorItem, ClsInstLookupResult)
-            -> TcM TcSolverReportMsg
-mk_dict_err ctxt (item, (matches, unifiers, unsafe_overlapped)) = case (NE.nonEmpty matches, NE.nonEmpty unsafe_overlapped) of
+            -> TcM ( TcSolverReportMsg, ([ImportError], [GhcHint]) )
+mk_dict_err ctxt (item, (matches, pot_unifiers, unsafe_overlapped))
+  = case (NE.nonEmpty matches, NE.nonEmpty unsafe_overlapped) of
   (Nothing, _)  -> do -- No matches but perhaps several unifiers
     { (_, rel_binds, item) <- relevantBindings True ctxt item
     ; candidate_insts <- get_candidate_instances
     ; (imp_errs, field_suggestions) <- record_field_suggestions item
-    ; return (cannot_resolve_msg item candidate_insts rel_binds imp_errs field_suggestions) }
+    ; return (CannotResolveInstance item unifiers candidate_insts rel_binds, (imp_errs, field_suggestions)) }
 
   -- Some matches => overlap errors
   (Just matchesNE, Nothing) -> return $
-    OverlappingInstances item (NE.map fst matchesNE) (getCoherentUnifiers unifiers)
+    ( OverlappingInstances item (NE.map fst matchesNE) unifiers, ([], []))
 
   (Just (match :| []), Just unsafe_overlappedNE) -> return $
-    UnsafeOverlap item (fst match) (NE.map fst unsafe_overlappedNE)
-  (Just matches@(_ :| _), Just overlaps) -> pprPanic "mk_dict_err: multiple matches with overlap" $ vcat [ text "matches:" <+> ppr matches, text "overlaps:" <+> ppr overlaps ]
+    ( UnsafeOverlap item (fst match) (NE.map fst unsafe_overlappedNE), ([], []))
+  (Just matches@(_ :| _), Just overlaps) ->
+    pprPanic "mk_dict_err: multiple matches with overlap" $
+      vcat [ text "matches:" <+> ppr matches
+           , text "overlaps:" <+> ppr overlaps
+           ]
   where
-    orig          = errorItemOrigin item
-    pred          = errorItemPred item
-    (clas, tys)   = getClassPredTys pred
+    orig        = errorItemOrigin item
+    pred        = errorItemPred item
+    (clas, tys) = getClassPredTys pred
+    unifiers    = getCoherentUnifiers pot_unifiers
 
     get_candidate_instances :: TcM [ClsInst]
     -- See Note [Report candidate instances]
@@ -2351,11 +2400,6 @@ mk_dict_err ctxt (item, (matches, unifiers, unsafe_overlapped)) = case (NE.nonEm
     record_field = case orig of
       GetFieldOrigin name -> Just (mkVarOccFS name)
       _                   -> Nothing
-
-    cannot_resolve_msg :: ErrorItem -> [ClsInst] -> RelevantBindings
-                       -> [ImportError] -> [GhcHint] -> TcSolverReportMsg
-    cannot_resolve_msg item candidate_insts binds imp_errs field_suggestions
-      = CannotResolveInstance item (getCoherentUnifiers unifiers) candidate_insts imp_errs field_suggestions binds
 
 {- Note [Report candidate instances]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

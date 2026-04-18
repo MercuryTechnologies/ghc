@@ -14,9 +14,10 @@ module GHC.Core (
 
         -- * In/Out type synonyms
         InId, InBind, InExpr, InAlt, InArg, InType, InKind,
-               InBndr, InVar, InCoercion, InTyVar, InCoVar,
+               InBndr, InVar, InCoercion, InTyVar, InCoVar, InTyCoVar,
         OutId, OutBind, OutExpr, OutAlt, OutArg, OutType, OutKind,
-               OutBndr, OutVar, OutCoercion, OutTyVar, OutCoVar, MOutCoercion,
+               OutBndr, OutVar, OutCoercion, OutTyVar, OutCoVar,
+               OutTyCoVar, MOutCoercion,
 
         -- ** 'Expr' construction
         mkLet, mkLets, mkLetNonRec, mkLetRec, mkLams,
@@ -38,7 +39,7 @@ module GHC.Core (
         isId, cmpAltCon, cmpAlt, ltAlt,
 
         -- ** Simple 'Expr' access functions and predicates
-        bindersOf, bindersOfBinds, rhssOfBind, rhssOfAlts,
+        bindersOf, bindersOfBinds, rhssOfBind, rhssOfBinds, rhssOfAlts,
         foldBindersOfBindStrict, foldBindersOfBindsStrict,
         collectBinders, collectTyBinders, collectTyAndValBinders,
         collectNBinders, collectNValBinders_maybe,
@@ -115,7 +116,11 @@ import GHC.Utils.Panic
 
 import Data.Data hiding (TyCon)
 import Data.Int
+import Data.List.NonEmpty (nonEmpty)
+import qualified Data.List.NonEmpty as NE
 import Data.Word
+
+import Control.DeepSeq
 
 infixl 4 `mkApps`, `mkTyApps`, `mkVarApps`, `App`, `mkCoApps`
 -- Left associative, so that we can say (f `mkTyApps` xs `mkVarApps` ys)
@@ -1164,11 +1169,9 @@ chooseOrphanAnchor :: NameSet -> IsOrphan
 --
 -- NB: 'minimum' use Ord, and (Ord OccName) works lexicographically
 --
-chooseOrphanAnchor local_names
-  | isEmptyNameSet local_names = IsOrphan
-  | otherwise                  = NotOrphan (minimum occs)
-  where
-    occs = map nameOccName $ nonDetEltsUniqSet local_names
+chooseOrphanAnchor local_names = case nonEmpty $ nonDetEltsUniqSet local_names of
+    Nothing -> IsOrphan
+    Just local_names -> NotOrphan (minimum (NE.map nameOccName local_names))
     -- It's OK to use nonDetEltsUFM here, see comments above
 
 instance Binary IsOrphan where
@@ -1183,6 +1186,10 @@ instance Binary IsOrphan where
             _ -> do
                 n <- get bh
                 return $ NotOrphan n
+
+instance NFData IsOrphan where
+  rnf IsOrphan = ()
+  rnf (NotOrphan n) = rnf n
 
 {-
 Note [Orphans]
@@ -1334,7 +1341,7 @@ isAutoRule (Rule { ru_auto = is_auto }) = is_auto
 
 -- | The number of arguments the 'ru_fn' must be applied
 -- to before the rule can match on it
-ruleArity :: CoreRule -> Int
+ruleArity :: CoreRule -> FullArgCount
 ruleArity (BuiltinRule {ru_nargs = n}) = n
 ruleArity (Rule {ru_args = args})      = length args
 
@@ -2146,6 +2153,11 @@ foldBindersOfBindsStrict f = \z binds -> foldl' fold_bind z binds
 rhssOfBind :: Bind b -> [Expr b]
 rhssOfBind (NonRec _ rhs) = [rhs]
 rhssOfBind (Rec pairs)    = [rhs | (_,rhs) <- pairs]
+
+rhssOfBinds :: [Bind b] -> [Expr b]
+rhssOfBinds []             = []
+rhssOfBinds (NonRec _ rhs : bs) = rhs : rhssOfBinds bs
+rhssOfBinds (Rec pairs    : bs) = map snd pairs ++ rhssOfBinds bs
 
 rhssOfAlts :: [Alt b] -> [Expr b]
 rhssOfAlts alts = [e | Alt _ _ e <- alts]

@@ -15,12 +15,13 @@ module GHC.Tc.Utils.Monad(
 
   -- * Simple accessors
   discardResult,
-  getTopEnv, updTopEnv, getGblEnv, updGblEnv,
+  getTopEnv, updTopEnv, updTopEnvIO, getGblEnv, updGblEnv,
   setGblEnv, getLclEnv, updLclEnv, updLclCtxt, setLclEnv, restoreLclEnv,
   updTopFlags,
   getEnvs, setEnvs, updEnvs, restoreEnvs,
   xoptM, doptM, goptM, woptM,
-  setXOptM, unsetXOptM, unsetGOptM, unsetWOptM,
+  setXOptM, setWOptM,
+  unsetXOptM, unsetGOptM, unsetWOptM,
   whenDOptM, whenGOptM, whenWOptM,
   whenXOptM, unlessXOptM,
   getGhcMode,
@@ -75,7 +76,9 @@ module GHC.Tc.Utils.Monad(
   -- * Shared error message stuff: renamer and typechecker
   recoverM, mapAndRecoverM, mapAndReportM, foldAndRecoverM,
   attemptM, tryTc,
-  askNoErrs, discardErrs, tryTcDiscardingErrs,
+  askNoErrs, discardErrs,
+  tryTcDiscardingErrs,
+  tryTcDiscardingErrs',
   checkNoErrs, whenNoErrs,
   ifErrsM, failIfErrsM,
 
@@ -88,8 +91,9 @@ module GHC.Tc.Utils.Monad(
   addErrTcM,
   failWithTc, failWithTcM,
   checkTc, checkTcM,
+  checkJustTc, checkJustTcM,
   failIfTc, failIfTcM,
-  mkErrInfo,
+  mkErrCtxt,
   addTcRnDiagnostic, addDetailedDiagnostic,
   mkTcRnMessage, reportDiagnostic, reportDiagnostics,
   warnIf, diagnosticTc, diagnosticTcM,
@@ -97,9 +101,9 @@ module GHC.Tc.Utils.Monad(
 
   -- * Type constraints
   newTcEvBinds, newNoTcEvBinds, cloneEvBindsVar,
-  addTcEvBind, addTopEvBinds,
-  getTcEvTyCoVars, getTcEvBindsMap, setTcEvBindsMap,
-  chooseUniqueOccTc,
+  addTcEvBind, addTcEvBinds, addTopEvBinds,
+  getTcEvBindsMap, setTcEvBindsMap, updTcEvBinds,
+  getTcEvTyCoVars, chooseUniqueOccTc,
   getConstraintVar, setConstraintVar,
   emitConstraints, emitStaticConstraints, emitSimple, emitSimples,
   emitImplication, emitImplications, ensureReflMultiplicityCo,
@@ -113,8 +117,8 @@ module GHC.Tc.Utils.Monad(
   emitNamedTypeHole, IsExtraConstraint(..), emitAnonTypeHole,
 
   -- * Template Haskell context
-  recordThUse, recordThSpliceUse, recordThNeededRuntimeDeps,
-  keepAlive, getStage, getStageAndBindLevel, setStage,
+  recordThUse, recordThNeededRuntimeDeps,
+  keepAlive, getThLevel, getCurrentAndBindLevel, setThLevel,
   addModFinalizersWithLclEnv,
 
   -- * Safe Haskell context
@@ -163,8 +167,10 @@ import GHC.Tc.Types     -- Re-export all
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.CtLoc
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Types.LclEnv
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.TcRef
+import GHC.Tc.Types.TH
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Zonk.TcType
 
@@ -174,7 +180,7 @@ import GHC.Unit
 import GHC.Unit.Env
 import GHC.Unit.External
 import GHC.Unit.Module.Warnings
-import GHC.Unit.Home.ModInfo
+import GHC.Unit.Home.PackageTable
 
 import GHC.Core.UsageEnv
 import GHC.Core.Multiplicity
@@ -183,8 +189,14 @@ import GHC.Core.FamInstEnv
 import GHC.Core.Type( mkNumLitTy )
 
 import GHC.Driver.Env
+import GHC.Driver.Env.KnotVars
 import GHC.Driver.Session
 import GHC.Driver.Config.Diagnostic
+
+import GHC.Iface.Errors.Types
+import GHC.Iface.Errors.Ppr
+
+import GHC.Linker.Types
 
 import GHC.Runtime.Context
 
@@ -199,6 +211,7 @@ import GHC.Utils.Panic
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Logger
 import qualified GHC.Data.Strict as Strict
+import qualified Data.Set as Set
 
 import GHC.Types.Error
 import GHC.Types.DefaultEnv ( DefaultEnv, emptyDefaultEnv )
@@ -208,16 +221,16 @@ import GHC.Types.Name
 import GHC.Types.SafeHaskell
 import GHC.Types.Id
 import GHC.Types.TypeEnv
-import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.SrcLoc
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
 import GHC.Types.Name.Ppr
 import GHC.Types.Unique.FM ( emptyUFM )
+import GHC.Types.Unique.DFM
 import GHC.Types.Unique.Supply
 import GHC.Types.Annotations
-import GHC.Types.Basic( TopLevelFlag, TypeOrKind(..) )
+import GHC.Types.Basic( TopLevelFlag(..), TypeOrKind(..) )
 import GHC.Types.CostCentre.State
 import GHC.Types.SourceFile
 
@@ -227,13 +240,8 @@ import Data.IORef
 import Control.Monad
 
 import qualified Data.Map as Map
-import GHC.Driver.Env.KnotVars
-import GHC.Linker.Types
-import GHC.Types.Unique.DFM
-import GHC.Iface.Errors.Types
-import GHC.Iface.Errors.Ppr
-import GHC.Tc.Types.LclEnv
 import GHC.Core.Coercion (isReflCo)
+
 
 {-
 ************************************************************************
@@ -258,7 +266,6 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
  = do { keep_var     <- newIORef emptyNameSet ;
         used_gre_var <- newIORef [] ;
         th_var       <- newIORef False ;
-        th_splice_var<- newIORef False ;
         infer_var    <- newIORef True ;
         infer_reasons_var <- newIORef emptyMessages ;
         dfun_n_var   <- newIORef emptyOccSet ;
@@ -320,8 +327,8 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
                 tcg_inst_env       = emptyInstEnv,
                 tcg_fam_inst_env   = emptyFamInstEnv,
                 tcg_ann_env        = emptyAnnEnv,
+                tcg_complete_match_env = [],
                 tcg_th_used        = th_var,
-                tcg_th_splice_used = th_splice_var,
                 tcg_th_needed_deps = th_needed_deps_var,
                 tcg_exports        = [],
                 tcg_imports        = emptyImportAvails,
@@ -356,7 +363,6 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
                 tcg_zany_n         = zany_n_var,
                 tcg_keep           = keep_var,
                 tcg_hdr_info        = (Nothing,Nothing),
-                tcg_hpc            = False,
                 tcg_main           = Nothing,
                 tcg_self_boot      = NoSelfBoot,
                 tcg_safe_infer     = infer_var,
@@ -395,7 +401,7 @@ initTcWithGbl hsc_env gbl_env loc do_this
                 tcl_in_gen_code = False,
                 tcl_ctxt       = [],
                 tcl_rdr        = emptyLocalRdrEnv,
-                tcl_th_ctxt    = topStage,
+                tcl_th_ctxt    = topLevel,
                 tcl_th_bndrs   = emptyNameEnv,
                 tcl_arrow_ctxt = NoArrowCtxt,
                 tcl_env        = emptyNameEnv,
@@ -472,6 +478,11 @@ getTopEnv = do { env <- getEnv; return (env_top env) }
 updTopEnv :: (HscEnv -> HscEnv) -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 updTopEnv upd = updEnv (\ env@(Env { env_top = top }) ->
                           env { env_top = upd top })
+
+updTopEnvIO :: (HscEnv -> IO HscEnv) -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
+updTopEnvIO upd = updEnvIO (\ env@(Env { env_top = top }) ->
+                                upd top >>= \t' ->
+                                pure env{ env_top = t' })
 
 getGblEnv :: TcRnIf gbl lcl gbl
 getGblEnv = do { Env{..} <- getEnv; return env_gbl }
@@ -570,6 +581,9 @@ woptM flag = wopt flag <$> getDynFlags
 
 setXOptM :: LangExt.Extension -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 setXOptM flag = updTopFlags (\dflags -> xopt_set dflags flag)
+
+setWOptM :: WarningFlag -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
+setWOptM flag = updTopFlags (\dflags -> wopt_set dflags flag)
 
 unsetXOptM :: LangExt.Extension -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 unsetXOptM flag = updTopFlags (\dflags -> xopt_unset dflags flag)
@@ -1059,11 +1073,11 @@ addErrAt :: SrcSpan -> TcRnMessage -> TcRn ()
 -- work doesn't matter
 addErrAt loc msg = do { ctxt <- getErrCtxt
                       ; tidy_env <- liftZonkM $ tcInitTidyEnv
-                      ; err_info <- mkErrInfo tidy_env ctxt
-                      ; let detailed_msg = mkDetailedMessage (ErrInfo err_info Outputable.empty) msg
+                      ; err_ctxt <- mkErrCtxt tidy_env ctxt
+                      ; let detailed_msg = mkDetailedMessage (ErrInfo err_ctxt Nothing noHints) msg
                       ; add_long_err_at loc detailed_msg }
 
-mkDetailedMessage :: ErrInfo -> TcRnMessage -> TcRnMessageDetailed
+mkDetailedMessage :: ErrInfo-> TcRnMessage -> TcRnMessageDetailed
 mkDetailedMessage err_info msg =
   TcRnMessageDetailed err_info msg
 
@@ -1218,12 +1232,12 @@ setErrCtxt ctxt = updLclEnv (setLclEnvErrCtxt ctxt)
 
 -- | Add a fixed message to the error context. This message should not
 -- do any tidying.
-addErrCtxt :: SDoc -> TcM a -> TcM a
+addErrCtxt :: ErrCtxtMsg -> TcM a -> TcM a
 {-# INLINE addErrCtxt #-}   -- Note [Inlining addErrCtxt]
 addErrCtxt msg = addErrCtxtM (\env -> return (env, msg))
 
 -- | Add a message to the error context. This message may do tidying.
-addErrCtxtM :: (TidyEnv -> ZonkM (TidyEnv, SDoc)) -> TcM a -> TcM a
+addErrCtxtM :: (TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)) -> TcM a -> TcM a
 {-# INLINE addErrCtxtM #-}  -- Note [Inlining addErrCtxt]
 addErrCtxtM ctxt = pushCtxt (False, ctxt)
 
@@ -1231,13 +1245,13 @@ addErrCtxtM ctxt = pushCtxt (False, ctxt)
 -- message is always sure to be reported, even if there is a lot of
 -- context. It also doesn't count toward the maximum number of contexts
 -- reported.
-addLandmarkErrCtxt :: SDoc -> TcM a -> TcM a
+addLandmarkErrCtxt :: ErrCtxtMsg -> TcM a -> TcM a
 {-# INLINE addLandmarkErrCtxt #-}  -- Note [Inlining addErrCtxt]
 addLandmarkErrCtxt msg = addLandmarkErrCtxtM (\env -> return (env, msg))
 
 -- | Variant of 'addLandmarkErrCtxt' that allows for monadic operations
 -- and tidying.
-addLandmarkErrCtxtM :: (TidyEnv -> ZonkM (TidyEnv, SDoc)) -> TcM a -> TcM a
+addLandmarkErrCtxtM :: (TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)) -> TcM a -> TcM a
 {-# INLINE addLandmarkErrCtxtM #-}  -- Note [Inlining addErrCtxt]
 addLandmarkErrCtxtM ctxt = pushCtxt (True, ctxt)
 
@@ -1371,11 +1385,13 @@ tryCaptureConstraints thing_inside
                           tcTryM thing_inside
 
        -- See Note [Constraints and errors]
-       ; let lie_to_keep = case mb_res of
-                             Nothing -> dropMisleading lie
-                             Just {} -> lie
-
-       ; return (mb_res, lie_to_keep) }
+       ; case mb_res of
+            Just {} -> return (mb_res, lie)
+            Nothing -> do { let pruned_lie = dropMisleading lie
+                          ; traceTc "tryCaptureConstraints" $
+                            vcat [ text "lie:" <+> ppr lie
+                                 , text "dropMisleading lie:" <+> ppr pruned_lie ]
+                          ; return (Nothing, pruned_lie) } }
 
 captureConstraints :: TcM a -> TcM (a, WantedConstraints)
 -- (captureConstraints m) runs m, and returns the type constraints it generates
@@ -1412,7 +1428,7 @@ tcCollectingUsage thing_inside
 tcScalingUsage :: Mult -> TcM a -> TcM a
 tcScalingUsage mult thing_inside
   = do { (usage, result) <- tcCollectingUsage thing_inside
-       ; traceTc "tcScalingUsage" (ppr mult)
+       ; traceTc "tcScalingUsage" $ vcat [ppr mult, ppr usage]
        ; tcEmitBindingUsage $ scaleUE mult usage
        ; return result }
 
@@ -1511,21 +1527,37 @@ tryTcDiscardingErrs :: TcM r -> TcM r -> TcM r
 --      if 'main' succeeds with no error messages, it's the answer
 --      otherwise discard everything from 'main', including errors,
 --          and try 'recover' instead.
-tryTcDiscardingErrs recover thing_inside
+tryTcDiscardingErrs recover =
+  tryTcDiscardingErrs'
+    (\_ _ _ -> True)     -- No validation
+    recover recover      -- Discard all errors and warnings
+                         -- and unsolved constraints entirely
+
+tryTcDiscardingErrs' :: (WantedConstraints -> Messages TcRnMessage -> r -> Bool)  -- Validation
+                     -> TcM r  -- Recover from validation error
+                     -> TcM r  -- Recover from failure
+                     -> TcM r  -- Action to try
+                     -> TcM r
+-- (tryTcDiscardingErrs' validate recover_invalid recover_error thing_inside) tries 'thing_inside';
+--      if 'thing_inside' succeeds and validation produces no errors, it's the answer
+--      otherwise discard everything from 'thing_inside', including errors,
+--          and try 'recover' instead.
+tryTcDiscardingErrs' validate recover_invalid recover_error thing_inside
   = do { ((mb_res, lie), msgs) <- capture_messages    $
                                   capture_constraints $
                                   tcTryM thing_inside
         ; case mb_res of
             Just res | not (errorsFound msgs)
                      , not (insolubleWC lie)
-              -> -- 'main' succeeded with no errors
-                 do { addMessages msgs  -- msgs might still have warnings
-                    ; emitConstraints lie
-                    ; return res }
+                    -- 'thing_inside' succeeded with no errors
+              -> if validate lie msgs res
+                 then do { addMessages msgs  -- msgs might still have warnings
+                         ; emitConstraints lie
+                         ; return res }
+                 else recover_invalid
 
-            _ -> -- 'main' failed, or produced an error message
-                 recover     -- Discard all errors and warnings
-                             -- and unsolved constraints entirely
+            _ -> -- 'thing_inside' failed, or produced an error message
+                 recover_error
         }
 
 {-
@@ -1579,6 +1611,12 @@ checkTcM :: Bool -> (TidyEnv, TcRnMessage) -> TcM ()
 checkTcM True  _   = return ()
 checkTcM False err = failWithTcM err
 
+checkJustTc :: TcRnMessage -> Maybe a -> TcM a
+checkJustTc err = maybe (failWithTc err) pure
+
+checkJustTcM :: (TidyEnv, TcRnMessage) -> Maybe a -> TcM a
+checkJustTcM err = maybe (failWithTcM err) pure
+
 failIfTc :: Bool -> TcRnMessage -> TcM ()         -- Check that the boolean is false
 failIfTc False _   = return ()
 failIfTc True  err = failWithTc err
@@ -1595,9 +1633,6 @@ failIfTcM True  err = failWithTcM err
 warnIf :: Bool -> TcRnMessage -> TcRn ()
 warnIf is_bad msg -- No need to check any flag here, it will be done in 'diagReasonSeverity'.
   = when is_bad (addDiagnostic msg)
-
-no_err_info :: ErrInfo
-no_err_info = ErrInfo Outputable.empty Outputable.empty
 
 -- | Display a warning if a condition is met.
 diagnosticTc :: Bool -> TcRnMessage -> TcM ()
@@ -1621,22 +1656,23 @@ addDiagnosticTc msg
 addDiagnosticTcM :: (TidyEnv, TcRnMessage) -> TcM ()
 addDiagnosticTcM (env0, msg)
  = do { ctxt <- getErrCtxt
-      ; extra <- mkErrInfo env0 ctxt
-      ; let err_info = ErrInfo extra Outputable.empty
-            detailed_msg = mkDetailedMessage err_info msg
+      ; extra <- mkErrCtxt env0 ctxt
+      ; let detailed_msg = mkDetailedMessage (ErrInfo extra Nothing noHints) msg
       ; add_diagnostic detailed_msg }
 
 -- | A variation of 'addDiagnostic' that takes a function to produce a 'TcRnDsMessage'
 -- given some additional context about the diagnostic.
-addDetailedDiagnostic :: (ErrInfo -> TcRnMessage) -> TcM ()
+addDetailedDiagnostic :: ([ErrCtxtMsg] -> TcRnMessage) -> TcM ()
 addDetailedDiagnostic mkMsg = do
   loc <- getSrcSpanM
   name_ppr_ctx <- getNamePprCtx
   !diag_opts  <- initDiagOpts <$> getDynFlags
   env0 <- liftZonkM tcInitTidyEnv
   ctxt <- getErrCtxt
-  err_info <- mkErrInfo env0 ctxt
-  reportDiagnostic (mkMsgEnvelope diag_opts loc name_ppr_ctx (mkMsg (ErrInfo err_info empty)))
+  err_info <- mkErrCtxt env0 ctxt
+  reportDiagnostic $
+    mkMsgEnvelope diag_opts loc name_ppr_ctx $
+      mkMsg err_info
 
 addTcRnDiagnostic :: TcRnMessage -> TcM ()
 addTcRnDiagnostic msg = do
@@ -1646,13 +1682,13 @@ addTcRnDiagnostic msg = do
 -- | Display a diagnostic for the current source location, taken from
 -- the 'TcRn' monad.
 addDiagnostic :: TcRnMessage -> TcRn ()
-addDiagnostic msg = add_diagnostic (mkDetailedMessage no_err_info msg)
+addDiagnostic msg = add_diagnostic (mkDetailedMessage (ErrInfo [] Nothing noHints) msg)
 
 -- | Display a diagnostic for a given source location.
 addDiagnosticAt :: SrcSpan -> TcRnMessage -> TcRn ()
 addDiagnosticAt loc msg = do
   unit_state <- hsc_units <$> getTopEnv
-  let detailed_msg = mkDetailedMessage no_err_info msg
+  let detailed_msg = mkDetailedMessage (ErrInfo [] Nothing noHints) msg
   mkTcRnMessage loc (TcRnMessageWithInfo unit_state detailed_msg) >>= reportDiagnostic
 
 -- | Display a diagnostic, with an optional flag, for the current source
@@ -1673,12 +1709,13 @@ add_err_tcm :: TidyEnv -> TcRnMessage -> SrcSpan
             -> [ErrCtxt]
             -> TcM ()
 add_err_tcm tidy_env msg loc ctxt
- = do { err_info <- mkErrInfo tidy_env ctxt ;
-        add_long_err_at loc (mkDetailedMessage (ErrInfo err_info Outputable.empty) msg) }
+ = do { err_ctxt <- mkErrCtxt tidy_env ctxt
+      ; add_long_err_at loc $
+          mkDetailedMessage (ErrInfo err_ctxt Nothing noHints) msg }
 
-mkErrInfo :: TidyEnv -> [ErrCtxt] -> TcM SDoc
+mkErrCtxt :: TidyEnv -> [ErrCtxt] -> TcM [ErrCtxtMsg]
 -- Tidy the error info, trimming excessive contexts
-mkErrInfo env ctxts
+mkErrCtxt env ctxts
 --  = do
 --       dbg <- hasPprDebug <$> getDynFlags
 --       if dbg                -- In -dppr-debug style the output
@@ -1686,14 +1723,14 @@ mkErrInfo env ctxts
 --          else go dbg 0 env ctxts
  = go False 0 env ctxts
  where
-   go :: Bool -> Int -> TidyEnv -> [ErrCtxt] -> TcM SDoc
-   go _ _ _   [] = return empty
+   go :: Bool -> Int -> TidyEnv -> [ErrCtxt] -> TcM [ErrCtxtMsg]
+   go _ _ _   [] = return []
    go dbg n env ((is_landmark, ctxt) : ctxts)
      | is_landmark || n < mAX_CONTEXTS -- Too verbose || dbg
      = do { (env', msg) <- liftZonkM $ ctxt env
           ; let n' = if is_landmark then n else n+1
           ; rest <- go dbg n' env' ctxts
-          ; return (msg $$ rest) }
+          ; return (msg : rest) }
      | otherwise
      = go dbg n env ctxts
 
@@ -1724,7 +1761,7 @@ addTopEvBinds new_ev_binds thing_inside
 
 newTcEvBinds :: TcM EvBindsVar
 newTcEvBinds = do { binds_ref <- newTcRef emptyEvBindMap
-                  ; tcvs_ref  <- newTcRef emptyVarSet
+                  ; tcvs_ref  <- newTcRef []
                   ; uniq <- newUnique
                   ; traceTc "newTcEvBinds" (text "unique =" <+> ppr uniq)
                   ; return (EvBindsVar { ebv_binds = binds_ref
@@ -1736,7 +1773,7 @@ newTcEvBinds = do { binds_ref <- newTcRef emptyEvBindMap
 -- must be made monadically
 newNoTcEvBinds :: TcM EvBindsVar
 newNoTcEvBinds
-  = do { tcvs_ref  <- newTcRef emptyVarSet
+  = do { tcvs_ref  <- newTcRef []
        ; uniq <- newUnique
        ; traceTc "newNoTcEvBinds" (text "unique =" <+> ppr uniq)
        ; return (CoEvBindsVar { ebv_tcvs = tcvs_ref
@@ -1747,14 +1784,14 @@ cloneEvBindsVar :: EvBindsVar -> TcM EvBindsVar
 -- solving don't pollute the original
 cloneEvBindsVar ebv@(EvBindsVar {})
   = do { binds_ref <- newTcRef emptyEvBindMap
-       ; tcvs_ref  <- newTcRef emptyVarSet
+       ; tcvs_ref  <- newTcRef []
        ; return (ebv { ebv_binds = binds_ref
                      , ebv_tcvs = tcvs_ref }) }
 cloneEvBindsVar ebv@(CoEvBindsVar {})
-  = do { tcvs_ref  <- newTcRef emptyVarSet
+  = do { tcvs_ref  <- newTcRef []
        ; return (ebv { ebv_tcvs = tcvs_ref }) }
 
-getTcEvTyCoVars :: EvBindsVar -> TcM TyCoVarSet
+getTcEvTyCoVars :: EvBindsVar -> TcM [TcCoercion]
 getTcEvTyCoVars ev_binds_var
   = readTcRef (ebv_tcvs ev_binds_var)
 
@@ -1773,15 +1810,51 @@ setTcEvBindsMap v@(CoEvBindsVar {}) ev_binds
   | otherwise
   = pprPanic "setTcEvBindsMap" (ppr v $$ ppr ev_binds)
 
+updTcEvBinds :: EvBindsVar -> EvBindsVar -> TcM ()
+updTcEvBinds (EvBindsVar { ebv_binds = old_ebv_ref, ebv_tcvs = old_tcv_ref })
+             (EvBindsVar { ebv_binds = new_ebv_ref, ebv_tcvs = new_tcv_ref })
+  = do { new_ebvs <- readTcRef new_ebv_ref
+       ; updTcRef old_ebv_ref (`unionEvBindMap` new_ebvs)
+       ; new_tcvs <- readTcRef new_tcv_ref
+       ; updTcRef old_tcv_ref (new_tcvs ++) }
+updTcEvBinds (EvBindsVar { ebv_tcvs = old_tcv_ref })
+             (CoEvBindsVar { ebv_tcvs = new_tcv_ref })
+  = do { new_tcvs <- readTcRef new_tcv_ref
+       ; updTcRef old_tcv_ref (new_tcvs ++) }
+updTcEvBinds (CoEvBindsVar { ebv_tcvs = old_tcv_ref })
+             (CoEvBindsVar { ebv_tcvs = new_tcv_ref })
+  = do { new_tcvs <- readTcRef new_tcv_ref
+       ; updTcRef old_tcv_ref (new_tcvs ++) }
+updTcEvBinds old_var new_var
+  = pprPanic "updTcEvBinds" (ppr old_var $$ ppr new_var)
+    -- Terms inside types, no good
+
 addTcEvBind :: EvBindsVar -> EvBind -> TcM ()
 -- Add a binding to the TcEvBinds by side effect
 addTcEvBind (EvBindsVar { ebv_binds = ev_ref, ebv_uniq = u }) ev_bind
-  = do { traceTc "addTcEvBind" $ ppr u $$
-                                 ppr ev_bind
-       ; bnds <- readTcRef ev_ref
-       ; writeTcRef ev_ref (extendEvBinds bnds ev_bind) }
+  = do { bnds <- readTcRef ev_ref
+       ; let bnds' = extendEvBinds bnds ev_bind
+       ; traceTc "addTcEvBind" $
+         vcat [ text "EvBindsVar:" <+> ppr u
+              , text "ev_bind:" <+> ppr ev_bind
+              , text "bnds:" <+> ppr bnds
+              , text "bnds':" <+> ppr bnds' ]
+       ; writeTcRef ev_ref bnds' }
 addTcEvBind (CoEvBindsVar { ebv_uniq = u }) ev_bind
   = pprPanic "addTcEvBind CoEvBindsVar" (ppr ev_bind $$ ppr u)
+
+addTcEvBinds :: EvBindsVar -> EvBindMap -> TcM ()
+-- ^ Add a collection of binding to the TcEvBinds by side effect
+addTcEvBinds _ new_ev_binds
+  | isEmptyEvBindMap new_ev_binds
+  = return ()
+addTcEvBinds (EvBindsVar { ebv_binds = ev_ref, ebv_uniq = u }) new_ev_binds
+  = do { traceTc "addTcEvBinds" $ ppr u $$
+                                  ppr new_ev_binds
+       ; old_bnds <- readTcRef ev_ref
+       ; writeTcRef ev_ref (old_bnds `unionEvBindMap` new_ev_binds) }
+addTcEvBinds (CoEvBindsVar { ebv_uniq = u }) new_ev_binds
+  = pprPanic "addTcEvBinds CoEvBindsVar" (ppr new_ev_binds $$ ppr u)
 
 chooseUniqueOccTc :: (OccSet -> OccName) -> TcM OccName
 chooseUniqueOccTc fn =
@@ -2018,28 +2091,51 @@ It's distressingly delicate though:
   emitted some constraints with skolem-escape problems.
 
 * If we discard too /few/ constraints, we may get the misleading
-  class constraints mentioned above.  But we may /also/ end up taking
-  constraints built at some inner level, and emitting them at some
-  outer level, and then breaking the TcLevel invariants
-  See Note [TcLevel invariants] in GHC.Tc.Utils.TcType
+  class constraints mentioned above.
 
-So dropMisleading has a horridly ad-hoc structure.  It keeps only
-/insoluble/ flat constraints (which are unlikely to very visibly trip
-up on the TcLevel invariant, but all /implication/ constraints (except
-the class constraints inside them).  The implication constraints are
-OK because they set the ambient level before attempting to solve any
-inner constraints.  Ugh! I hate this. But it seems to work.
+  We may /also/ end up taking constraints built at some inner level, and
+  emitting them (via the exception catching in `tryCaptureConstraints` at some
+  outer level, and then breaking the TcLevel invariants See Note [TcLevel
+  invariants] in GHC.Tc.Utils.TcType
 
-However note that freshly-generated constraints like (Int ~ Bool), or
-((a -> b) ~ Int) are all CNonCanonical, and hence won't be flagged as
-insoluble.  The constraint solver does that.  So they'll be discarded.
-That's probably ok; but see th/5358 as a not-so-good example:
-   t1 :: Int
-   t1 x = x   -- Manifestly wrong
+So `dropMisleading` has a horridly ad-hoc structure:
 
-   foo = $(...raises exception...)
-We report the exception, but not the bug in t1.  Oh well.  Possible
-solution: make GHC.Tc.Utils.Unify.uType spot manifestly-insoluble constraints.
+* It keeps only /insoluble/ flat constraints (which are unlikely to very visibly
+  trip up on the TcLevel invariant
+
+* But it keeps all /implication/ constraints (except the class constraints
+  inside them).  The implication constraints are OK because they set the ambient
+  level before attempting to solve any inner constraints.
+
+Ugh! I hate this. But it seems to work.
+
+Other wrinkles
+
+(CERR1) Note that freshly-generated constraints like (Int ~ Bool), or
+    ((a -> b) ~ Int) are all CNonCanonical, and hence won't be flagged as
+    insoluble.  The constraint solver does that.  So they'll be discarded.
+    That's probably ok; but see th/5358 as a not-so-good example:
+       t1 :: Int
+       t1 x = x   -- Manifestly wrong
+
+       foo = $(...raises exception...)
+    We report the exception, but not the bug in t1.  Oh well.  Possible
+    solution: make GHC.Tc.Utils.Unify.uType spot manifestly-insoluble constraints.
+
+(CERR2) In #26015 I found that from the constraints
+           [W] alpha ~ Int      -- A class constraint
+           [W] F alpha ~# Bool  -- An equality constraint
+  we were dropping the first (becuase it's a class constraint) but not the
+  second, and then getting a misleading error message from the second.  As
+  #25607 shows, we can get not just one but a zillion bogus messages, which
+  conceal the one genuine error.  Boo.
+
+  For now I have added an even more ad-hoc "drop class constraints except
+  equality classes (~) and (~~)"; see `dropMisleading`.  That just kicks the can
+  down the road; but this problem seems somewhat rare anyway.  The code in
+  `dropMisleading` hasn't changed for years.
+
+It would be great to have a more systematic solution to this entire mess.
 
 
 ************************************************************************
@@ -2051,9 +2147,6 @@ solution: make GHC.Tc.Utils.Unify.uType spot manifestly-insoluble constraints.
 
 recordThUse :: TcM ()
 recordThUse = do { env <- getGblEnv; writeTcRef (tcg_th_used env) True }
-
-recordThSpliceUse :: TcM ()
-recordThSpliceUse = do { env <- getGblEnv; writeTcRef (tcg_th_splice_used env) True }
 
 recordThNeededRuntimeDeps :: [Linkable] -> PkgsLoaded -> TcM ()
 recordThNeededRuntimeDeps new_links new_pkgs
@@ -2070,18 +2163,38 @@ keepAlive name
        ; traceRn "keep alive" (ppr name)
        ; updTcRef (tcg_keep env) (`extendNameSet` name) }
 
-getStage :: TcM ThStage
-getStage = do { env <- getLclEnv; return (getLclEnvThStage env) }
+getThLevel :: TcM ThLevel
+getThLevel = do { env <- getLclEnv; return (getLclEnvThLevel env) }
 
-getStageAndBindLevel :: Name -> TcRn (Maybe (TopLevelFlag, ThLevel, ThStage))
-getStageAndBindLevel name
+getCurrentAndBindLevel :: Name -> TcRn (Maybe (TopLevelFlag, Set.Set ThLevelIndex, ThLevel))
+getCurrentAndBindLevel name
   = do { env <- getLclEnv;
        ; case lookupNameEnv (getLclEnvThBndrs env) name of
-           Nothing                  -> return Nothing
-           Just (top_lvl, bind_lvl) -> return (Just (top_lvl, bind_lvl, getLclEnvThStage env)) }
+           Nothing                  -> do
+              lvls <- getExternalBindLvl name
+              if Set.empty == lvls
+                -- This case happens when code is generated for identifiers which are not
+                -- in scope.
+                --
+                -- TODO: What happens if someone generates [|| GHC.Magic.dataToTag# ||]
+                then do
+                  return Nothing
+                else return (Just (TopLevel, lvls, getLclEnvThLevel env))
+           Just (top_lvl, bind_lvl) -> return (Just (top_lvl, Set.singleton bind_lvl, getLclEnvThLevel env)) }
 
-setStage :: ThStage -> TcM a -> TcRn a
-setStage s = updLclEnv (setLclEnvThStage s)
+getExternalBindLvl :: Name -> TcRn (Set.Set ThLevelIndex)
+getExternalBindLvl name = do
+  env <- getGlobalRdrEnv
+  mod <- getModule
+  case lookupGRE_Name env name of
+    Just gre -> return $ (Set.map thLevelIndexFromImportLevel (greLevels gre))
+    Nothing ->
+      if nameIsLocalOrFrom mod name
+        then return $ Set.singleton topLevelIndex
+        else return Set.empty
+
+setThLevel :: ThLevel -> TcM a -> TcRn a
+setThLevel l = updLclEnv (setLclEnvThLevel l)
 
 -- | Adds the given modFinalizers to the global environment and set them to use
 -- the current local environment.
@@ -2335,13 +2448,14 @@ liftZonkM (ZonkM f) =
 getCompleteMatchesTcM :: TcM CompleteMatches
 getCompleteMatchesTcM
   = do { hsc_env <- getTopEnv
-       ; tcg_env <- getGblEnv
        ; eps <- liftIO $ hscEPS hsc_env
-       ; return $ localAndImportedCompleteMatches (tcg_complete_matches tcg_env) hsc_env eps
+       ; tcg_env <- getGblEnv
+       ; let tcg_comps = tcg_complete_match_env tcg_env
+       ; liftIO $ localAndImportedCompleteMatches tcg_comps eps
        }
 
-localAndImportedCompleteMatches :: CompleteMatches -> HscEnv -> ExternalPackageState -> CompleteMatches
-localAndImportedCompleteMatches tcg_comps hsc_env eps =
-     tcg_comps                -- from the current module
-  ++ hptCompleteSigs hsc_env  -- from the home package
-  ++ eps_complete_matches eps -- from imports
+localAndImportedCompleteMatches :: CompleteMatches -> ExternalPackageState -> IO CompleteMatches
+localAndImportedCompleteMatches tcg_comps eps = do
+  return $
+       tcg_comps                -- from the current modulea and from the home package
+    ++ eps_complete_matches eps -- from external packages

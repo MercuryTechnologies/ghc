@@ -66,6 +66,7 @@ module GHC.Unit.State (
         pprUnitInfoForUser,
         pprModuleMap,
         pprWithUnitState,
+        pprRawUnitIds,
 
         -- * Utils
         unwireUnit)
@@ -364,9 +365,13 @@ initUnitConfig dflags cached_dbs home_units =
 
        autoLink
          | not (gopt Opt_AutoLinkPackages dflags) = []
-         -- By default we add ghc-internal & rts to the preload units (when they are
+         -- By default we add base, ghc-internal and rts to the preload units (when they are
          -- found in the unit database) except when we are building them
-         | otherwise = filter (hu_id /=) [ghcInternalUnitId, rtsUnitId]
+         --
+         -- Since "base" is not wired in, then the unit-id is discovered
+         -- from the settings file by default, but can be overriden by power-users
+         -- by specifying `-base-unit-id` flag.
+         | otherwise = filter (hu_id /=) [baseUnitId dflags, ghcInternalUnitId, rtsUnitId]
 
        -- if the home unit is indefinite, it means we are type-checking it only
        -- (not producing any code). Hence we can use virtual units instantiated
@@ -1885,8 +1890,7 @@ lookupModuleInAllUnits pkgs m
   = case lookupModuleWithSuggestions pkgs m NoPkgQual of
       LookupFound a b -> [(a,fst b)]
       LookupMultiple rs -> map f rs
-        where f (m,_) = (m, expectJust "lookupModule" (lookupUnit pkgs
-                                                         (moduleUnit m)))
+        where f (m,_) = (m, expectJust (lookupUnit pkgs (moduleUnit m)))
       _ -> []
 
 -- | The result of performing a lookup
@@ -2266,3 +2270,7 @@ pprWithUnitState :: UnitState -> SDoc -> SDoc
 pprWithUnitState state = updSDocContext (\ctx -> ctx
    { sdocUnitIdForUser = \fs -> pprUnitIdForUser state (UnitId fs)
    })
+
+-- | Print raw unit-ids, without removing the hash
+pprRawUnitIds :: SDoc -> SDoc
+pprRawUnitIds = updSDocContext (\ctx -> ctx { sdocUnitIdForUser = ftext })

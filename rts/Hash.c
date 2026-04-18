@@ -14,18 +14,6 @@
 #include "Hash.h"
 #include "RtsUtils.h"
 
-/* This file needs to be compiled with vectorization enabled.  Unfortunately
-   since we compile these things these days with cabal we can no longer
-   specify optimization per file.  So we have to resort to pragmas.  */
-#if defined(__GNUC__) || defined(__GNUG__)
-#if !defined(__clang__)
-#if !defined(DEBUG)
-#pragma GCC push_options
-#pragma GCC optimize ("O3")
-#endif
-#endif
-#endif
-
 #define XXH_INLINE_ALL
 
 #include "xxhash.h"
@@ -81,7 +69,7 @@ hashWord(const HashTable *table, StgWord key)
     int bucket;
 
     /* Strip the boring zero bits */
-    key >>= sizeof(StgWord);
+    key /= sizeof(StgWord);
 
     /* Mod the size of the hash table (a power of 2) */
     bucket = key & table->mask1;
@@ -94,13 +82,13 @@ hashWord(const HashTable *table, StgWord key)
 }
 
 int
-hashStr(const HashTable *table, StgWord w)
+hashBuffer(const HashTable *table, const void *buf, size_t len)
 {
-    const char *key = (char*) w;
+    const char *key = (char*) buf;
 #if WORD_SIZE_IN_BITS == 64
-    StgWord h = XXH3_64bits_withSeed (key, strlen(key), 1048583);
+    StgWord h = XXH3_64bits_withSeed (key, len, 1048583);
 #else
-    StgWord h = XXH32 (key, strlen(key), 1048583);
+    StgWord h = XXH32 (key, len, 1048583);
 #endif
 
     /* Mod the size of the hash table (a power of 2) */
@@ -112,6 +100,13 @@ hashStr(const HashTable *table, StgWord w)
     }
 
     return bucket;
+}
+
+int
+hashStr(const HashTable *table, StgWord w)
+{
+    const char *key = (char*) w;
+    return hashBuffer(table, key, strlen(key));
 }
 
 STATIC_INLINE int
@@ -563,12 +558,3 @@ int keyCountHashTable (HashTable *table)
 {
     return table->kcount;
 }
-
-
-#if defined(__GNUC__) || defined(__GNUG__)
-#if !defined(__clang__)
-#if !defined(DEBUG)
-#pragma GCC pop_options
-#endif
-#endif
-#endif

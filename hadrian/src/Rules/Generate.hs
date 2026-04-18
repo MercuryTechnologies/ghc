@@ -1,7 +1,6 @@
 module Rules.Generate (
     isGeneratedCmmFile, compilerDependencies, generatePackageCode,
     generateRules, copyRules, generatedDependencies,
-    ghcPrimDependencies,
     templateRules
     ) where
 
@@ -27,6 +26,7 @@ import Utilities
 import GHC.Toolchain as Toolchain hiding (HsCpp(HsCpp))
 import GHC.Toolchain.Program
 import GHC.Platform.ArchOS
+import Settings.Program (ghcWithInterpreter)
 
 -- | Track this file to rebuild generated files whenever it changes.
 trackGenerateHs :: Expr ()
@@ -47,11 +47,11 @@ isGeneratedCmmFile file =
     , "AutoApply_V64"
     ]
 
-ghcPrimDependencies :: Expr [FilePath]
-ghcPrimDependencies = do
+ghcInternalDependencies :: Expr [FilePath]
+ghcInternalDependencies = do
     stage <- getStage
-    path  <- expr $ buildPath (vanillaContext stage ghcPrim)
-    return [path -/- "GHC/Prim.hs", path -/- "GHC/PrimopWrappers.hs"]
+    path  <- expr $ buildPath (vanillaContext stage ghcInternal)
+    return [path -/- "GHC/Internal/Prim.hs", path -/- "GHC/Internal/PrimopWrappers.hs"]
 
 rtsDependencies :: Expr [FilePath]
 rtsDependencies = do
@@ -109,9 +109,9 @@ compilerDependencies = do
 
 generatedDependencies :: Expr [FilePath]
 generatedDependencies = do
-    mconcat [ package compiler ? compilerDependencies
-            , package ghcPrim  ? ghcPrimDependencies
-            , package rts      ? rtsDependencies
+    mconcat [ package compiler    ? compilerDependencies
+            , package ghcInternal ? ghcInternalDependencies
+            , package rts         ? rtsDependencies
             ]
 
 generate :: FilePath -> Context -> Expr String -> Action ()
@@ -144,9 +144,9 @@ generatePackageCode context@(Context stage pkg _ _) = do
             root -/- "**" -/- dir -/- "GHC/Platform/Constants.hs" %> genPlatformConstantsType context
             root -/- "**" -/- dir -/- "GHC/Settings/Config.hs" %> go generateConfigHs
             root -/- "**" -/- dir -/- "*.hs-incl" %> genPrimopCode context
-        when (pkg == ghcPrim) $ do
-            root -/- "**" -/- dir -/- "GHC/Prim.hs" %> genPrimopCode context
-            root -/- "**" -/- dir -/- "GHC/PrimopWrappers.hs" %> genPrimopCode context
+        when (pkg == ghcInternal) $ do
+            root -/- "**" -/- dir -/- "GHC/Internal/Prim.hs" %> genPrimopCode context
+            root -/- "**" -/- dir -/- "GHC/Internal/PrimopWrappers.hs" %> genPrimopCode context
         when (pkg == ghcBoot) $ do
             root -/- "**" -/- dir -/- "GHC/Version.hs" %> go generateVersionHs
             root -/- "**" -/- dir -/- "GHC/Platform/Host.hs" %> go generatePlatformHostHs
@@ -425,7 +425,7 @@ bindistRules = do
     , interpolateSetting "LlvmMinVersion" LlvmMinVersion
     , interpolateVar "LlvmTarget" $ getTarget tgtLlvmTarget
     , interpolateSetting "ProjectVersion" ProjectVersion
-    , interpolateVar "SettingsUseDistroMINGW" $ settingsFileSetting ToolchainSetting_DistroMinGW
+    , interpolateVar "SettingsUseDistroMINGW" $ lookupSystemConfig "settings-use-distro-mingw"
     , interpolateVar "TablesNextToCode" $ yesNo <$> getTarget tgtTablesNextToCode
     , interpolateVar "TargetHasLibm" $ lookupSystemConfig "target-has-libm"
     , interpolateVar "TargetPlatform" $ getTarget targetPlatformTriple
@@ -435,6 +435,7 @@ bindistRules = do
     , interpolateVar "UseLibdw" $ fmap yesNo $ interp $ getFlag UseLibdw
     , interpolateVar "UseLibffiForAdjustors" $ yesNo <$> getTarget tgtUseLibffiForAdjustors
     , interpolateVar "GhcWithSMP" $ yesNo <$> targetSupportsSMP
+    , interpolateVar "BaseUnitId" $ pkgUnitId Stage1 base
     ]
   where
     interp = interpretInContext (semiEmptyTarget Stage2)
@@ -471,6 +472,14 @@ generateSettings settingsFile = do
         Stage2 -> get_pkg_db Stage1
         Stage3 -> get_pkg_db Stage2
 
+    -- The unit-id of the base package which is always linked against (#25382)
+    base_unit_id <- expr $ do
+      case stage of
+        Stage0 {} -> error "Unable to generate settings for stage0"
+        Stage1 -> pkgUnitId Stage1 base
+        Stage2 -> pkgUnitId Stage1 base
+        Stage3 -> pkgUnitId Stage2 base
+
     let rel_pkg_db = makeRelativeNoSysLink (dropFileName settingsFile) package_db_path
 
     settings <- traverse sequence $
@@ -500,9 +509,9 @@ generateSettings settingsFile = do
         , ("ar flags",            queryTarget arFlags)
         , ("ar supports at file", queryTarget arSupportsAtFile')
         , ("ar supports -L",      queryTarget arSupportsDashL')
-        , ("ranlib command", queryTarget ranlibPath)
-        , ("otool command", expr $ settingsFileSetting ToolchainSetting_OtoolCommand)
-        , ("install_name_tool command", expr $ settingsFileSetting ToolchainSetting_InstallNameToolCommand)
+        , ("ranlib command",      queryTarget ranlibPath)
+        , ("otool command",       queryTarget otoolPath)
+        , ("install_name_tool command", queryTarget installNameToolPath)
         , ("windres command", queryTarget (maybe "/bin/false" prgPath . tgtWindres)) -- TODO: /bin/false is not available on many distributions by default, but we keep it as it were before the ghc-toolchain patch. Fix-me.
         , ("unlit command", ("$topdir/../bin/" <>) <$> expr (programName (ctx { Context.package = unlit })))
         , ("cross compiling", expr $ yesNo <$> flag CrossCompiling)
@@ -517,13 +526,14 @@ generateSettings settingsFile = do
         , ("target has libm", expr $  lookupSystemConfig "target-has-libm")
         , ("Unregisterised", queryTarget (yesNo . tgtUnregisterised))
         , ("LLVM target", queryTarget tgtLlvmTarget)
-        , ("LLVM llc command", expr $ settingsFileSetting ToolchainSetting_LlcCommand)
-        , ("LLVM opt command", expr $ settingsFileSetting ToolchainSetting_OptCommand)
-        , ("LLVM llvm-as command", expr $ settingsFileSetting ToolchainSetting_LlvmAsCommand)
-        , ("Use inplace MinGW toolchain", expr $ settingsFileSetting ToolchainSetting_DistroMinGW)
+        , ("LLVM llc command", queryTarget llcPath)
+        , ("LLVM opt command", queryTarget optPath)
+        , ("LLVM llvm-as command", queryTarget llvmAsPath)
+        , ("LLVM llvm-as flags", queryTarget llvmAsFlags)
+        , ("Use inplace MinGW toolchain", expr $ lookupSystemConfig "settings-use-distro-mingw")
 
         , ("target RTS linker only supports shared libraries", expr $ yesNo <$> targetRTSLinkerOnlySupportsSharedLibs)
-        , ("Use interpreter", expr $ yesNo <$> ghcWithInterpreter)
+        , ("Use interpreter", expr $ yesNo <$> ghcWithInterpreter (predStage stage))
         , ("Support SMP", expr $ yesNo <$> targetSupportsSMP)
         , ("RTS ways", escapeArgs . map show . Set.toList <$> getRtsWays)
         , ("Tables next to code", queryTarget (yesNo . tgtTablesNextToCode))
@@ -531,6 +541,7 @@ generateSettings settingsFile = do
         , ("Use LibFFI", expr $ yesNo <$> useLibffiForAdjustors)
         , ("RTS expects libdw", yesNo <$> getFlag UseLibdw)
         , ("Relative Global Package DB", pure rel_pkg_db)
+        , ("base unit-id", pure base_unit_id)
         ]
     let showTuple (k, v) = "(" ++ show k ++ ", " ++ show v ++ ")"
     pure $ case settings of
@@ -561,10 +572,16 @@ generateSettings settingsFile = do
     linkSupportsFilelist        = yesNo . ccLinkSupportsFilelist . tgtCCompilerLink
     linkSupportsCompactUnwind   = yesNo . ccLinkSupportsCompactUnwind . tgtCCompilerLink
     linkIsGnu                   = yesNo . ccLinkIsGnu . tgtCCompilerLink
+    llcPath = maybe "" prgPath . tgtLlc
+    optPath = maybe "" prgPath . tgtOpt
+    llvmAsPath = maybe "" prgPath . tgtLlvmAs
+    llvmAsFlags = escapeArgs . maybe [] prgFlags . tgtLlvmAs
     arPath  = prgPath . arMkArchive . tgtAr
     arFlags = escapeArgs . prgFlags . arMkArchive . tgtAr
     arSupportsAtFile' = yesNo . arSupportsAtFile . tgtAr
     arSupportsDashL' = yesNo . arSupportsDashL . tgtAr
+    otoolPath = maybe "" prgPath . tgtOtool
+    installNameToolPath = maybe "" prgPath . tgtInstallNameTool
     ranlibPath  = maybe "" (prgPath . ranlibProgram) . tgtRanlib
     mergeObjsSupportsResponseFiles' = maybe "NO" (yesNo . mergeObjsSupportsResponseFiles) . tgtMergeObjs
 
@@ -591,6 +608,8 @@ generateConfigHs = do
     -- 'pkgUnitId' on 'compiler' (the ghc-library package) to create the
     -- unit-id in both situations.
     cProjectUnitId <- expr . (`pkgUnitId` compiler) =<< getStage
+
+    cGhcInternalUnitId <- expr . (`pkgUnitId` ghcInternal) =<< getStage
     return $ unlines
         [ "module GHC.Settings.Config"
         , "  ( module GHC.Version"
@@ -600,6 +619,7 @@ generateConfigHs = do
         , "  , cBooterVersion"
         , "  , cStage"
         , "  , cProjectUnitId"
+        , "  , cGhcInternalUnitId"
         , "  ) where"
         , ""
         , "import GHC.Prelude.Basic"
@@ -623,6 +643,9 @@ generateConfigHs = do
         , ""
         , "cProjectUnitId :: String"
         , "cProjectUnitId = " ++ show cProjectUnitId
+        , ""
+        , "cGhcInternalUnitId :: String"
+        , "cGhcInternalUnitId = " ++ show cGhcInternalUnitId
         ]
   where
     stageString (Stage0 InTreeLibs) = "1"
@@ -671,8 +694,12 @@ generateVersionHs = do
 generatePlatformHostHs :: Expr String
 generatePlatformHostHs = do
     trackGenerateHs
-    cHostPlatformArch <- queryHost (archOS_arch . tgtArchOs)
-    cHostPlatformOS   <- queryHost (archOS_OS . tgtArchOs)
+    stage <- getStage
+    let chooseHostQuery = case stage of
+            Stage0 {} -> queryHost
+            _         -> queryTarget
+    cHostPlatformArch <- chooseHostQuery (archOS_arch . tgtArchOs)
+    cHostPlatformOS   <- chooseHostQuery (archOS_OS . tgtArchOs)
     return $ unlines
         [ "module GHC.Platform.Host where"
         , ""

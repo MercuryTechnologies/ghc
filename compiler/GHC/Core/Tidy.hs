@@ -16,12 +16,12 @@ import GHC.Prelude
 
 import GHC.Core
 import GHC.Core.Type
-
+import GHC.Core.TyCo.Tidy
 import GHC.Core.Seq ( seqUnfolding )
+
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Demand ( zapDmdEnvSig, isStrUsedDmd )
-import GHC.Core.Coercion ( tidyCo )
 import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Unique (getUnique)
@@ -30,6 +30,7 @@ import GHC.Types.Name hiding (tidyNameOcc)
 import GHC.Types.Name.Set
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish
+
 import GHC.Data.Maybe
 import GHC.Utils.Misc
 import Data.List (mapAccumL)
@@ -234,8 +235,8 @@ tidyAlt env (Alt con vs rhs)
 
 ------------  Tickish  --------------
 tidyTickish :: TidyEnv -> CoreTickish -> CoreTickish
-tidyTickish env (Breakpoint ext ix ids modl)
-  = Breakpoint ext ix (map (tidyVarOcc env) ids) modl
+tidyTickish env (Breakpoint ext bid ids)
+  = Breakpoint ext bid (map (tidyVarOcc env) ids)
 tidyTickish _   other_tickish       = other_tickish
 
 ------------  Rules  --------------

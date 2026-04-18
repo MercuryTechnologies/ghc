@@ -156,7 +156,7 @@ import GHC.Parser.Errors.Types ( PsWarning, PsError )
 import GHC.Types.Error         ( Messages )
 import GHC.Hs                  ( HsParsedModule )
 
-import qualified GHC.Internal.TH.Syntax as TH
+import qualified GHC.Boot.TH.Syntax as TH
 
 {- This instance is defined outside GHC.Core.Opt.Monad so that
    GHC.Core.Opt.Monad does not depend on GHC.Tc.Utils.Env -}
@@ -202,7 +202,8 @@ thNameToGhcName th_name = do
 -- ensures everything in that session will get the same name cache.
 thNameToGhcNameIO :: NameCache -> TH.Name -> IO (Maybe Name)
 thNameToGhcNameIO cache th_name
-  =  do { names <- mapMaybeM lookup (thRdrNameGuesses th_name)
+  =  do { let listTuplePuns = True -- conservative assumption
+        ; names <- mapMaybeM lookup (thRdrNameGuesses listTuplePuns th_name)
           -- Pick the first that works
           -- E.g. reify (mkName "A") will pick the class A in preference
           -- to the data constructor A

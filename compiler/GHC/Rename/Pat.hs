@@ -53,6 +53,7 @@ import GHC.Hs
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcMType ( hsOverLitName )
+import GHC.Rename.Doc (rnLHsDoc)
 import GHC.Rename.Env
 import GHC.Rename.Fixity
 import GHC.Rename.Utils    ( newLocalBndrRn, bindLocalNames
@@ -63,17 +64,19 @@ import GHC.Rename.Utils    ( newLocalBndrRn, bindLocalNames
 import GHC.Rename.HsType
 import GHC.Builtin.Names
 
+import GHC.Types.Hint
+import GHC.Types.Fixity (LexicalFixity(..))
 import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.Name.Reader
 import GHC.Types.Unique.Set
-
 import GHC.Types.Basic
 import GHC.Types.SourceText
-import GHC.Utils.Misc
+
 import GHC.Data.FastString ( uniqCompareFS )
 import GHC.Data.List.SetOps( removeDups )
-import GHC.Utils.Outputable
+
+import GHC.Utils.Misc
 import GHC.Utils.Panic.Plain
 import GHC.Types.SrcLoc
 import GHC.Types.Literal   ( inCharRange )
@@ -88,15 +91,11 @@ import Data.Foldable
 import Data.Function       ( on )
 import Data.Functor.Identity ( Identity (..) )
 import qualified Data.List.NonEmpty as NE
-import Data.Maybe
 import Data.Ratio
 import Control.Monad.Trans.Writer.CPS
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import Data.Functor ((<&>))
-import GHC.Rename.Doc (rnLHsDoc)
-import GHC.Types.Hint
-import GHC.Types.Fixity (LexicalFixity(..))
 import Data.Coerce
 
 {-
@@ -161,11 +160,12 @@ wrapSrcSpanCps fn (L loc a)
                  unCpsRn (fn a) $ \v ->
                  k (L loc v))
 
-lookupConCps :: LocatedN RdrName -> CpsRn (LocatedN Name)
-lookupConCps con_rdr
-  = CpsRn (\k -> do { con_name <- lookupLocatedOccRnConstr con_rdr
-                    ; (r, fvs) <- k con_name
-                    ; return (r, addOneFV fvs (unLoc con_name)) })
+lookupConCps :: LocatedN RdrName -> CpsRn (LocatedN (WithUserRdr Name))
+lookupConCps lcon_rdr@(L _ con_rdr)
+  = CpsRn $ \k ->
+    do { con_name <- lookupLocatedOccRnConstr lcon_rdr
+       ; (r, fvs) <- k (fmap (WithUserRdr con_rdr) con_name)
+       ; return (r, addOneFV fvs (unLoc con_name)) }
     -- We add the constructor name to the free vars
     -- See Note [Patterns are uses]
 
@@ -447,13 +447,12 @@ rn_pats_general ctxt pats thing_inside = do
     --
     -- See Note [Don't report shadowing for pattern synonyms]
     let bndrs = collectPatsBinders CollVarTyVarBinders (toList pats')
-    addErrCtxt doc_pat $
+    addErrCtxt (MatchCtxt ctxt) $
       if isPatSynCtxt ctxt
          then checkDupNames bndrs
          else checkDupAndShadowedNames envs_before bndrs
     thing_inside pats'
   where
-    doc_pat = text "In" <+> pprMatchContext ctxt
 
     -- See Note [Invisible binders in functions] in GHC.Hs.Pat
     --
@@ -510,9 +509,9 @@ rnLArgPatAndThen :: NameMaker -> LocatedA (Pat GhcPs) -> CpsRn (LocatedA (Pat Gh
 rnLArgPatAndThen mk = wrapSrcSpanCps rnArgPatAndThen where
 
   rnArgPatAndThen (InvisPat (_, spec) tp) = do
-    liftCps $ unlessXOptM LangExt.TypeAbstractions $
-      addErr (TcRnIllegalInvisibleTypePattern tp)
     tp' <- rnHsTyPat HsTypePatCtx tp
+    liftCps $ unlessXOptM LangExt.TypeAbstractions $
+      addErr (TcRnIllegalInvisibleTypePattern tp' InvisPatWithoutFlag)
     pure (InvisPat spec tp')
   rnArgPatAndThen p = rnPatAndThen mk p
 
@@ -525,6 +524,9 @@ rnLPatsAndThen mk = traverse (rnLPatAndThen mk)
   -- variables that may be mentioned in subsequent patterns in the list
 {-# SPECIALISE rnLPatsAndThen :: NameMaker -> [LPat GhcPs] -> CpsRn [LPat GhcRn] #-}
 {-# SPECIALISE rnLPatsAndThen :: NameMaker -> NE.NonEmpty (LPat GhcPs) -> CpsRn (NE.NonEmpty (LPat GhcRn)) #-}
+
+rnLArgPatsAndThen :: NameMaker -> [LPat GhcPs] -> CpsRn [LPat GhcRn]
+rnLArgPatsAndThen mk = traverse (rnLArgPatAndThen mk)
 
 --------------------
 -- The workhorse
@@ -680,10 +682,10 @@ rnPatAndThen _ (EmbTyPat _ tp)
   = do { tp' <- rnHsTyPat HsTypePatCtx tp
        ; return (EmbTyPat noExtField tp') }
 rnPatAndThen _ (InvisPat (_, spec) tp)
-  = do { liftCps $ addErr (TcRnMisplacedInvisPat tp)
-         -- Invisible patterns are handled in `rnLArgPatAndThen`
+  = do { -- Invisible patterns are handled in `rnLArgPatAndThen`
          -- so unconditionally emit error here
        ; tp' <- rnHsTyPat HsTypePatCtx tp
+       ; liftCps $ addErr (TcRnIllegalInvisibleTypePattern tp' InvisPatMisplaced)
        ; return (InvisPat spec tp')
        }
 
@@ -693,39 +695,21 @@ rnConPatAndThen :: NameMaker
                 -> HsConPatDetails GhcPs
                 -> CpsRn (Pat GhcRn)
 
-rnConPatAndThen mk con (PrefixCon tyargs pats)
+rnConPatAndThen mk con (PrefixCon pats)
   = do  { con' <- lookupConCps con
-        ; liftCps check_lang_exts
-        ; tyargs' <- mapM rnConPatTyArg tyargs
-        ; pats' <- rnLPatsAndThen mk pats
+        ; pats' <- rnLArgPatsAndThen mk pats
         ; return $ ConPat
             { pat_con_ext = noExtField
             , pat_con = con'
-            , pat_args = PrefixCon tyargs' pats'
+            , pat_args = PrefixCon pats'
             }
         }
-  where
-    check_lang_exts :: RnM ()
-    check_lang_exts =
-      for_ (listToMaybe tyargs) $ \ arg ->
-        do { type_abs   <- xoptM LangExt.TypeAbstractions
-           ; type_app   <- xoptM LangExt.TypeApplications
-           ; scoped_tvs <- xoptM LangExt.ScopedTypeVariables
-           -- See Note [Deprecated type abstractions in constructor patterns]
-           ; if | type_abs -> return ()
-                | type_app && scoped_tvs -> addDiagnostic TcRnDeprecatedInvisTyArgInConPat
-                | otherwise -> addErrTc $ TcRnTypeApplicationsDisabled (TypeApplicationInPattern arg)
-           }
-
-    rnConPatTyArg (HsConPatTyArg _ t) = do
-      t' <- rnHsTyPat HsTypePatCtx t
-      return (HsConPatTyArg noExtField t')
 
 rnConPatAndThen mk con (InfixCon pat1 pat2)
   = do  { con' <- lookupConCps con
         ; pat1' <- rnLPatAndThen mk pat1
         ; pat2' <- rnLPatAndThen mk pat2
-        ; fixity <- liftCps $ lookupFixityRn (unLoc con')
+        ; fixity <- liftCps $ lookupFixityRn (getName con')
         ; liftCps $ mkConOpPatRn con' fixity pat1' pat2' }
 
 rnConPatAndThen mk con (RecCon rpats)
@@ -733,34 +717,10 @@ rnConPatAndThen mk con (RecCon rpats)
         ; rpats' <- rnHsRecPatsAndThen mk con' rpats
         ; return $ ConPat
             { pat_con_ext = noExtField
-            , pat_con = con'
-            , pat_args = RecCon rpats'
+            , pat_con     = con'
+            , pat_args    = RecCon rpats'
             }
         }
-
-{- Note [Deprecated type abstractions in constructor patterns]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Type abstractions in constructor patterns allow the user to bind
-existential type variables:
-
-    import Type.Reflection (Typeable, typeRep)
-    data Ex = forall e. (Typeable e, Show e) => MkEx e
-    showEx (MkEx @e a) = show a ++ " :: " ++ show (typeRep @e)
-
-Note the pattern `MkEx @e a`, and specifically the `@e` binder.
-
-For historical reasons, using this feature only required TypeApplications
-and ScopedTypeVariables to be enabled. As per GHC Proposal #448 (and especially
-its amendment #604) we are now transitioning towards guarding this feature
-behind TypeAbstractions instead.
-
-As a compatibility measure, we continue to support old programs that use
-TypeApplications with ScopedTypeVariables instead of TypeAbstractions,
-but emit the appropriate compatibility warning, -Wdeprecated-type-abstractions.
-This warning is scheduled to become an error in GHC 9.14, at which point
-we can simply require TypeAbstractions.
--}
-
 checkUnusedRecordWildcardCps :: SrcSpan
                              -> Maybe [ImplicitFieldBinders]
                              -> CpsRn ()
@@ -772,7 +732,7 @@ checkUnusedRecordWildcardCps loc dotdot_names =
 
 --------------------
 rnHsRecPatsAndThen :: NameMaker
-                   -> LocatedN Name      -- Constructor
+                   -> LocatedN (WithUserRdr Name) -- constructor
                    -> HsRecFields GhcPs (LPat GhcPs)
                    -> CpsRn (HsRecFields GhcRn (LPat GhcRn))
 rnHsRecPatsAndThen mk (L _ con)
@@ -827,8 +787,8 @@ mkExpandedPat a b = XPat (HsPatExpanded a b)
 -}
 
 data HsRecFieldContext
-  = HsRecFieldCon Name
-  | HsRecFieldPat Name
+  = HsRecFieldCon (WithUserRdr Name)
+  | HsRecFieldPat (WithUserRdr Name)
   | HsRecFieldUpd
 
 rnHsRecFields
@@ -863,7 +823,9 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
                 HsRecFieldPat con  -> Just con
                 HsRecFieldUpd      -> Nothing
 
-    rn_fld :: Bool -> Maybe Name -> LHsRecField GhcPs (LocatedA arg)
+    rn_fld :: Bool
+           -> Maybe (WithUserRdr Name)
+           -> LHsRecField GhcPs (LocatedA arg)
            -> RnM (LHsRecField GhcRn (LocatedA arg))
     rn_fld pun_ok parent (L l
                            (HsFieldBind
@@ -887,11 +849,11 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
                  , hfbPun = pun } }
 
     rn_dotdot :: Maybe (LocatedE RecFieldsDotDot)     -- See Note [DotDot fields] in GHC.Hs.Pat
-              -> Maybe Name -- The constructor (Nothing for an
-                                --    out of scope constructor)
+              -> Maybe (WithUserRdr Name)
+                  -- The constructor (Nothing for an out of scope constructor)
               -> [LHsRecField GhcRn (LocatedA arg)] -- Explicit fields
               -> RnM [LHsRecField GhcRn (LocatedA arg)]   -- Field Labels we need to fill in
-    rn_dotdot (Just (L loc_e (RecFieldsDotDot n))) (Just con) flds -- ".." on record construction / pat match
+    rn_dotdot (Just (L loc_e (RecFieldsDotDot n))) (Just qcon@(WithUserRdr _ con)) flds -- ".." on record construction / pat match
       | not (isUnboundName con) -- This test is because if the constructor
                                 -- isn't in scope the constructor lookup will add
                                 -- an error but still return an unbound name. We
@@ -900,7 +862,7 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
         do { dd_flag <- xoptM LangExt.RecordWildCards
            ; checkErr dd_flag (needFlagDotDot ctxt)
            ; (rdr_env, lcl_env) <- getRdrEnvs
-           ; conInfo <- lookupConstructorInfo con
+           ; conInfo <- lookupConstructorInfo qcon
            ; when (conFieldInfo conInfo == ConHasPositionalArgs) (addErr (TcRnIllegalWildcardsInConstructor con))
            ; let present_flds = mkOccSet $ map rdrNameOcc (getFieldRdrs flds)
 
@@ -1027,7 +989,7 @@ rnHsRecUpdFields flds
                                  checkErr pun_ok (TcRnIllegalFieldPunning (L (locA loc) lbl))
                                  -- Discard any module qualifier (#11662)
                                ; let arg_rdr = mkRdrUnqual (rdrNameOcc lbl)
-                               ; return (L (l2l loc) (HsVar noExtField (L (l2l loc) arg_rdr))) }
+                               ; return (L (l2l loc) (mkHsVarWithUserRdr lbl (L (l2l loc) arg_rdr))) }
                        else return arg
              ; (arg'', fvs) <- rnLExpr arg'
              ; let lbl' :: FieldOcc GhcRn
@@ -1064,8 +1026,8 @@ dupFieldErr :: HsRecFieldContext -> NE.NonEmpty RdrName -> TcRnMessage
 dupFieldErr ctxt = TcRnDuplicateFieldName (toRecordFieldPart ctxt)
 
 toRecordFieldPart :: HsRecFieldContext -> RecordFieldPart
-toRecordFieldPart (HsRecFieldCon n)  = RecordFieldConstructor n
-toRecordFieldPart (HsRecFieldPat n)  = RecordFieldPattern     n
+toRecordFieldPart (HsRecFieldCon n)  = RecordFieldConstructor (getName n)
+toRecordFieldPart (HsRecFieldPat n)  = RecordFieldPattern     (getName n)
 toRecordFieldPart (HsRecFieldUpd {}) = RecordFieldUpdate
 
 {- Note [Disambiguating record updates]
@@ -1085,25 +1047,90 @@ In a record update, the `lookupRecUpdFields` function tries to determine
 the parent datatype by computing the parents (TyCon/PatSyn) which have
 at least one constructor (DataCon/PatSyn) with all of the fields.
 
-For example, in the (non-overloaded) record update
+To do this, given the (non-empty) set of fields in the record update,
+lookupRecUpdFields proceeds as follows:
 
-    r { fld1 = 3, fld2 = 'x' }
+  (1) For each field, retrieve all the in-scope GREs that it could possibly
+      refer to.
 
-only the TyCon R contains at least one DataCon which has both of the fields
-being updated: in this case, MkR1 and MkR2 have both of the updated fields.
-The TyCon S also has both fields fld1 and fld2, but no single constructor
-has both of those fields, so S is not a valid parent for this record update.
+  (2) Take an intersection to compute the possible parent data constructors.
+      For example, for an update
 
-Note that this check is namespace-aware, so that a record update such as
+        r { fld1 = 3, fld2 = 'x' }
+
+      the possible parents for each field are:
+
+        fld1: [MkR1 |-> R.fld1, MkR2 |-> R.fld1, MkS1 |> S.fld1]
+        fld2: [MkR1 |-> R.fld2, MkR2 |-> R.fld2, MkS2 |> S.fld2]
+
+      after intersecting by constructor, we get:
+
+        fld1: [MkR1 |-> R.fld1, MkR2 |-> R.fld1]
+        fld2: [MkR1 |-> R.fld2, MkR2 |-> R.fld2]
+
+      This reflects the fact that only the TyCon R contains at least one DataCon
+      which has both of the fields being updated: MkR1 and MkR2.
+      The TyCon S also has both fields fld1 and fld2, but no single constructor
+      has both of those fields, so S is not a valid parent for this record update.
+
+  (3)
+    (a)
+      If there is at least one possible parent TyCon, succeed. The typechecker
+      might still be able to disambiguate if there remains more than one
+      candidate parent TyCon (see Note [Type-directed record disambiguation]).
+    (b)
+      Otherwise, report an error saying "No constructor has all these fields".
+      This is the job of GHC.Rename.Env.badFieldsUpd. This function tries
+      to report a minimal set of fields, so that in a record update like
+
+        r { fld1 = x1, fld2 = x2, [...], fld99 = x99 }
+
+      we don't report a massive error message saying "No constructor has all
+      the fields fld1, ..., fld99" and instead report e.g. "No constructor
+      has all the fields { fld3, fld17 }".
+
+Wrinkle [Qualified names in record updates]
+
+  Note that we must take into account qualified names in (1), so that a record
+  update such as
 
     import qualified M ( R (fld1, fld2) )
     f r = r { M.fld1 = 3 }
 
-is unambiguous, as only R contains the field fld1 in the M namespace.
-(See however #22122 for issues relating to the usage of exact Names in
-record fields.)
+  is unambiguous: only R contains the field fld1 with the M qualifier.
 
-See also Note [Type-directed record disambiguation] in GHC.Tc.Gen.Expr.
+  The function that looks up the GREs for the record update is 'lookupFieldGREs',
+  which uses 'lookupGRE env (LookupRdrName ...)', ensuring that we correctly
+  filter the GREs with the correct module qualification (with 'pickGREs').
+
+  (See however #22122 for issues relating to the usage of exact Names in
+  record fields.)
+
+Wrinkle [Out of scope constructors]
+
+  For (3)(b), we have an invalid record update because no constructor has
+  all of the fields of the record update. The 'badFieldsUpd' then tries to
+  compute a minimal set of fields which are not children of any single
+  constructor. The way this is done is explained in
+  Note [Finding the conflicting fields] in GHC.Rename.Env, but in short that
+  function needs a mapping from ConLike to all of its fields to do its business.
+  (You may remark that we did not need such a mapping for step (2).)
+
+  This means we need to look up each constructor and find its fields; this
+  information is stored in the GREInfo field of a constructor GRE.
+  We need this information even if the constructor itself is not in scope, so
+  we proceed as follows:
+
+    1. First look up the constructor in the GlobalRdrEnv, using lookupGRE_Name.
+       This handles constructors defined in the current module being renamed,
+       as well as in-scope imported constructors.
+    2. If that fails (e.g. the field is imported but the constructor is not),
+       then look up the GREInfo of the constructor in the TypeEnv, using
+       lookupGREInfo. This makes sure we give the right error message even when
+       the constructors are not in scope (#26391).
+
+    Note that we do need (1), as (2) does not handle constructors defined in the
+    current module being renamed (as those have not yet been added to the TypeEnv).
 
 Note [Using PatSyn FreeVars]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1266,7 +1293,7 @@ rn_lty_pat (L l hs_ty) = do
   hs_ty' <- rn_ty_pat hs_ty
   pure (L l hs_ty')
 
-rn_ty_pat_var :: LocatedN RdrName -> TPRnM (LocatedN Name)
+rn_ty_pat_var :: LocatedN RdrName -> TPRnM (LocatedN (WithUserRdr Name))
 rn_ty_pat_var lrdr@(L l rdr) = do
   locals <- askLocals
   if isRdrTyVar rdr
@@ -1275,11 +1302,11 @@ rn_ty_pat_var lrdr@(L l rdr) = do
     then do -- binder
       name <- liftTPRnCps $ newPatName (LamMk True) lrdr
       tellTPB (tpBuilderExplicitTV name)
-      pure (L l name)
+      pure (L l $ WithUserRdr rdr name)
 
     else do -- usage
       name <- lookupTypeOccTPRnM rdr
-      pure (L l name)
+      pure (L l $ WithUserRdr rdr name)
 
 -- | Rename type patterns
 --
@@ -1287,13 +1314,13 @@ rn_ty_pat_var lrdr@(L l rdr) = do
 -- and Note [Implicit and explicit type variable binders]
 rn_ty_pat :: HsType GhcPs -> TPRnM (HsType GhcRn)
 rn_ty_pat tv@(HsTyVar an prom lrdr) = do
-  lname@(L _ name) <- rn_ty_pat_var lrdr
+  L l (WithUserRdr _ name) <- rn_ty_pat_var lrdr
   when (isDataConName name && not (isKindName name)) $
     -- Any use of a promoted data constructor name (that is not specifically
     -- exempted by isKindName) is illegal without the use of DataKinds.
     -- See Note [Checking for DataKinds] in GHC.Tc.Validity.
     check_data_kinds tv
-  pure (HsTyVar an prom lname)
+  pure (HsTyVar an prom (L l $ WithUserRdr (unLoc lrdr) name))
 
 rn_ty_pat (HsForAllTy an tele body) = liftTPRnRaw $ \ctxt locals thing_inside ->
   bindHsForAllTelescope ctxt tele $ \tele' -> do
@@ -1324,7 +1351,7 @@ rn_ty_pat (HsAppKindTy _ ty ki) = do
 
 rn_ty_pat (HsFunTy an mult lhs rhs) = do
   lhs' <- rn_lty_pat lhs
-  mult' <- rn_ty_pat_arrow mult
+  mult' <- rn_ty_pat_mult mult
   rhs' <- rn_lty_pat rhs
   pure (HsFunTy an mult' lhs' rhs')
 
@@ -1344,8 +1371,8 @@ rn_ty_pat (HsOpTy _ prom ty1 l_op ty2) = do
   ty1' <- rn_lty_pat ty1
   l_op' <- rn_ty_pat_var l_op
   ty2' <- rn_lty_pat ty2
-  fix  <- liftRn $ lookupTyFixityRn l_op'
-  let op_name = unLoc l_op'
+  fix  <- liftRn $ lookupTyFixityRn $ fmap getName l_op'
+  let op_name = getName l_op'
   when (isDataConName op_name && not (isPromoted prom)) $
     liftRn $ addDiagnostic (TcRnUntickedPromotedThing $ UntickedConstructor Infix op_name)
   liftRn $ mkHsOpTyRn prom l_op' fix ty1' ty2'
@@ -1412,29 +1439,14 @@ rn_ty_pat (HsSpliceTy _ splice) = do
       | hsTypeNeedsParens maxPrec hs_ty = L loc (HsParTy noAnn lhs_ty)
       | otherwise                       = lhs_ty
 
-rn_ty_pat (HsBangTy an bang_src lty) = do
-  ctxt <- askDocContext
-  lty'@(L _ ty') <- rn_lty_pat lty
-  liftRn $ addErr $
-    TcRnWithHsDocContext ctxt $
-    TcRnUnexpectedAnnotation ty' bang_src
-  pure (HsBangTy an bang_src lty')
-
-rn_ty_pat ty@HsRecTy{} = do
-  ctxt <- askDocContext
-  liftRn $ addErr $
-    TcRnWithHsDocContext ctxt $
-    TcRnIllegalRecordSyntax (Left ty)
-  pure (HsWildCardTy noExtField) -- trick to avoid `failWithTc`
-
 rn_ty_pat ty@(XHsType{}) = do
   ctxt <- askDocContext
   liftRnFV $ rnHsType ctxt ty
 
-rn_ty_pat_arrow :: HsArrow GhcPs -> TPRnM (HsArrow GhcRn)
-rn_ty_pat_arrow (HsUnrestrictedArrow _) = pure (HsUnrestrictedArrow noExtField)
-rn_ty_pat_arrow (HsLinearArrow _) = pure (HsLinearArrow noExtField)
-rn_ty_pat_arrow (HsExplicitMult _ p)
+rn_ty_pat_mult :: HsMultAnn GhcPs -> TPRnM (HsMultAnn GhcRn)
+rn_ty_pat_mult (HsUnannotated _) = pure (HsUnannotated noExtField)
+rn_ty_pat_mult (HsLinearAnn _) = pure (HsLinearAnn noExtField)
+rn_ty_pat_mult (HsExplicitMult _ p)
   = rn_lty_pat p <&> (\mult -> HsExplicitMult noExtField mult)
 
 check_data_kinds :: HsType GhcPs -> TPRnM ()
@@ -1541,7 +1553,7 @@ with lambdas:
 
 
 So we have at least three options where we could do free variable extraction:
-HsConPatTyArg, ConPat, or a Match (used to represent a function LHS). And none
+HsTyPat, ConPat, or a Match (used to represent a function LHS). And none
 of those would be general enough. Rather than make an arbitrary choice, we
 embrace left-to-right scoping in types and implement it with CPS, just like
 it's done for view patterns in terms.

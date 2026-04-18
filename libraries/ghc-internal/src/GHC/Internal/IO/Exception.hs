@@ -187,7 +187,8 @@ instance Show SomeAsyncException where
     showsPrec p (SomeAsyncException e) = showsPrec p e
 
 -- | @since base-4.7.0.0
-instance Exception SomeAsyncException
+instance Exception SomeAsyncException where
+    displayException (SomeAsyncException e) = displayException e
 
 -- | @since base-4.7.0.0
 asyncExceptionToException :: Exception e => e -> SomeException
@@ -438,6 +439,7 @@ instance Show IOException where
          _  -> showString " (" . showString s . showString ")")
 
 assertError :: (?callStack :: CallStack) => Bool -> a -> a
+-- See Note [Overview of assertions] in GHC.Tc.Gen.Head
 assertError predicate v
   | predicate = v
   | otherwise = lazy $ unsafeDupablePerformIO $ do -- lazy: See Note [Strictness of assertError]

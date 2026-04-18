@@ -110,7 +110,6 @@ parseIOManagerFlag(const char *iomgrstr, IO_MANAGER_FLAG *flag)
 #else
         return IOManagerUnavailable;
 #endif
-        *flag = IO_MNGR_FLAG_MIO;
     }
     else if (strcmp("winio", iomgrstr) == 0) {
 #if defined(IOMGR_ENABLED_WINIO)
@@ -234,7 +233,6 @@ void selectIOManager(void)
 #if defined(IOMGR_ENABLED_WINIO)
         case IO_MNGR_FLAG_WINIO:
             iomgr_type = IO_MANAGER_WINIO;
-            rts_IOManagerIsWin32Native = true;
             break;
 #endif
 
@@ -247,6 +245,10 @@ void selectIOManager(void)
         default:
           barf("selectIOManager: %d", RtsFlags.MiscFlags.ioManager);
     }
+
+#if defined(mingw32_HOST_OS)
+    rts_IOManagerIsWin32Native = iomgr_type == IO_MANAGER_WINIO;
+#endif
 }
 
 

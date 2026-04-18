@@ -26,7 +26,8 @@ fakeSettings =
       sToolSettings = ToolSettings {},
       sTargetPlatform =
         genericPlatform,
-      sPlatformMisc = PlatformMisc {}
+      sPlatformMisc = PlatformMisc {},
+      sUnitSettings = UnitSettings { unitSettings_baseUnitId = stringToUnitId "base" }
     }
 
 fakeDynFlags :: DynFlags

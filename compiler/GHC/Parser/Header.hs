@@ -31,7 +31,6 @@ import GHC.Parser           ( parseHeader )
 import GHC.Parser.Lexer
 
 import GHC.Hs
-import GHC.Unit.Module
 import GHC.Builtin.Names
 
 import GHC.Types.Error
@@ -39,6 +38,7 @@ import GHC.Types.SrcLoc
 import GHC.Types.SourceError
 import GHC.Types.SourceText
 import GHC.Types.PkgQual
+import GHC.Types.Basic (ImportLevel(..), convImportLevel)
 
 import GHC.Utils.Misc
 import GHC.Utils.Panic
@@ -74,9 +74,8 @@ getImports :: ParserOpts   -- ^ Parser options
                            --   in the function result)
            -> IO (Either
                (Messages PsMessage)
-               ([(RawPkgQual, Located ModuleName)],
-                [(RawPkgQual, Located ModuleName)],
-                Bool, -- Is GHC.Prim imported or not
+               ([Located ModuleName],
+                [(ImportLevel, RawPkgQual, Located ModuleName)],
                 Located ModuleName))
               -- ^ The source imports and normal imports (with optional package
               -- names from -XPackageImports), and the module name.
@@ -101,21 +100,16 @@ getImports popts implicit_prelude buf filename source_filename = do
                 mod = mb_mod `orElse` L (noAnnSrcSpan main_loc) mAIN_NAME
                 (src_idecls, ord_idecls) = partition ((== IsBoot) . ideclSource . unLoc) imps
 
-               -- GHC.Prim doesn't exist physically, so don't go looking for it.
-                (ordinary_imps, ghc_prim_import)
-                  = partition ((/= moduleName gHC_PRIM) . unLoc
-                                  . ideclName . unLoc)
-                                 ord_idecls
-
                 implicit_imports = mkPrelImports (unLoc mod) main_loc
                                                  implicit_prelude imps
-                convImport (L _ (i::ImportDecl GhcPs))
-                  = (ideclPkgQual i, reLoc $ ideclName i)
+                convImport (L _ (i :: ImportDecl GhcPs)) = (convImportLevel (ideclLevelSpec i), ideclPkgQual i, reLoc $ ideclName i)
+                convImport_src (L _ (i :: ImportDecl GhcPs)) = (reLoc $ ideclName i)
               in
-              return (map convImport src_idecls
-                     , map convImport (implicit_imports ++ ordinary_imps)
-                     , not (null ghc_prim_import)
+              return (map convImport_src src_idecls
+                     , map convImport (implicit_imports ++ ord_idecls)
                      , reLoc mod)
+
+
 
 mkPrelImports :: ModuleName
               -> SrcSpan    -- Attribute the "import Prelude" to this location
@@ -142,6 +136,10 @@ mkPrelImports this_mod loc implicit_prelude import_decls
         && case ideclPkgQual decl of
             NoRawPkgQual -> True
             RawPkgQual {} -> False
+        -- Only a "normal" level import will override the implicit prelude import.
+        && case ideclLevelSpec decl of
+              NotLevelled -> True
+              _ -> False
 
 
       loc' = noAnnSrcSpan loc
@@ -158,6 +156,7 @@ mkPrelImports this_mod loc implicit_prelude import_decls
                                 ideclSafe      = False,  -- Not a safe import
                                 ideclQualified = NotQualified,
                                 ideclAs        = Nothing,
+                                ideclLevelSpec = NotLevelled,
                                 ideclImportList = Nothing  }
 
 --------------------------------------------------------------
@@ -168,14 +167,15 @@ mkPrelImports this_mod loc implicit_prelude import_decls
 --
 -- Throws a 'SourceError' if flag parsing fails (including unsupported flags.)
 getOptionsFromFile :: ParserOpts
+                   -> [String] -- ^ Supported LANGUAGE pragmas
                    -> FilePath            -- ^ Input file
                    -> IO (Messages PsMessage, [Located String]) -- ^ Parsed options, if any.
-getOptionsFromFile opts filename
+getOptionsFromFile opts supported filename
     = Exception.bracket
               (openBinaryFile filename ReadMode)
               (hClose)
               (\handle -> do
-                  (warns, opts) <- fmap (getOptions' opts)
+                  (warns, opts) <- fmap (getOptions' opts supported)
                                (lazyGetToks opts' filename handle)
                   seqList opts
                     $ seqList (bagToList $ getMessages warns)
@@ -249,20 +249,22 @@ getToks popts filename buf = lexAll pstate
 --
 -- Throws a 'SourceError' if flag parsing fails (including unsupported flags.)
 getOptions :: ParserOpts
+           -> [String] -- ^ Supported LANGUAGE pragmas
            -> StringBuffer -- ^ Input Buffer
            -> FilePath     -- ^ Source filename.  Used for location info.
            -> (Messages PsMessage,[Located String]) -- ^ warnings and parsed options.
-getOptions opts buf filename
-    = getOptions' opts (getToks opts filename buf)
+getOptions opts supported buf filename
+    = getOptions' opts supported (getToks opts filename buf)
 
 -- The token parser is written manually because Happy can't
 -- return a partial result when it encounters a lexer error.
 -- We want to extract options before the buffer is passed through
 -- CPP, so we can't use the same trick as 'getImports'.
 getOptions' :: ParserOpts
+            -> [String]
             -> [Located Token]      -- Input buffer
             -> (Messages PsMessage,[Located String])     -- Options.
-getOptions' opts toks
+getOptions' opts supported toks
     = parseToks toks
     where
           parseToks (open:close:xs)
@@ -274,7 +276,7 @@ getOptions' opts toks
                   Right args -> fmap (args ++) (parseToks xs)
             where
               src_span      = getLoc open
-              real_src_span = expectJust "getOptions'" (srcSpanToRealSrcSpan src_span)
+              real_src_span = expectJust (srcSpanToRealSrcSpan src_span)
               starting_loc  = realSrcSpanStart real_src_span
           parseToks (open:close:xs)
               | ITinclude_prag str <- unLoc open
@@ -296,7 +298,7 @@ getOptions' opts toks
           parseToks xs = (unionManyMessages $ mapMaybe mkMessage xs ,[])
 
           parseLanguage ((L loc (ITconid fs)):rest)
-              = fmap (checkExtension opts (L loc fs) :) $
+              = fmap (checkExtension supported (L loc fs) :) $
                 case rest of
                   (L _loc ITcomma):more -> parseLanguage more
                   (L _loc ITclose_prag):more -> parseToks more
@@ -446,13 +448,13 @@ checkProcessArgsResult flags
 
 -----------------------------------------------------------------------------
 
-checkExtension :: ParserOpts -> Located FastString -> Located String
-checkExtension opts (L l ext)
+checkExtension :: [String] -> Located FastString -> Located String
+checkExtension supported (L l ext)
 -- Checks if a given extension is valid, and if so returns
 -- its corresponding flag. Otherwise it throws an exception.
-  = if ext' `elem` (pSupportedExts opts)
+  = if ext' `elem` supported
     then L l ("-X"++ext')
-    else unsupportedExtnError opts l ext'
+    else unsupportedExtnError supported l ext'
   where
     ext' = unpackFS ext
 
@@ -460,9 +462,9 @@ languagePragParseError :: SrcSpan -> a
 languagePragParseError loc =
     throwErr loc $ PsErrParseLanguagePragma
 
-unsupportedExtnError :: ParserOpts -> SrcSpan -> String -> a
-unsupportedExtnError opts loc unsup =
-    throwErr loc $ PsErrUnsupportedExt unsup (pSupportedExts opts)
+unsupportedExtnError :: [String] -> SrcSpan -> String -> a
+unsupportedExtnError supported loc unsup =
+    throwErr loc $ PsErrUnsupportedExt unsup supported
 
 optionsParseError :: String -> SrcSpan -> a     -- #15053
 optionsParseError str loc =

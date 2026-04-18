@@ -21,6 +21,7 @@ import sys
 
 from collections import namedtuple, defaultdict
 from math import ceil, trunc
+import math
 
 from testutil import passed, failBecause, testing_metrics, print_table
 from term_color import Color, colored
@@ -140,7 +141,7 @@ class MetricAcceptanceWindow:
 
 class AlwaysAccept(MetricAcceptanceWindow):
     def get_bounds(self, baseline: float) -> Tuple[float, float]:
-        return (-1/0, +1/0)
+        return (-math.inf, +math.inf)
 
     def describe(self) -> str:
         raise NotImplemented
@@ -161,7 +162,7 @@ class RelativeMetricAcceptanceWindow(MetricAcceptanceWindow):
         return (lowerBound, upperBound)
 
     def describe(self) -> str:
-        return '+/- %1.1f%%' % (100*self.__tol)
+        return '+/- %1.1f%%' % (self.__tol)
 
 def parse_perf_stat(stat_str: str) -> PerfStat:
     field_vals = stat_str.strip('\t').split('\t')

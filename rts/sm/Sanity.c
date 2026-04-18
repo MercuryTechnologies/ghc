@@ -128,6 +128,7 @@ checkStackFrame( StgPtr c )
     case UNDERFLOW_FRAME:
     case STOP_FRAME:
     case RET_SMALL:
+    case ANN_FRAME:
         size = BITMAP_SIZE(info->i.layout.bitmap);
         checkSmallBitmap((StgPtr)c + 1,
                          BITMAP_BITS(info->i.layout.bitmap), size);
@@ -990,7 +991,6 @@ static void checkGeneration (generation *gen,
 #endif
 
     if (isNonmovingGen(gen)) {
-        ASSERT(countNonMovingSegments(nonmovingHeap.free) == (W_) nonmovingHeap.n_free * NONMOVING_SEGMENT_BLOCKS);
         ASSERT(countBlocks(nonmoving_large_objects) == n_nonmoving_large_blocks);
         ASSERT(countBlocks(nonmoving_marked_large_objects) == n_nonmoving_marked_large_blocks);
 

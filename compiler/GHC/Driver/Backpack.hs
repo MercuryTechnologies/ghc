@@ -24,7 +24,7 @@ import GHC.Driver.Backend
 -- In a separate module because it hooks into the parser.
 import GHC.Driver.Backpack.Syntax
 import GHC.Driver.Config.Finder (initFinderOpts)
-import GHC.Driver.Config.Parser (initParserOpts)
+import GHC.Driver.Config.Parser
 import GHC.Driver.Config.Diagnostic
 import GHC.Driver.Monad
 import GHC.Driver.Session
@@ -45,14 +45,13 @@ import GHC.Rename.Names
 import GHC hiding (Failed, Succeeded)
 import GHC.Tc.Utils.Monad
 import GHC.Iface.Recomp
-import GHC.Builtin.Names
 
 import GHC.Types.SrcLoc
 import GHC.Types.SourceError
 import GHC.Types.SourceFile
 import GHC.Types.Unique.FM
-import GHC.Types.Unique.DFM
 import GHC.Types.Unique.DSet
+import GHC.Types.Basic (convImportLevel)
 
 import GHC.Utils.Outputable
 import GHC.Utils.Fingerprint
@@ -67,7 +66,6 @@ import GHC.Unit.External
 import GHC.Unit.Finder
 import GHC.Unit.Module.Graph
 import GHC.Unit.Module.ModSummary
-import GHC.Unit.Home.ModInfo
 
 import GHC.Linker.Types
 
@@ -92,6 +90,9 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import GHC.Types.Error (mkUnknownDiagnostic)
+import qualified GHC.Unit.Home.Graph as HUG
+import GHC.Unit.Home.ModInfo
+import GHC.Unit.Home.PackageTable
 
 -- | Entry point to compile a Backpack file.
 doBackpack :: [FilePath] -> Ghc ()
@@ -100,8 +101,9 @@ doBackpack [src_filename] = do
     dflags0 <- getDynFlags
     let dflags1 = dflags0
     let parser_opts1 = initParserOpts dflags1
-    (p_warns, src_opts) <- liftIO $ getOptionsFromFile parser_opts1 src_filename
-    (dflags, unhandled_flags, warns) <- liftIO $ parseDynamicFilePragma dflags1 src_opts
+    logger0 <- getLogger
+    (p_warns, src_opts) <- liftIO $ getOptionsFromFile parser_opts1 (supportedLanguagePragmas dflags1) src_filename
+    (dflags, unhandled_flags, warns) <- liftIO $ parseDynamicFilePragma logger0 dflags1 src_opts
     modifySession (hscSetFlags dflags)
     logger <- getLogger -- Get the logger after having set the session flags,
                         -- so that logger options are correctly set.
@@ -334,7 +336,7 @@ buildUnit session cid insts lunit = do
         ok <- load' noIfaceCache LoadAllTargets mkUnknownDiagnostic (Just msg) mod_graph
         when (failed ok) (liftIO $ exitWith (ExitFailure 1))
 
-        let hi_dir = expectJust (panic "hiDir Backpack") $ hiDir dflags
+        let hi_dir = expectJust $ hiDir dflags
             export_mod ms = (ms_mod_name ms, ms_mod ms)
             -- Export everything!
             mods = [ export_mod ms | ms <- mgModSummaries mod_graph
@@ -342,14 +344,17 @@ buildUnit session cid insts lunit = do
 
         -- Compile relevant only
         hsc_env <- getSession
-        let home_mod_infos = eltsUDFM (hsc_HPT hsc_env)
-            linkables = map (expectJust "bkp link" . homeModInfoObject)
-                      . filter ((==HsSrcFile) . mi_hsc_src . hm_iface)
-                      $ home_mod_infos
+        let takeLinkables x
+              | mi_hsc_src (hm_iface x) == HsSrcFile
+              = [Just $ expectJust $ homeModInfoObject x]
+              | otherwise
+              = [Nothing]
+        linkables <- liftIO $ catMaybes <$> concatHpt takeLinkables (hsc_HPT hsc_env)
+        let
             obj_files = concatMap linkableFiles linkables
             state     = hsc_units hsc_env
 
-        let compat_fs = unitIdFS cid
+            compat_fs = unitIdFS cid
             compat_pn = PackageName compat_fs
             unit_id   = homeUnitId (hsc_home_unit hsc_env)
 
@@ -442,16 +447,17 @@ addUnit u = do
     -- update platform constants
     dflags <- liftIO $ updatePlatformConstants dflags0 mconstants
 
-    let unit_env = ue_setUnits unit_state $ ue_setUnitDbs (Just dbs) $ UnitEnv
+    let unit_env = UnitEnv
           { ue_platform  = targetPlatform dflags
           , ue_namever   = ghcNameVersion dflags
           , ue_current_unit = homeUnitId home_unit
 
           , ue_home_unit_graph =
-                unitEnv_singleton
+                HUG.unitEnv_singleton
                     (homeUnitId home_unit)
-                    (mkHomeUnitEnv dflags (ue_hpt old_unit_env) (Just home_unit))
+                    (HUG.mkHomeUnitEnv unit_state (Just dbs) dflags (ue_hpt old_unit_env) (Just home_unit))
           , ue_eps       = ue_eps old_unit_env
+          , ue_module_graph = ue_module_graph old_unit_env
           }
     setSession $ hscSetFlags dflags $ hsc_env { hsc_unit_env = unit_env }
 
@@ -580,7 +586,7 @@ mkBackpackMsg = do
             NeedsRecompile reason0 -> showMsg (text "Instantiating ") $ case reason0 of
               MustCompile -> empty
               RecompBecause reason -> text " [" <> pprWithUnitState state (ppr reason) <> text "]"
-        ModuleNode _ _ ->
+        ModuleNode {} ->
           case recomp of
             UpToDate
               | verbosity (hsc_dflags hsc_env) >= 2 -> showMsg (text "Skipping  ") empty
@@ -589,6 +595,7 @@ mkBackpackMsg = do
               MustCompile -> empty
               RecompBecause reason -> text " [" <> pprWithUnitState state (ppr reason) <> text "]"
         LinkNode _ _ -> showMsg (text "Linking ")  empty
+        UnitNode {} -> showMsg (text "Package ") empty
 
 -- | 'PprStyle' for Backpack messages; here we usually want the module to
 -- be qualified (so we can tell how it was instantiated.) But we try not
@@ -741,16 +748,19 @@ hsunitModuleGraph do_link unit = do
     --  create an "empty" hsig file to induce compilation for the
     --  requirement.
     let hsig_set = Set.fromList
-          [ ms_mod_name ms
+          [ moduleNodeInfoModuleName ms
           | ModuleNode _ ms <- nodes
-          , ms_hsc_src ms == HsigFile
+          , moduleNodeInfoHscSource ms == Just HsigFile
           ]
     req_nodes <- fmap catMaybes . forM (homeUnitInstantiations home_unit) $ \(mod_name, _) ->
         if Set.member mod_name hsig_set
             then return Nothing
             else fmap Just $ summariseRequirement pn mod_name
-
-    let graph_nodes = nodes ++ req_nodes ++ (instantiationNodes (homeUnitId $ hsc_home_unit hsc_env) (hsc_units hsc_env))
+    let inodes = instantiationNodes (homeUnitId $ hsc_home_unit hsc_env) (hsc_units hsc_env)
+    -- TODO: Backpack mode does not properly support ExternalPackage nodes yet
+    -- Module nodes do not get given package dependencies (see hsModuleToModSummary).
+    let pkg_nodes =  ordNub $ map (\(_, iud) -> UnitNode [] (instUnitInstanceOf iud)) inodes
+    let graph_nodes = nodes ++ req_nodes ++ (map (uncurry InstantiationNode) $ inodes) ++ pkg_nodes
         key_nodes = map mkNodeKey graph_nodes
         all_nodes = graph_nodes ++ [LinkNode key_nodes (homeUnitId $ hsc_home_unit hsc_env) | do_link]
     -- This error message is not very good but .bkp mode is just for testing so
@@ -781,7 +791,7 @@ summariseRequirement pn mod_name = do
     let loc = srcLocSpan (mkSrcLoc (mkFastString (bkp_filename env)) 1 1)
 
     let fc = hsc_FC hsc_env
-    mod <- liftIO $ addHomeModuleToFinder fc home_unit (notBoot mod_name) location
+    mod <- liftIO $ addHomeModuleToFinder fc home_unit mod_name location HsigFile
 
     extra_sig_imports <- liftIO $ findExtraSigImports hsc_env HsigFile mod_name
 
@@ -795,8 +805,7 @@ summariseRequirement pn mod_name = do
         ms_iface_date = hi_timestamp,
         ms_hie_date = hie_timestamp,
         ms_srcimps = [],
-        ms_textual_imps = ((,) NoPkgQual . noLoc) <$> extra_sig_imports,
-        ms_ghc_prim_import = False,
+        ms_textual_imps = ((,,) NormalLevel NoPkgQual . noLoc) <$> extra_sig_imports,
         ms_parsed_mod = Just (HsParsedModule {
                 hpm_module = L loc (HsModule {
                         hsmodExt = XModulePs {
@@ -816,8 +825,8 @@ summariseRequirement pn mod_name = do
         ms_hspp_opts = dflags,
         ms_hspp_buf = Nothing
         }
-    let nodes = [NodeKey_Module (ModNodeKeyWithUid (GWIB mn NotBoot) (homeUnitId home_unit)) | mn <- extra_sig_imports ]
-    return (ModuleNode nodes ms)
+    let nodes = [mkModuleEdge NormalLevel (NodeKey_Module (ModNodeKeyWithUid (GWIB mn NotBoot) (homeUnitId home_unit))) | mn <- extra_sig_imports ]
+    return (ModuleNode nodes (ModuleNodeCompile ms))
 
 summariseDecl :: PackageName
               -> HscSource
@@ -854,17 +863,14 @@ hsModuleToModSummary home_keys pn hsc_src modname
     -- To add insult to injury, we don't even actually use
     -- these filenames to figure out where the hi files go.
     -- A travesty!
-    let location0 = mkHomeModLocation2 fopts modname
+    let location = mkHomeModLocation fopts modname
                              (unsafeEncodeUtf $ unpackFS unit_fs </>
                               moduleNameSlashes modname)
-                              (case hsc_src of
+                             (case hsc_src of
                                 HsigFile   -> os "hsig"
                                 HsBootFile -> os "hs-boot"
                                 HsSrcFile  -> os "hs")
-    -- DANGEROUS: bootifying can POISON the module finder cache
-    let location = case hsc_src of
-                        HsBootFile -> addBootSuffixLocnOut location0
-                        _ -> location0
+                             hsc_src
     -- This duplicates a pile of logic in GHC.Driver.Make
     hi_timestamp <- liftIO $ modificationTimeIfExists (ml_hi_file location)
     hie_timestamp <- liftIO $ modificationTimeIfExists (ml_hie_file location)
@@ -872,28 +878,23 @@ hsModuleToModSummary home_keys pn hsc_src modname
     -- Also copied from 'getImports'
     let (src_idecls, ord_idecls) = partition ((== IsBoot) . ideclSource . unLoc) imps
 
-             -- GHC.Prim doesn't exist physically, so don't go looking for it.
-        (ordinary_imps, ghc_prim_import)
-          = partition ((/= moduleName gHC_PRIM) . unLoc . ideclName . unLoc)
-              ord_idecls
-
         implicit_prelude = xopt LangExt.ImplicitPrelude dflags
         implicit_imports = mkPrelImports modname loc
                                          implicit_prelude imps
 
         rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env) modname
-        convImport (L _ i) = (rn_pkg_qual (ideclPkgQual i), reLoc $ ideclName i)
+        convImport (L _ i) = (convImportLevel (ideclLevelSpec i), rn_pkg_qual (ideclPkgQual i), reLoc $ ideclName i)
 
     extra_sig_imports <- liftIO $ findExtraSigImports hsc_env hsc_src modname
 
-    let normal_imports = map convImport (implicit_imports ++ ordinary_imps)
+    let normal_imports = map convImport (implicit_imports ++ ord_idecls)
     (implicit_sigs, inst_deps) <- liftIO $ implicitRequirementsShallow hsc_env normal_imports
 
     -- So that Finder can find it, even though it doesn't exist...
     this_mod <- liftIO $ do
       let home_unit = hsc_home_unit hsc_env
       let fc        = hsc_FC hsc_env
-      addHomeModuleToFinder fc home_unit (GWIB modname (hscSourceToIsBoot hsc_src)) location
+      addHomeModuleToFinder fc home_unit modname location hsc_src
     let ms = ModSummary {
             ms_mod = this_mod,
             ms_hsc_src = hsc_src,
@@ -903,14 +904,13 @@ hsModuleToModSummary home_keys pn hsc_src modname
                             Just d -> d) </> ".." </> moduleNameSlashes modname <.> "hi",
             ms_hspp_opts = dflags,
             ms_hspp_buf = Nothing,
-            ms_srcimps = map convImport src_idecls,
-            ms_ghc_prim_import = not (null ghc_prim_import),
+            ms_srcimps = (\i -> reLoc (ideclName (unLoc i))) <$> src_idecls,
             ms_textual_imps = normal_imports
                            -- We have to do something special here:
                            -- due to merging, requirements may end up with
                            -- extra imports
-                           ++ ((,) NoPkgQual . noLoc <$> extra_sig_imports)
-                           ++ ((,) NoPkgQual . noLoc <$> implicit_sigs),
+                           ++ ((,,) NormalLevel NoPkgQual . noLoc <$> extra_sig_imports)
+                           ++ ((,,) NormalLevel NoPkgQual . noLoc <$> implicit_sigs),
             -- This is our hack to get the parse tree to the right spot
             ms_parsed_mod = Just (HsParsedModule {
                     hpm_module = hsmod,
@@ -930,12 +930,12 @@ hsModuleToModSummary home_keys pn hsc_src modname
     let inst_nodes = map NodeKey_Unit inst_deps
         mod_nodes  =
           -- hs-boot edge
-          [k | k <- [NodeKey_Module (ModNodeKeyWithUid (GWIB (ms_mod_name ms) IsBoot)  (moduleUnitId this_mod))], NotBoot == isBootSummary ms,  k `elem` home_keys ] ++
+          [k | k <- [NodeKey_Module (ModNodeKeyWithUid (GWIB (ms_mod_name ms) IsBoot) (moduleUnitId this_mod))], NotBoot == isBootSummary ms,  k `elem` home_keys ] ++
           -- Normal edges
-          [k | (_, mnwib) <- msDeps ms, let k = NodeKey_Module (ModNodeKeyWithUid (fmap unLoc mnwib) (moduleUnitId this_mod)), k `elem` home_keys]
+          [k | (_, _,  mnwib) <- msDeps ms, let k = NodeKey_Module (ModNodeKeyWithUid (fmap unLoc mnwib) (moduleUnitId this_mod)), k `elem` home_keys]
 
 
-    return (ModuleNode (mod_nodes ++ inst_nodes) ms)
+    return (ModuleNode (map mkNormalEdge (mod_nodes ++ inst_nodes)) (ModuleNodeCompile ms))
 
 -- | Create a new, externally provided hashed unit id from
 -- a hash.

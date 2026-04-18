@@ -4,7 +4,6 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE GADTs #-}
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 #include <ghcplatform.h>
 
 {- Functions for providing the default interpretation of the 'TPhase' actions
@@ -34,6 +33,7 @@ import GHC.Unit.Module.ModSummary
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Types.SrcLoc
 import GHC.Driver.Main
+import GHC.Driver.Downsweep
 import GHC.Tc.Types
 import GHC.Types.Error
 import GHC.Driver.Errors.Types
@@ -409,7 +409,7 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
   let dflags    = hsc_dflags hsc_env
   let logger    = hsc_logger hsc_env
   let unit_env  = hsc_unit_env hsc_env
-  let home_unit = hsc_home_unit hsc_env
+  let home_unit = hsc_home_unit_maybe hsc_env
   let tmpfs     = hsc_tmpfs hsc_env
   let platform  = ue_platform unit_env
   let hcc       = cc_phase `eqPhase` HCc
@@ -478,7 +478,7 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
           -- very weakly typed, being derived from C--.
           ["-fno-strict-aliasing"]
 
-  ghcVersionH <- getGhcVersionPathName dflags unit_env
+  ghcVersionH <- getGhcVersionIncludeFlags dflags unit_env
 
   withAtomicRename output_fn $ \temp_outputFilename ->
     GHC.SysTools.runCc (phaseForeignLanguage cc_phase) logger tmpfs dflags (
@@ -508,10 +508,12 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
           -- These symbols are imported into the stub.c file via RtsAPI.h, and the
           -- way we do the import depends on whether we're currently compiling
           -- the base package or not.
-                 ++ (if platformOS platform == OSMinGW32 &&
-                        isHomeUnitId home_unit ghcInternalUnitId
-                          then [ "-DCOMPILING_GHC_INTERNAL_PACKAGE" ]
-                          else [])
+                 ++ (case home_unit of
+                        Just hu
+                          | isHomeUnitId hu ghcInternalUnitId
+                          , platformOS platform == OSMinGW32
+                          -> ["-DCOMPILING_GHC_INTERNAL_PACKAGE"]
+                        _ -> [])
 
                  -- GCC 4.6+ doesn't like -Wimplicit when compiling C++.
                  ++ (if (cc_phase /= Ccxx && cc_phase /= Cobjcxx)
@@ -523,7 +525,7 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
                        else [])
                  ++ verbFlags
                  ++ cc_opt
-                 ++ [ "-include", ghcVersionH ]
+                 ++ ghcVersionH
                  ++ framework_paths
                  ++ include_paths
                  ++ pkg_extra_cc_opts
@@ -558,7 +560,7 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
                    HsigFile -> do
                      -- We need to create a REAL but empty .o file
                      -- because we are going to attempt to put it in a library
-                     let input_fn = expectJust "runPhase" (ml_hs_file location)
+                     let input_fn = expectJust (ml_hs_file location)
                          basename = dropExtension input_fn
                      compileEmptyStub dflags hsc_env basename location mod_name
 
@@ -656,10 +658,11 @@ runUnlitPhase hsc_env input_fn output_fn = do
 getFileArgs :: HscEnv -> FilePath -> IO ((DynFlags, Messages PsMessage, Messages DriverMessage))
 getFileArgs hsc_env input_fn = do
   let dflags0 = hsc_dflags hsc_env
+      logger  = hsc_logger hsc_env
       parser_opts = initParserOpts dflags0
-  (warns0, src_opts) <- getOptionsFromFile parser_opts input_fn
+  (warns0, src_opts) <- getOptionsFromFile parser_opts (supportedLanguagePragmas dflags0) input_fn
   (dflags1, unhandled_flags, warns)
-    <- parseDynamicFilePragma dflags0 src_opts
+    <- parseDynamicFilePragma logger dflags0 src_opts
   checkProcessArgsResult unhandled_flags
   return (dflags1, warns0, warns)
 
@@ -701,17 +704,17 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
   hsc_env <- initializePlugins hsc_env1
 
   -- gather the imports and module name
-  (hspp_buf,mod_name,imps,src_imps, ghc_prim_imp) <- do
+  (hspp_buf,mod_name,imps,src_imps) <- do
     buf <- hGetStringBuffer input_fn
     let imp_prelude = xopt LangExt.ImplicitPrelude dflags
         popts = initParserOpts dflags
         rn_pkg_qual = renameRawPkgQual (hsc_unit_env hsc_env)
-        rn_imps = fmap (\(rpk, lmn@(L _ mn)) -> (rn_pkg_qual mn rpk, lmn))
+        rn_imps = fmap (\(s, rpk, lmn@(L _ mn)) -> (s, rn_pkg_qual mn rpk, lmn))
     eimps <- getImports popts imp_prelude buf input_fn (basename <.> suff)
     case eimps of
         Left errs -> throwErrors (GhcPsMessage <$> errs)
-        Right (src_imps,imps, ghc_prim_imp, L _ mod_name) -> return
-              (Just buf, mod_name, rn_imps imps, rn_imps src_imps, ghc_prim_imp)
+        Right (src_imps,imps, L _ mod_name) -> return
+              (Just buf, mod_name, rn_imps imps, src_imps)
 
   -- Take -o into account if present
   -- Very like -ohi, but we must *only* do this if we aren't linking
@@ -734,7 +737,7 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
   mod <- do
     let home_unit = hsc_home_unit hsc_env
     let fc        = hsc_FC hsc_env
-    addHomeModuleToFinder fc home_unit (GWIB mod_name (hscSourceToIsBoot src_flavour)) location
+    addHomeModuleToFinder fc home_unit mod_name location src_flavour
 
   -- Make the ModSummary to hand to hscMain
   let
@@ -750,7 +753,6 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
                                 ms_parsed_mod   = Nothing,
                                 ms_iface_date   = hi_date,
                                 ms_hie_date     = hie_date,
-                                ms_ghc_prim_import = ghc_prim_imp,
                                 ms_textual_imps = imps,
                                 ms_srcimps      = src_imps }
 
@@ -759,11 +761,18 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
   let msg :: Messager
       msg hsc_env _ what _ = oneShotMsg (hsc_logger hsc_env) what
 
+  -- A lazy module graph thunk, don't force it unless you need it!
+  mg <- downsweepThunk hsc_env mod_summary
+
   -- Need to set the knot-tying mutable variable for interface
   -- files. See GHC.Tc.Utils.TcGblEnv.tcg_type_env_var.
   -- See also Note [hsc_type_env_var hack]
   type_env_var <- newIORef emptyNameEnv
-  let hsc_env' = hsc_env { hsc_type_env_vars = knotVarsFromModuleEnv (mkModuleEnv [(mod, type_env_var)]) }
+  let hsc_env' =
+        setModuleGraph mg
+          hsc_env { hsc_type_env_vars = knotVarsFromModuleEnv (mkModuleEnv [(mod, type_env_var)]) }
+
+
 
   status <- hscRecompStatus (Just msg) hsc_env' mod_summary
                         Nothing emptyHomeModInfoLinkable (1, 1)
@@ -777,24 +786,18 @@ mkOneShotModLocation :: PipeEnv -> DynFlags -> HscSource -> ModuleName -> IO Mod
 mkOneShotModLocation pipe_env dflags src_flavour mod_name = do
     let PipeEnv{ src_basename=basename,
              src_suffix=suff } = pipe_env
-    let location1 = mkHomeModLocation2 fopts mod_name (unsafeEncodeUtf basename) (unsafeEncodeUtf suff)
-
-    -- Boot-ify it if necessary
-    let location2
-          | HsBootFile <- src_flavour = addBootSuffixLocnOut location1
-          | otherwise                 = location1
-
+    let location1 = mkHomeModLocation fopts mod_name (unsafeEncodeUtf basename) (unsafeEncodeUtf suff) src_flavour
 
     -- Take -ohi into account if present
     -- This can't be done in mkHomeModuleLocation because
     -- it only applies to the module being compiles
     let ohi = outputHi dflags
-        location3 | Just fn <- ohi = location2{ ml_hi_file_ospath = unsafeEncodeUtf  fn }
-                  | otherwise      = location2
+        location2 | Just fn <- ohi = location1{ ml_hi_file_ospath = unsafeEncodeUtf fn }
+                  | otherwise      = location1
 
     let dynohi = dynOutputHi dflags
-        location4 | Just fn <- dynohi = location3{ ml_dyn_hi_file_ospath = unsafeEncodeUtf fn }
-                  | otherwise         = location3
+        location3 | Just fn <- dynohi = location2{ ml_dyn_hi_file_ospath = unsafeEncodeUtf fn }
+                  | otherwise         = location2
 
     -- Take -o into account if present
     -- Very like -ohi, but we must *only* do this if we aren't linking
@@ -807,11 +810,11 @@ mkOneShotModLocation pipe_env dflags src_flavour mod_name = do
         location5 | Just ofile <- expl_o_file
                   , let dyn_ofile = fromMaybe (ofile -<.> dynObjectSuf_ dflags) expl_dyn_o_file
                   , isNoLink (ghcLink dflags)
-                  = location4 { ml_obj_file_ospath = unsafeEncodeUtf ofile
+                  = location3 { ml_obj_file_ospath = unsafeEncodeUtf ofile
                               , ml_dyn_obj_file_ospath = unsafeEncodeUtf dyn_ofile }
                   | Just dyn_ofile <- expl_dyn_o_file
-                  = location4 { ml_dyn_obj_file_ospath = unsafeEncodeUtf dyn_ofile }
-                  | otherwise = location4
+                  = location3 { ml_dyn_obj_file_ospath = unsafeEncodeUtf dyn_ofile }
+                  | otherwise = location3
     return location5
     where
       fopts = initFinderOpts dflags
@@ -970,7 +973,7 @@ llvmOptions llvm_config dflags =
 
   where target = platformMisc_llvmTarget $ platformMisc dflags
         target_os = platformOS (targetPlatform dflags)
-        Just (LlvmTarget _ mcpu mattr) = lookup target (llvmTargets llvm_config)
+        LlvmTarget _ mcpu mattr = expectJust $ lookup target (llvmTargets llvm_config)
 
         -- Relocation models
         rmodel |  gopt Opt_PIC dflags
@@ -992,6 +995,9 @@ llvmOptions llvm_config dflags =
                    -- LLVM gates POPCNT instructions behind the popcnt flag,
                    -- while the GHC NCG (as well as GCC, Clang) gates it
                    -- behind SSE4.2 instead.
+              ++ ["+sse4.1"  | isSse4_1Enabled dflags   ]
+              ++ ["+ssse3"   | isSsse3Enabled dflags    ]
+              ++ ["+sse3"    | isSse3Enabled dflags     ]
               ++ ["+sse2"    | isSse2Enabled platform   ]
               ++ ["+sse"     | isSseEnabled platform    ]
               ++ ["+avx512f" | isAvx512fEnabled dflags  ]

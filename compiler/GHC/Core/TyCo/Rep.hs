@@ -37,7 +37,7 @@ module GHC.Core.TyCo.Rep (
         -- * Coercions
         Coercion(..), CoSel(..), FunSel(..),
         UnivCoProvenance(..),
-        CoercionHole(..), coHoleCoVar, setCoHoleCoVar, isHeteroKindCoHole,
+        CoercionHole(..), coHoleCoVar, setCoHoleCoVar,
         CoercionN, CoercionR, CoercionP, KindCoercion,
         MCoercion(..), MCoercionR, MCoercionN,
 
@@ -155,11 +155,13 @@ data Type
 
   | ForAllTy  -- See Note [ForAllTy]
         {-# UNPACK #-} !ForAllTyBinder
-        Type            -- ^ A Π type.
-             -- See Note [Why ForAllTy can quantify over a coercion variable]
-             -- INVARIANT: If the binder is a coercion variable, it must
-             --            be mentioned in the Type.
-             --            See Note [Unused coercion variable in ForAllTy]
+           -- ForAllTyBinder: see GHC.Types.Var
+           --    Note [VarBndrs, ForAllTyBinders, TyConBinders, and visibility]
+        Type
+           -- INVARIANT: If the binder is a coercion variable, it must
+           --            be mentioned in the Type.
+           --            See Note [Unused coercion variable in ForAllTy]
+           -- See Note [Why ForAllTy can quantify over a coercion variable]
 
   | FunTy      -- ^ FUN m t1 t2   Very common, so an important special case
                 -- See Note [Function types]
@@ -259,47 +261,9 @@ FunTy is the constructor for a function type.  Here are the details:
   multiplicity argument nondependent in #20164.
 
 * Re the ft_af field: see Note [FunTyFlag] in GHC.Types.Var
-  See Note [Types for coercions, predicates, and evidence]
-  This visibility info makes no difference in Core; it matters
-  only when we regard the type as a Haskell source type.
-
-Note [Types for coercions, predicates, and evidence]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We treat differently:
-
-  (a) Predicate types
-        Test: isPredTy
-        Binders: DictIds
-        Kind: Constraint
-        Examples: (Eq a), and (a ~ b)
-
-  (b) Coercion types are primitive, unboxed equalities
-        Test: isCoVarTy
-        Binders: CoVars (can appear in coercions)
-        Kind: TYPE (TupleRep [])
-        Examples: (t1 ~# t2) or (t1 ~R# t2)
-
-  (c) Evidence types is the type of evidence manipulated by
-      the type constraint solver.
-        Test: isEvVarType
-        Binders: EvVars
-        Kind: Constraint or TYPE (TupleRep [])
-        Examples: all coercion types and predicate types
-
-Coercion types and predicate types are mutually exclusive,
-but evidence types are a superset of both.
-
-When treated as a user type,
-
-  - Predicates (of kind Constraint) are invisible and are
-    implicitly instantiated
-
-  - Coercion types, and non-pred evidence types (i.e. not
-    of kind Constraint), are just regular old types, are
-    visible, and are not implicitly instantiated.
-
-In a FunTy { ft_af = af } and af = FTF_C_T or FTF_C_C, the argument
-type is always a Predicate type.
+  See Note [Types for coercions, predicates, and evidence] in
+  GHC.Core.Predicate.  This visibility info makes no difference in Core;
+  it matter only when we regard the type as a Haskell source type.
 
 Note [Weird typing rule for ForAllTy]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -981,7 +945,6 @@ instance Outputable CoSel where
   ppr SelForAll      = text "All"
   ppr (SelFun fs)    = text "Fun" <> parens (ppr fs)
 
-
 pprOneCharRole :: Role -> SDoc
 pprOneCharRole Nominal          = char 'N'
 pprOneCharRole Representational = char 'R'
@@ -991,6 +954,11 @@ instance Outputable FunSel where
   ppr SelMult = text "mult"
   ppr SelArg  = text "arg"
   ppr SelRes  = text "res"
+
+instance NFData FunSel where
+  rnf SelMult = ()
+  rnf SelArg  = ()
+  rnf SelRes  = ()
 
 instance Binary CoSel where
    put_ bh (SelTyCon n r)   = do { putByte bh 0; put_ bh n; put_ bh r }
@@ -1008,9 +976,9 @@ instance Binary CoSel where
                    _ -> return (SelFun SelRes) }
 
 instance NFData CoSel where
-  rnf (SelTyCon n r) = n `seq` r `seq` ()
+  rnf (SelTyCon n r) = rnf n `seq` rnf r `seq` ()
   rnf SelForAll      = ()
-  rnf (SelFun fs)    = fs `seq` ()
+  rnf (SelFun fs)    = rnf fs `seq` ()
 
 -- | A semantically more meaningful type to represent what may or may not be a
 -- useful 'Coercion'.
@@ -1090,19 +1058,21 @@ The Coercion form SelCo allows us to decompose a structural coercion, one
 between ForallTys, or TyConApps, or FunTys.
 
 There are three forms, split by the CoSel field inside the SelCo:
-SelTyCon, SelForAll, and SelFun.
+SelTyCon, SelForAll, and SelFun.  The typing rules below are directly
+checked by the SelCo case of GHC.Core.Lint.lintCoercion.
 
 * SelTyCon:
 
-      co : (T s1..sn) ~r0 (T t1..tn)
-      T is a data type, not a newtype, nor an arrow type
-      r = tyConRole tc r0 i
+      co : (T s1..sn) ~r (T t1..tn)
+      T is not a saturated FunTyCon (use SelFun for that)
+      T is injective at role r
+      ri = tyConRole tc r i
       i < n    (i is zero-indexed)
       ----------------------------------
-      SelCo (SelTyCon i r) co : si ~r ti
+      SelCo (SelTyCon i ri) co : si ~ri ti
 
-  "Not a newtype": see Note [SelCo and newtypes]
-  "Not an arrow type": see SelFun below
+  "Injective at role r": see Note [SelCo and newtypes]
+  "Not saturated FunTyCon": see SelFun below
 
    See Note [SelCo Cached Roles]
 
@@ -1198,11 +1168,12 @@ It has type
    forall a. e_ty
 Note the Specified visibility of (forall a. e_ty); the Core type just isn't able
 to express more than one visiblity, and we pick `Specified`.  See `exprType` and
-`mkLamType` in GHC.Core.Utils, and `GHC.Type.Var.coreLamForAllTyFlag`.
+`mkLamType` in GHC.Core.Utils, and `GHC.Type.Var.coreTyLamForAllTyFlag`.
 
 So how can we ever get a term of type (forall a -> e_ty)?  Answer: /only/ via a
-cast built with ForAllCo.  See `GHC.Tc.Types.Evidence.mkWpForAllCast`.  This does
-not seem very satisfying, but it does the job.
+cast built with ForAllCo.  See `GHC.Core.Coercion.mkForAllVisCos`,
+`GHC.Tc.Types.Evidence.mkWpForAllCast` and `GHC.Core.Make.mkCoreTyLams`.
+This does not seem very satisfying, but it does the job.
 
 An alternative would be to put a visibility flag into `Lam` (a huge change),
 or into a `TyVar` (a more plausible change), but we leave that for the future.
@@ -1218,14 +1189,15 @@ because the kinds of the bound tyvars can be different.
 
 The typing rule is:
 
-  kind_co : k1 ~N k2
-  tv1:k1 |- co : t1 ~r t2
+  G |- kind_co : k1 ~N k2
+  tv1 \not\in fv(typeKind(t1),typeKind(t2))  -- Skolem escape
+  G, tv1:k1 |- co : t1 ~r t2
   if r=N, then vis1=vis2
   ------------------------------------
-  ForAllCo (tv1:k1) vis1 vis2 kind_co co
-     : forall (tv1:k1) <vis1>. t1
+  G |- ForAllCo (tv1:k1) vis1 vis2 kind_co co
+         : forall (tv1:k1) <vis1>. t1
               ~r
-       forall (tv1:k2) <vis2>. (t2[tv1 |-> (tv1:k2) |> sym kind_co])
+           forall (tv1:k2) <vis2>. (t2[tv1 |-> (tv1:k2) |> sym kind_co])
 
 Several things to note here
 
@@ -1469,6 +1441,10 @@ SelCo, we'll get out a representational coercion. That is:
 
 Yikes! Clearly, this is terrible. The solution is simple: forbid
 SelCo to be used on newtypes if the internal coercion is representational.
+More specifically, we use isInjectiveTyCon to determine whether
+T is injective at role r:
+* Newtypes and datatypes are both injective at Nominal role, but
+* Newtypes are not injective at Representational role
 See the SelCo equation for GHC.Core.Lint.lintCoercion.
 
 This is not just some corner case discovered by a segfault somewhere;
@@ -1564,9 +1540,9 @@ data UnivCoProvenance
   -- Why Ord?  See Note [Ord instance of IfaceType] in GHC.Iface.Type
 
 instance Outputable UnivCoProvenance where
-  ppr PhantomProv      = text "(phantom)"
-  ppr ProofIrrelProv   = text "(proof irrel)"
-  ppr (PluginProv str) = parens (text "plugin" <+> brackets (text str))
+  ppr PhantomProv          = text "(phantom)"
+  ppr (ProofIrrelProv {})  = text "(proof irrel)"
+  ppr (PluginProv str)     = parens (text "plugin" <+> brackets (text str))
 
 instance NFData UnivCoProvenance where
   rnf p = p `seq` ()
@@ -1677,18 +1653,10 @@ data CoercionHole
                        -- See Note [CoercionHoles and coercion free variables]
 
                  , ch_ref :: IORef (Maybe Coercion)
-
-                 , ch_hetero_kind :: Bool
-                       -- True <=> arises from a kind-level equality
-                       -- See Note [Equalities with incompatible kinds]
-                       --     in GHC.Tc.Solver.Equality, wrinkle (EIK2)
                  }
 
 coHoleCoVar :: CoercionHole -> CoVar
 coHoleCoVar = ch_co_var
-
-isHeteroKindCoHole :: CoercionHole -> Bool
-isHeteroKindCoHole = ch_hetero_kind
 
 setCoHoleCoVar :: CoercionHole -> CoVar -> CoercionHole
 setCoHoleCoVar h cv = h { ch_co_var = cv }
@@ -1700,8 +1668,7 @@ instance Data.Data CoercionHole where
   dataTypeOf _ = mkNoRepType "CoercionHole"
 
 instance Outputable CoercionHole where
-  ppr (CoercionHole { ch_co_var = cv, ch_hetero_kind = hk })
-    = braces (ppr cv <> ppWhen hk (text "[hk]"))
+  ppr (CoercionHole { ch_co_var = cv }) = braces (ppr cv)
 
 instance Uniquable CoercionHole where
   getUnique (CoercionHole { ch_co_var = cv }) = getUnique cv

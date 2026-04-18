@@ -13,7 +13,7 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [9.13], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [9.14.1], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
     # Version on master must be X.Y (not X.Y.Z) for ProjectVersionMunged variable
     # to be useful (cf #19058). However, the version must have three components
     # (X.Y.Z) on stable branches (e.g. ghc-9.2) to ensure that pre-releases are
@@ -22,7 +22,7 @@ AC_INIT([The Glorious Glasgow Haskell Compilation System], [9.13], [glasgow-hask
 AC_CONFIG_MACRO_DIRS([m4])
 
 # Set this to YES for a released version, otherwise NO
-: ${RELEASE=NO}
+: ${RELEASE=YES}
 
 # The primary version (e.g. 7.5, 7.4.1) is set in the AC_INIT line
 # above.  If this is not a released version, then we will append the
@@ -265,8 +265,8 @@ dnl we ask the bootstrapping compiler what platform it is for
 
 if test "${WithGhc}" != ""
 then
-        bootstrap_host=`"${WithGhc}" +RTS --info | grep '^ ,("Host platform"' | sed -e 's/.*, "//' -e 's/")//' | tr -d '\r'`
-        bootstrap_target=`"${WithGhc}" +RTS --info | grep '^ ,("Target platform"' | sed -e 's/.*, "//' -e 's/")//' | tr -d '\r'`
+        bootstrap_host=`"${WithGhc}" --info | grep '^ ,("Host platform"' | sed -e 's/.*,"//' -e 's/")//' | tr -d '\r'`
+        bootstrap_target=`"${WithGhc}" --info | grep '^ ,("Target platform"' | sed -e 's/.*,"//' -e 's/")//' | tr -d '\r'`
         if test "$bootstrap_host" != "$bootstrap_target"
         then
                 echo "Bootstrapping GHC is a cross compiler. This probably isn't going to work"
@@ -351,15 +351,23 @@ fi
 
 dnl ** Building a cross compiler?
 dnl --------------------------------------------------------------
-CrossCompiling=NO
-# If 'host' and 'target' differ, then this means we are building a cross-compiler.
-if test "$target" != "$host" ; then
-    CrossCompiling=YES
-    cross_compiling=yes   # This tells configure that it can accept just 'target',
-                          # otherwise you get
-                          #   configure: error: cannot run C compiled programs.
-                          #   If you meant to cross compile, use `--host'.
+dnl We allow the user to override this since the target/host check
+dnl can get this wrong in some particular cases. See #26236.
+if test -z "$CrossCompiling" ; then
+    CrossCompiling=NO
+    # If 'host' and 'target' differ, then this means we are building a cross-compiler.
+    if test "$target" != "$host" ; then
+        CrossCompiling=YES
+    fi
 fi
+if test "$CrossCompiling" = "YES"; then
+    # This tells configure that it can accept just 'target',
+    # otherwise you get
+    #   configure: error: cannot run C compiled programs.
+    #   If you meant to cross compile, use `--host'.
+    cross_compiling=yes
+fi
+
 if test "$BuildPlatform" != "$HostPlatform" ; then
    AC_MSG_ERROR([
 You've selected:
@@ -528,7 +536,7 @@ AC_SUBST(InstallNameToolCmd)
 # versions of LLVM simultaneously, but that stopped working around
 # 3.5/3.6 release of LLVM.
 LlvmMinVersion=13  # inclusive
-LlvmMaxVersion=20  # not inclusive
+LlvmMaxVersion=21  # not inclusive
 AC_SUBST([LlvmMinVersion])
 AC_SUBST([LlvmMaxVersion])
 

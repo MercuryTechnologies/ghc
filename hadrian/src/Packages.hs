@@ -7,9 +7,9 @@ module Packages (
     exceptions, filepath, fileio, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcBootThNext, ghcPlatform,
     ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghcInternal, ghci, ghciWrapper, ghcPkg, ghcPrim,
     ghcToolchain, ghcToolchainBin, haddockApi, haddockLibrary, haddock, haskeline,
-    hsc2hs, hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, iservProxy,
+    hsc2hs, hp2ps, hpc, hpcBin, integerGmp, iserv, iservProxy,
     libffi, mtl, osString, parsec, pretty, primitive, process, remoteIserv, rts,
-    runGhc, semaphoreCompat, stm, templateHaskell, terminfo, text, time, timeout,
+    runGhc, semaphoreCompat, stm, templateHaskell, thLift, thQuasiquoter, terminfo, text, time, timeout,
     transformers, unlit, unix, win32, xhtml,
     lintersCommon, lintNotes, lintCodes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace,
     ghcPackages, isGhcPackage,
@@ -38,8 +38,8 @@ ghcPackages =
     , exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcBootThNext, ghcPlatform
     , ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghcInternal, ghci, ghciWrapper, ghcPkg, ghcPrim
     , ghcToolchain, ghcToolchainBin, haddockApi, haddockLibrary, haddock, haskeline, hsc2hs
-    , hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, libffi, mtl, osString
-    , parsec, pretty, process, rts, runGhc, stm, semaphoreCompat, templateHaskell
+    , hp2ps, hpc, hpcBin, integerGmp, iserv, libffi, mtl, osString
+    , parsec, pretty, process, rts, runGhc, stm, semaphoreCompat, templateHaskell, thLift, thQuasiquoter
     , terminfo, text, time, transformers, unlit, unix, win32, xhtml, fileio
     , timeout
     , lintersCommon
@@ -55,8 +55,8 @@ array, base, binary, bytestring, cabalSyntax, cabal, checkPpr, checkExact, count
   exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcBootThNext, ghcPlatform,
   ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghci, ghcInternal, ghciWrapper, ghcPkg, ghcPrim,
   ghcToolchain, ghcToolchainBin, haddockLibrary, haddockApi, haddock, haskeline, hsc2hs,
-  hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, iservProxy, remoteIserv, libffi, mtl,
-  osString, parsec, pretty, primitive, process, rts, runGhc, semaphoreCompat, stm, templateHaskell,
+  hp2ps, hpc, hpcBin, integerGmp, iserv, iservProxy, remoteIserv, libffi, mtl,
+  osString, parsec, pretty, primitive, process, rts, runGhc, semaphoreCompat, stm, templateHaskell, thLift, thQuasiquoter,
   terminfo, text, time, transformers, unlit, unix, win32, xhtml,
   timeout,
   lintersCommon, lintNotes, lintCodes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace
@@ -109,7 +109,6 @@ hp2ps               = util "hp2ps"
 hpc                 = lib  "hpc"
 hpcBin              = util "hpc-bin"         `setPath` "utils/hpc"
 integerGmp          = lib  "integer-gmp"
-integerSimple       = lib  "integer-simple"
 iserv               = util "iserv"
 iservProxy          = util "iserv-proxy"
 libffi              = top  "libffi"
@@ -125,6 +124,8 @@ runGhc              = util "runghc"
 semaphoreCompat     = lib  "semaphore-compat"
 stm                 = lib  "stm"
 templateHaskell     = lib  "template-haskell"
+thLift              = lib  "template-haskell-lift"
+thQuasiquoter       = lib  "template-haskell-quasiquoter"
 terminfo            = lib  "terminfo"
 text                = lib  "text"
 time                = lib  "time"

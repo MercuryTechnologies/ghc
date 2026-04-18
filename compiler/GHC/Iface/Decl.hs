@@ -31,6 +31,7 @@ import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Type
 import GHC.Core.Multiplicity
+import GHC.Core.TyCo.Tidy
 
 import GHC.Types.Id
 import GHC.Types.Var.Env
@@ -115,7 +116,7 @@ coAxBranchToIfaceBranch tc lhs_s
                   , ifaxbRHS     = toIfaceType rhs
                   , ifaxbIncomps = iface_incomps }
   where
-    iface_incomps = map (expectJust "iface_incomps"
+    iface_incomps = map (expectJust
                         . flip findIndex lhs_s
                         . eqTypes
                         . coAxBranchLHS) incomps
@@ -204,18 +205,20 @@ tyConToIfaceDecl env tycon
             ibr  = map (coAxBranchToIfaceBranch tycon lhss) defs
             axn  = coAxiomName ax
 
-    ifaceConDecls (NewTyCon { data_con = con })    = IfNewTyCon  (ifaceConDecl con)
     ifaceConDecls (DataTyCon { data_cons = cons, is_type_data = type_data })
       = IfDataTyCon type_data (map ifaceConDecl cons)
-    ifaceConDecls (TupleTyCon { data_con = con })  = IfDataTyCon False [ifaceConDecl con]
-    ifaceConDecls (SumTyCon { data_cons = cons })  = IfDataTyCon False (map ifaceConDecl cons)
-    ifaceConDecls AbstractTyCon                    = IfAbstractTyCon
-        -- The AbstractTyCon case happens when a TyCon has been trimmed
-        -- during tidying.
-        -- Furthermore, tyThingToIfaceDecl is also used in GHC.Tc.Module
-        -- for GHCi, when browsing a module, in which case the
-        -- AbstractTyCon and TupleTyCon cases are perfectly sensible.
-        -- (Tuple declarations are not serialised into interface files.)
+    ifaceConDecls (NewTyCon { data_con = con })        = IfNewTyCon        (ifaceConDecl con)
+    ifaceConDecls (UnaryClassTyCon { data_con = con})  = IfDataTyCon False [ifaceConDecl con]
+    ifaceConDecls (TupleTyCon { data_con = con })      = IfDataTyCon False [ifaceConDecl con]
+    ifaceConDecls (SumTyCon { data_cons = cons })      = IfDataTyCon False (map ifaceConDecl cons)
+    ifaceConDecls AbstractTyCon                        = IfAbstractTyCon
+        -- The AbstractTyCon case happens when a TyCon has been trimmed during tidying.
+        --
+        -- NB: TupleTyCon/SumTyCon/UnaryClassTyCon are never serialised into interface files
+        --     But tyThingToIfaceDecl is also used in GHC.Tc.Module
+        --     for GHCi, when browsing a module, in which case the
+        --     AbstractTyCon, TupleTyCon, SumTyCon are perfectly sensible.
+        --     (Not sure about UnaryClassTyCon, but easier to treat it uniformly.)
 
     ifaceConDecl data_con
         = IfCon   { ifConName    = dataConName data_con,
@@ -245,7 +248,7 @@ tyConToIfaceDecl env tycon
           --     we know that the type variables will line up
           -- The latter (b) is important because we pretty-print type constructors
           -- by converting to Iface syntax and pretty-printing that
-          con_env1 = (fst tc_env1, mkVarEnv (zipEqual "ifaceConDecl" univ_tvs tc_tyvars))
+          con_env1 = (fst tc_env1, mkVarEnv (zipEqual univ_tvs tc_tyvars))
                      -- A bit grimy, perhaps, but it's simple!
 
           (con_env2, ex_tvs') = tidyVarBndrs con_env1 ex_tvs
@@ -259,7 +262,7 @@ tyConToIfaceDecl env tycon
           -- tidying produced. Therefore, tidying the user-written tyvars is a
           -- simple matter of looking up each variable in the substitution,
           -- which tidyTyCoVarOcc accomplishes.
-          tidyUserForAllTyBinder :: TidyEnv -> InvisTVBinder -> InvisTVBinder
+          tidyUserForAllTyBinder :: TidyEnv -> TyVarBinder -> TyVarBinder
           tidyUserForAllTyBinder env (Bndr tv vis) =
             Bndr (tidyTyCoVarOcc env tv) vis
 
@@ -282,7 +285,8 @@ classToIfaceDecl env clas
                 ifClassCtxt   = tidyToIfaceContext env1 sc_theta,
                 ifATs    = map toIfaceAT clas_ats,
                 ifSigs   = map toIfaceClassOp op_stuff,
-                ifMinDef = toIfaceBooleanFormula (classMinimalDef clas)
+                ifMinDef = toIfaceBooleanFormula (classMinimalDef clas),
+                ifUnary  = isUnaryClassTyCon tycon
             }
 
     (env1, tc_binders) = tidyTyConBinders env (tyConBinders tycon)

@@ -114,14 +114,14 @@ Library
         extra-libraries: zstd
       CPP-Options: -DHAVE_LIBZSTD
 
-    Build-Depends: base       >= 4.11 && < 4.21,
+    Build-Depends: base       >= 4.11 && < 4.23,
                    deepseq    >= 1.4 && < 1.6,
                    directory  >= 1   && < 1.4,
                    process    >= 1   && < 1.7,
                    bytestring >= 0.11 && < 0.13,
                    binary     == 0.8.*,
-                   time       >= 1.4 && < 1.15,
-                   containers >= 0.6.2.1 && < 0.8,
+                   time       >= 1.4 && < 1.16,
+                   containers >= 0.6.2.1 && < 0.9,
                    array      >= 0.1 && < 0.6,
                    filepath   >= 1.5 && < 1.6,
                    os-string  >= 2.0.1 && < 2.1,
@@ -130,8 +130,9 @@ Library
                    exceptions == 0.10.*,
                    semaphore-compat,
                    stm,
+                   rts,
                    ghc-boot   == @ProjectVersionMunged@,
-                   ghc-heap   == @ProjectVersionMunged@,
+                   ghc-heap   >=9.10.1 && <=@ProjectVersionMunged@,
                    ghci == @ProjectVersionMunged@
 
     if flag(bootstrap)
@@ -139,7 +140,8 @@ Library
         ghc-boot-th-next     == @ProjectVersionMunged@
     else
       Build-Depends:
-        ghc-boot-th          == @ProjectVersionMunged@
+        ghc-boot-th          == @ProjectVersionMunged@,
+        ghc-internal         == @ProjectVersionForLib@.0,
 
     if os(windows)
         Build-Depends: Win32  >= 2.3 && < 2.15
@@ -222,6 +224,7 @@ Library
         GHC.Builtin.Uniques
         GHC.Builtin.Utils
         GHC.ByteCode.Asm
+        GHC.ByteCode.Breakpoints
         GHC.ByteCode.InfoTable
         GHC.ByteCode.Instr
         GHC.ByteCode.Linker
@@ -282,6 +285,13 @@ Library
         GHC.CmmToAsm.Dwarf.Types
         GHC.CmmToAsm.Format
         GHC.CmmToAsm.Instr
+        GHC.CmmToAsm.LA64
+        GHC.CmmToAsm.LA64.CodeGen
+        GHC.CmmToAsm.LA64.Cond
+        GHC.CmmToAsm.LA64.Instr
+        GHC.CmmToAsm.LA64.Ppr
+        GHC.CmmToAsm.LA64.RegInfo
+        GHC.CmmToAsm.LA64.Regs
         GHC.CmmToAsm.Monad
         GHC.CmmToAsm.PIC
         GHC.CmmToAsm.PPC
@@ -306,6 +316,7 @@ Library
         GHC.CmmToAsm.Reg.Linear.Base
         GHC.CmmToAsm.Reg.Linear.FreeRegs
         GHC.CmmToAsm.Reg.Linear.JoinToTargets
+        GHC.CmmToAsm.Reg.Linear.LA64
         GHC.CmmToAsm.Reg.Linear.PPC
         GHC.CmmToAsm.Reg.Linear.RV64
         GHC.CmmToAsm.Reg.Linear.StackMap
@@ -413,6 +424,7 @@ Library
         GHC.CoreToIface
         GHC.CoreToStg
         GHC.CoreToStg.Prep
+        GHC.CoreToStg.AddImplicitBinds
         GHC.Core.TyCo.FVs
         GHC.Core.TyCo.Compare
         GHC.Core.TyCon
@@ -444,13 +456,17 @@ Library
         GHC.Data.Graph.Color
         GHC.Data.Graph.Collapse
         GHC.Data.Graph.Directed
+        GHC.Data.Graph.Directed.Internal
+        GHC.Data.Graph.Directed.Reachability
         GHC.Data.Graph.Inductive.Graph
         GHC.Data.Graph.Inductive.PatriciaTree
         GHC.Data.Graph.Ops
         GHC.Data.Graph.Ppr
         GHC.Data.Graph.UnVar
         GHC.Data.IOEnv
+        GHC.Data.List
         GHC.Data.List.Infinite
+        GHC.Data.List.NonEmpty
         GHC.Data.List.SetOps
         GHC.Data.Maybe
         GHC.Data.OrdList
@@ -506,6 +522,8 @@ Library
         GHC.Driver.Config.Tidy
         GHC.Driver.Config.StgToJS
         GHC.Driver.DynFlags
+        GHC.Driver.IncludeSpecs
+        GHC.Driver.Downsweep
         GHC.Driver.Env
         GHC.Driver.Env.KnotVars
         GHC.Driver.Env.Types
@@ -519,6 +537,8 @@ Library
         GHC.Driver.MakeSem
         GHC.Driver.Main
         GHC.Driver.Make
+        GHC.Driver.Messager
+        GHC.Driver.MakeAction
         GHC.Driver.MakeFile
         GHC.Driver.Monad
         GHC.Driver.Phases
@@ -531,6 +551,8 @@ Library
         GHC.Driver.Plugins.External
         GHC.Driver.Ppr
         GHC.Driver.Session
+        GHC.Driver.Session.Inspect
+        GHC.Driver.Session.Units
         GHC.Hs
         GHC.Hs.Basic
         GHC.Hs.Binds
@@ -601,8 +623,10 @@ Library
         GHC.Iface.Recomp
         GHC.Iface.Recomp.Binary
         GHC.Iface.Recomp.Flags
+        GHC.Iface.Recomp.Types
         GHC.Iface.Rename
         GHC.Iface.Syntax
+        GHC.Iface.Flags
         GHC.Iface.Tidy
         GHC.Iface.Tidy.StaticPtrTable
         GHC.Iface.Warnings
@@ -643,6 +667,8 @@ Library
         GHC.Parser.Errors.Types
         GHC.Parser.Header
         GHC.Parser.Lexer
+        GHC.Parser.Lexer.Interface
+        GHC.Parser.Lexer.String
         GHC.Parser.HaddockLex
         GHC.Parser.PostProcess
         GHC.Parser.PostProcess.Haddock
@@ -653,7 +679,7 @@ Library
         GHC.Platform.ARM
         GHC.Platform.AArch64
         GHC.Platform.Constants
-        GHC.Platform.LoongArch64
+        GHC.Platform.LA64
         GHC.Platform.NoRegs
         GHC.Platform.PPC
         GHC.Platform.Profile
@@ -686,14 +712,17 @@ Library
         GHC.Rename.Utils
         GHC.Runtime.Context
         GHC.Runtime.Debugger
+        GHC.Runtime.Debugger.Breakpoints
         GHC.Runtime.Eval
         GHC.Runtime.Eval.Types
+        GHC.Runtime.Eval.Utils
         GHC.Runtime.Heap.Inspect
         GHC.Runtime.Heap.Layout
         GHC.Runtime.Interpreter
         GHC.Runtime.Interpreter.JS
         GHC.Runtime.Interpreter.Process
         GHC.Runtime.Interpreter.Types
+        GHC.Runtime.Interpreter.Types.SymbolCache
         GHC.Runtime.Interpreter.Wasm
         GHC.Runtime.Loader
         GHC.Runtime.Utils
@@ -813,7 +842,6 @@ Library
         GHC.Tc.Gen.HsType
         GHC.Tc.Gen.Match
         GHC.Tc.Gen.Pat
-        GHC.Tc.Gen.Rule
         GHC.Tc.Gen.Sig
         GHC.Tc.Gen.Splice
         GHC.Tc.Instance.Class
@@ -841,7 +869,6 @@ Library
         GHC.Tc.Types
         GHC.Tc.Types.Constraint
         GHC.Tc.Types.Evidence
-        GHC.Tc.Types.EvTerm
         GHC.Tc.Types.Origin
         GHC.Tc.Types.Rank
         GHC.Tc.Types.CtLoc
@@ -867,7 +894,6 @@ Library
         GHC.Types.Annotations
         GHC.Types.Avail
         GHC.Types.Basic
-        GHC.Types.Breakpoint
         GHC.Types.CompleteMatch
         GHC.Types.CostCentre
         GHC.Types.CostCentre.State
@@ -887,6 +913,7 @@ Library
         GHC.Types.HpcInfo
         GHC.Types.Id
         GHC.Types.IPE
+        GHC.Types.ThLevelIndex
         GHC.Types.Id.Info
         GHC.Types.Id.Make
         GHC.Types.Literal
@@ -932,12 +959,16 @@ Library
         GHC.Unit.Finder
         GHC.Unit.Finder.Types
         GHC.Unit.Home
+        GHC.Unit.Home.Graph
         GHC.Unit.Home.ModInfo
+        GHC.Unit.Home.PackageTable
         GHC.Unit.Info
         GHC.Unit.Module
         GHC.Unit.Module.Deps
         GHC.Unit.Module.Env
         GHC.Unit.Module.Graph
+        GHC.Unit.Module.ModNodeKey
+        GHC.Unit.Module.Stage
         GHC.Unit.Module.Imported
         GHC.Unit.Module.Location
         GHC.Unit.Module.ModDetails
@@ -998,6 +1029,7 @@ Library
         Language.Haskell.Syntax.Expr
         Language.Haskell.Syntax.Extension
         Language.Haskell.Syntax.ImpExp
+        Language.Haskell.Syntax.ImpExp.IsBoot
         Language.Haskell.Syntax.Lit
         Language.Haskell.Syntax.Module.Name
         Language.Haskell.Syntax.Pat

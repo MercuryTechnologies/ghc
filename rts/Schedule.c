@@ -41,6 +41,7 @@
 #include "Threads.h"
 #include "Timer.h"
 #include "ThreadPaused.h"
+#include "ThreadLabels.h"
 #include "Messages.h"
 #include "StablePtr.h"
 #include "StableName.h"
@@ -93,6 +94,10 @@ StgWord recent_activity = ACTIVITY_YES;
  * LOCK: none (changes monotonically)
  */
 StgWord sched_state = SCHED_RUNNING;
+
+
+bool allocLimitKill = true;
+bool allocLimitRunHook = false;
 
 /*
  * This mutex protects most of the global scheduler data in
@@ -1125,19 +1130,36 @@ schedulePostRunThread (Capability *cap, StgTSO *t)
         }
     }
 
-    //
-    // If the current thread's allocation limit has run out, send it
-    // the AllocationLimitExceeded exception.
+    // Handle the current thread's allocation limit running out,
 
     if (PK_Int64((W_*)&(t->alloc_limit)) < 0 && (t->flags & TSO_ALLOC_LIMIT)) {
-        // Use a throwToSelf rather than a throwToSingleThreaded, because
-        // it correctly handles the case where the thread is currently
-        // inside mask.  Also the thread might be blocked (e.g. on an
-        // MVar), and throwToSingleThreaded doesn't unblock it
-        // correctly in that case.
-        throwToSelf(cap, t, allocationLimitExceeded_closure);
-        ASSIGN_Int64((W_*)&(t->alloc_limit),
-                     (StgInt64)RtsFlags.GcFlags.allocLimitGrace * BLOCK_SIZE);
+        if(allocLimitKill) {
+          // Throw the AllocationLimitExceeded exception.
+          // Use a throwToSelf rather than a throwToSingleThreaded, because
+          // it correctly handles the case where the thread is currently
+          // inside mask.  Also the thread might be blocked (e.g. on an
+          // MVar), and throwToSingleThreaded doesn't unblock it
+          // correctly in that case.
+          throwToSelf(cap, t, allocationLimitExceeded_closure);
+          ASSIGN_Int64((W_*)&(t->alloc_limit),
+                      (StgInt64)RtsFlags.GcFlags.allocLimitGrace * BLOCK_SIZE);
+        } else {
+          // If we aren't killing the thread, we must disable the limit
+          // otherwise we will immediatelly retrigger it.
+          // User defined handlers should re-enable it if wanted.
+          t->flags = t->flags & ~TSO_ALLOC_LIMIT;
+        }
+
+        if(allocLimitRunHook)
+        {
+          // Create a thread to run the allocation limit handler.
+          StgClosure* c = rts_apply(cap, runAllocationLimitHandler_closure, (StgClosure*)t);
+          StgTSO* hookThread = createIOThread(cap, RtsFlags.GcFlags.initialStkSize, c);
+          setThreadLabel(cap, hookThread, "allocation limit handler thread");
+          // Schedule the handler to be run immediatelly.
+          pushOnRunQueue(cap, hookThread);
+        }
+
     }
 
   /* some statistics gathering in the parallel case */
@@ -2288,8 +2310,11 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
     } else if (new_n_capabilities <= 0) {
         errorBelch("setNumCapabilities: Capability count must be positive");
         return;
+    } else if (new_n_capabilities > max_n_capabilities) {
+        // See Note [Capabilities array sizing] in rts/Capability.c.
+        errorBelch("setNumCapabilities: Attempt to increase capability count beyond maximum capability count %" PRIu32 "; clamping...\n", max_n_capabilities);
+        new_n_capabilities = max_n_capabilities;
     }
-
 
     debugTrace(DEBUG_sched, "changing the number of Capabilities from %d to %d",
                enabled_capabilities, new_n_capabilities);
@@ -3338,4 +3363,10 @@ resurrectThreads (StgTSO *threads)
                  tso->why_blocked);
         }
     }
+}
+
+void setAllocLimitKill(bool shouldKill, bool shouldHook)
+{
+   allocLimitKill = shouldKill;
+   allocLimitRunHook = shouldHook;
 }

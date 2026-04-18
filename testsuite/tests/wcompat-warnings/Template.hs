@@ -1,13 +1,12 @@
-{-# LANGUAGE DataKinds #-}
-module WCompatWarningsOnOff where
+-- The following program should trigger all warnings in the -Wcompat
+-- warning group.
 
-import Data.Proxy
-import GHC.Types
-import Data.List
-import Data.Kind
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ExplicitNamespaces #-}
 
-type T1 = 'Nothing :: Maybe a
+module WCompatWarningsOnOff
+  ( pattern Just, pattern Left, pattern (:|)    -- triggers -Wpattern-namespace-specifier
+  ) where
 
-foo :: Maybe a -> Maybe a
-foo (Just @b x) = Just @b x
-foo _ = Nothing
+import Data.List.NonEmpty (pattern (:|))        -- triggers -Wpattern-namespace-specifier
+

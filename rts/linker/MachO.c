@@ -51,7 +51,7 @@
 /* often times we need to extend some value of certain number of bits
  * int an int64_t for e.g. relative offsets.
  */
-int64_t signExtend(uint64_t val, uint8_t bits);
+static int64_t signExtend(uint64_t val, uint8_t bits);
 /* Helper functions to check some instruction properties */
 static bool isVectorOp(uint32_t *p);
 static bool isLoadStore(uint32_t *p);
@@ -60,17 +60,18 @@ static bool isLoadStore(uint32_t *p);
  * where we want to write the address offset to. Thus decoding as well
  * as encoding is needed.
  */
-bool fitsBits(size_t bits, int64_t value);
-int64_t decodeAddend(ObjectCode * oc, Section * section,
+static bool fitsBits(size_t bits, int64_t value);
+static int64_t decodeAddend(ObjectCode * oc, Section * section,
                      MachORelocationInfo * ri);
-void encodeAddend(ObjectCode * oc, Section * section,
-                  MachORelocationInfo * ri, int64_t addend);
+static void encodeAddend(ObjectCode * oc, Section * section,
+                  MachORelocationInfo * ri, int64_t addend, MachOSymbol * symbol);
 
 /* Global Offset Table logic */
-bool isGotLoad(MachORelocationInfo * ri);
-bool needGotSlot(MachONList * symbol);
-bool makeGot(ObjectCode * oc);
-void freeGot(ObjectCode * oc);
+static bool isGotLoad(MachORelocationInfo * ri);
+static bool needGotSlot(MachOSymbol * symbol);
+static bool makeGot(ObjectCode * oc);
+static void freeGot(ObjectCode * oc);
+static void findInternalGotRefs(ObjectCode * oc);
 #endif /* aarch64_HOST_ARCH */
 
 /*
@@ -252,7 +253,7 @@ resolveImports(
             return 0;
         }
 
-        checkProddableBlock(oc,
+        checkProddableBlock(&oc->proddables,
                             ((void**)(oc->image + sect->offset)) + i,
                             sizeof(void *));
         ((void**)(oc->image + sect->offset))[i] = addr;
@@ -265,7 +266,7 @@ resolveImports(
 #if defined(aarch64_HOST_ARCH)
 /* aarch64 linker by moritz angermann <moritz@lichtzwerge.de> */
 
-int64_t
+static int64_t
 signExtend(uint64_t val, uint8_t bits) {
     return (int64_t)(val << (64-bits)) >> (64-bits);
 }
@@ -280,13 +281,13 @@ isLoadStore(uint32_t *p) {
     return (*p & 0x3B000000) == 0x39000000;
 }
 
-int64_t
+static int64_t
 decodeAddend(ObjectCode * oc, Section * section, MachORelocationInfo * ri) {
 
     /* the instruction. It is 32bit wide */
     uint32_t * p = (uint32_t*)((uint8_t*)section->start + ri->r_address);
 
-    checkProddableBlock(oc, (void*)p, 1 << ri->r_length);
+    checkProddableBlock(&oc->proddables, (void*)p, 1 << ri->r_length);
 
     switch(ri->r_type) {
         case ARM64_RELOC_UNSIGNED: {
@@ -350,7 +351,7 @@ decodeAddend(ObjectCode * oc, Section * section, MachORelocationInfo * ri) {
     barf("unsupported relocation type: %d\n", ri->r_type);
 }
 
-inline bool
+inline static bool
 fitsBits(size_t bits, int64_t value) {
     if(bits == 64) return true;
     if(bits > 64) barf("fits_bits with %zu bits and an 64bit integer!", bits);
@@ -358,17 +359,23 @@ fitsBits(size_t bits, int64_t value) {
         || -1 == (value >> bits);  // All bits on: -1
 }
 
-void
+static void
 encodeAddend(ObjectCode * oc, Section * section,
-             MachORelocationInfo * ri, int64_t addend) {
+             MachORelocationInfo * ri, int64_t addend, MachOSymbol * symbol) {
     uint32_t * p = (uint32_t*)((uint8_t*)section->start + ri->r_address);
 
-    checkProddableBlock(oc, (void*)p, 1 << ri->r_length);
+    checkProddableBlock(&oc->proddables, (void*)p, 1 << ri->r_length);
+
+    const char *symbol_name = symbol && symbol->name ? (char*)symbol->name : "<unknown>";
+    const char *file_name = oc->fileName ? (char*)oc->fileName : "<unknown>";
 
     switch (ri->r_type) {
         case ARM64_RELOC_UNSIGNED: {
-            if(!fitsBits(8 << ri->r_length, addend))
-                barf("Relocation out of range for UNSIGNED");
+            if(!fitsBits(8 << ri->r_length, addend)) {
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation out of range for UNSIGNED in %s: symbol '%s', addend 0x%llx, address 0x%llx, library: %s",
+                     file_name, symbol_name, (long long)addend, (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
             switch (ri->r_length) {
                 case 0: *(uint8_t*)p  = (uint8_t)addend; break;
                 case 1: *(uint16_t*)p = (uint16_t)addend; break;
@@ -381,8 +388,11 @@ encodeAddend(ObjectCode * oc, Section * section,
             return;
         }
         case ARM64_RELOC_SUBTRACTOR: {
-            if(!fitsBits(8 << ri->r_length, addend))
-                barf("Relocation out of range for SUBTRACTOR");
+            if(!fitsBits(8 << ri->r_length, addend)) {
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation out of range for SUBTRACTOR in %s: symbol '%s', addend 0x%llx, address 0x%llx, library: %s",
+                     file_name, symbol_name, (long long)addend, (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
             switch (ri->r_length) {
                 case 0: *(uint8_t*)p  = (uint8_t)addend; break;
                 case 1: *(uint16_t*)p = (uint16_t)addend; break;
@@ -399,8 +409,11 @@ encodeAddend(ObjectCode * oc, Section * section,
              * do not need the last two bits of the value. If the value >> 2
              * still exceeds 26bits, we won't be able to reach it.
              */
-            if(!fitsBits(26, addend >> 2))
-                barf("Relocation target for BRACH26 out of range.");
+            if(!fitsBits(26, addend >> 2)) {
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation target for BRANCH26 out of range in %s: symbol '%s', addend 0x%llx (0x%llx >> 2), address 0x%llx, library: %s",
+                     file_name, symbol_name, (long long)addend, (long long)(addend >> 2), (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
             *p = (*p & 0xFC000000) | ((uint32_t)(addend >> 2) & 0x03FFFFFF);
             return;
         }
@@ -411,8 +424,12 @@ encodeAddend(ObjectCode * oc, Section * section,
              * with the PAGEOFF12 relocation allows to address a relative range
              * of +-4GB.
              */
-            if(!fitsBits(21, addend >> 12))
-                barf("Relocation target for PAGE21 out of range.");
+            if(!fitsBits(21, addend >> 12)) {
+                const char *reloc_type = (ri->r_type == ARM64_RELOC_PAGE21) ? "PAGE21" : "GOT_LOAD_PAGE21";
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation target for %s out of range in %s: symbol '%s', addend 0x%llx (0x%llx >> 12), address 0x%llx, library: %s",
+                     reloc_type, file_name, symbol_name, (long long)addend, (long long)(addend >> 12), (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
             *p = (*p & 0x9F00001F) | (uint32_t)((addend << 17) & 0x60000000)
                                    | (uint32_t)((addend >> 9)  & 0x00FFFFE0);
             return;
@@ -422,8 +439,11 @@ encodeAddend(ObjectCode * oc, Section * section,
             /* Store an offset into a page (4k). Depending on the instruction
              * the bits are stored at slightly different positions.
              */
-            if(!fitsBits(12, addend))
-                barf("Relocation target for PAGEOFF12 out or range.");
+            if(!fitsBits(12, addend)) {
+                const char *library_info = OC_INFORMATIVE_FILENAME(oc);
+                barf("Relocation target for PAGEOFF12 out of range in %s: symbol '%s', addend 0x%llx, address 0x%llx, library: %s",
+                     file_name, symbol_name, (long long)addend, (long long)ri->r_address, library_info ? (char*)library_info : "<unknown>");
+            }
 
             int shift = 0;
             if(isLoadStore(p)) {
@@ -440,7 +460,49 @@ encodeAddend(ObjectCode * oc, Section * section,
     barf("unsupported relocation type: %d\n", ri->r_type);
 }
 
-bool
+/* Note [Symbols in need of GOT entries]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * As GOT entries require memory, we ideally want to avoid reserving
+ * them for symbols where they are unnecessary. Specifically, most internal
+ * symbols will not be referenced by the GOT, even in position independent code
+ * (since you can instead use direct PC-relative addressing).
+ *
+ * However, it is nevertheless possible for internal symbols to be referenced
+ * via the GOT. Consequently, we use the following strategy to determine whether
+ * a symbol needs a GOT slot:
+ *
+ *  a. all undefined external symbols are given GOT entries
+ *  b. all external symbols with cross-section refrences are given GOT entries
+ *  c. all internal symbols for which there are GOT relocations are given GOT
+ *     entries.
+ *
+ * Failing to consider (c) lead to #25577. For this we explicitly traverse
+ * the relocations in findInternalGotRefs() looking for GOT relocations
+ * referencing internal symbols, setting the MachOSymbol.needs_got flag for
+ * each.
+ */
+
+// See Note [Symbols in need of GOT entries]
+static void
+findInternalGotRefs(ObjectCode * oc)
+{
+    for (int curSection = 0; curSection < oc->n_sections; curSection++) {
+        Section * sect = &oc->sections[curSection];
+        if (sect->info == NULL)
+            continue;
+        MachOSection * msect = sect->info->macho_section; // for access convenience
+        MachORelocationInfo * relocs = sect->info->relocation_info;
+        for(uint32_t i = 0; i < msect->nreloc; i++) {
+            MachORelocationInfo *ri = &relocs[i];
+            if (isGotLoad(ri)) {
+                MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];
+                symbol->needs_got = true;
+            }
+        }
+    }
+}
+
+static bool
 isGotLoad(struct relocation_info * ri) {
     return ri->r_type == ARM64_RELOC_GOT_LOAD_PAGE21
     ||  ri->r_type == ARM64_RELOC_GOT_LOAD_PAGEOFF12;
@@ -448,22 +510,27 @@ isGotLoad(struct relocation_info * ri) {
 
 /*
  * Check if we need a global offset table slot for a
- * given symbol
+ * given symbol. See Note [Symbols in need of GOT entries].
  */
-bool
-needGotSlot(MachONList * symbol) {
-    return (symbol->n_type & N_EXT)             /* is an external symbol      */
-        && (N_UNDF == (symbol->n_type & N_TYPE) /* and is undefined           */
-            || NO_SECT != symbol->n_sect);      /*     or is defined in a
-                                                 *        different section   */
+static bool
+needGotSlot(MachOSymbol * symbol) {
+    // Does it have any internal references?
+    if (symbol->needs_got) {
+        return true;
+    }
+
+    return (symbol->nlist->n_type & N_EXT)             /* is an external symbol    */
+        && (N_UNDF == (symbol->nlist->n_type & N_TYPE) /* and is undefined         */
+            || NO_SECT != symbol->nlist->n_sect);      /*     or is defined in a
+                                                        *        different section */
 }
 
-bool
+static bool
 makeGot(ObjectCode * oc) {
     size_t got_slots = 0;
 
     for(size_t i=0; i < oc->info->n_macho_symbols; i++)
-        if(needGotSlot(oc->info->macho_symbols[i].nlist))
+        if(needGotSlot(&oc->info->macho_symbols[i]))
             got_slots += 1;
 
     if(got_slots > 0) {
@@ -476,7 +543,7 @@ makeGot(ObjectCode * oc) {
         /* update got_addr */
         size_t slot = 0;
         for(size_t i=0; i < oc->info->n_macho_symbols; i++)
-            if(needGotSlot(oc->info->macho_symbols[i].nlist))
+            if(needGotSlot(&oc->info->macho_symbols[i]))
                 oc->info->macho_symbols[i].got_addr
                     = ((uint8_t*)oc->info->got_start)
                     + (slot++ * sizeof(void *));
@@ -484,7 +551,7 @@ makeGot(ObjectCode * oc) {
     return EXIT_SUCCESS;
 }
 
-void
+static void
 freeGot(ObjectCode * oc) {
     /* sanity check */
     if(NULL != oc->info->got_start && oc->info->got_size > 0) {
@@ -541,7 +608,7 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
                 MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];
                 int64_t addend = decodeAddend(oc, section, ri);
                 uint64_t value = symbol_value(oc, symbol);
-                encodeAddend(oc, section, ri, value + addend);
+                encodeAddend(oc, section, ri, value + addend, symbol);
                 break;
             }
             case ARM64_RELOC_SUBTRACTOR:
@@ -575,7 +642,7 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
 
                 // combine with addend and store
                 int64_t addend = decodeAddend(oc, section, ri);
-                encodeAddend(oc, section, ri, addend - sub_value + add_value);
+                encodeAddend(oc, section, ri, addend - sub_value + add_value, symbol1);
 
                 // skip next relocation: we've already handled it
                 i += 1;
@@ -616,7 +683,7 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
                         }
                     }
                 }
-                encodeAddend(oc, section, ri, value - pc + addend);
+                encodeAddend(oc, section, ri, value - pc + addend, symbol);
                 break;
             }
             case ARM64_RELOC_PAGE21:
@@ -627,7 +694,8 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
                     barf("explicit_addend and addend can't be set at the same time.");
                 uint64_t pc = (uint64_t)section->start + ri->r_address;
                 uint64_t value = (uint64_t)(isGotLoad(ri) ? symbol->got_addr : symbol->addr);
-                encodeAddend(oc, section, ri, ((value + addend + explicit_addend) & (-4096)) - (pc & (-4096)));
+                ASSERT(!isGotLoad(ri) || (symbol->got_addr != 0));
+                encodeAddend(oc, section, ri, ((value + addend + explicit_addend) & (-4096)) - (pc & (-4096)), symbol);
 
                 // reset, just in case.
                 explicit_addend = 0;
@@ -640,7 +708,8 @@ relocateSectionAarch64(ObjectCode * oc, Section * section)
                 if(!(explicit_addend == 0 || addend == 0))
                     barf("explicit_addend and addend can't be set at the same time.");
                 uint64_t value = (uint64_t)(isGotLoad(ri) ? symbol->got_addr : symbol->addr);
-                encodeAddend(oc, section, ri, 0xFFF & (value + addend + explicit_addend));
+                ASSERT(!isGotLoad(ri) || (symbol->got_addr != 0));
+                encodeAddend(oc, section, ri, 0xFFF & (value + addend + explicit_addend), symbol);
 
                 // reset, just in case.
                 explicit_addend = 0;
@@ -738,7 +807,7 @@ relocateSection(ObjectCode* oc, int curSection)
             default:
                 barf("Unknown size.");
         }
-        checkProddableBlock(oc,thingPtr,relocLenBytes);
+        checkProddableBlock(&oc->proddables,thingPtr,relocLenBytes);
 
         /*
          * With SIGNED_N the relocation is not at the end of the
@@ -984,9 +1053,9 @@ relocateSection(ObjectCode* oc, int curSection)
          */
         if (0 == reloc->r_extern) {
             if (reloc->r_pcrel) {
-                checkProddableBlock(oc, (void *)((char *)thing + baseValue), 1);
+                checkProddableBlock(&oc->proddables, (void *)((char *)thing + baseValue), 1);
             } else {
-                checkProddableBlock(oc, (void *)thing, 1);
+                checkProddableBlock(&oc->proddables, (void *)thing, 1);
             }
         }
 
@@ -1293,7 +1362,7 @@ ocGetNames_MachO(ObjectCode* oc)
                 secArray[sec_idx].info->stub_size = 0;
                 secArray[sec_idx].info->stubs = NULL;
 #endif
-                addProddableBlock(oc, start, section->size);
+                addProddableBlock(&oc->proddables, start, section->size);
             }
 
             curMem = (char*) secMem + section->size;
@@ -1450,6 +1519,8 @@ ocGetNames_MachO(ObjectCode* oc)
         }
     }
 #if defined(aarch64_HOST_ARCH)
+    findInternalGotRefs(oc);
+
     /* Setup the global offset table
      * This is for symbols that are external, and not defined here.
      * So that we can load their address indirectly.
@@ -1556,7 +1627,7 @@ ocResolve_MachO(ObjectCode* oc)
     /* fill the GOT table */
     for(size_t i = 0; i < oc->info->n_macho_symbols; i++) {
         MachOSymbol * symbol = &oc->info->macho_symbols[i];
-        if(needGotSlot(symbol->nlist)) {
+        if(needGotSlot(symbol)) {
             if(N_UNDF == (symbol->nlist->n_type & N_TYPE)) {
                 /* an undefined symbol. So we need to ensure we
                  * have the address.

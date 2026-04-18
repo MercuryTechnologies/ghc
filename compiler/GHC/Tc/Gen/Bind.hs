@@ -59,8 +59,9 @@ import GHC.Core.Multiplicity
 import GHC.Core.FamInstEnv( normaliseType )
 import GHC.Core.Class   ( Class )
 import GHC.Core.Coercion( mkSymCo )
-import GHC.Core.Type (mkStrLitTy, tidyOpenTypeX, mkCastTy)
+import GHC.Core.Type (mkStrLitTy, mkCastTy)
 import GHC.Core.TyCo.Ppr( pprTyVars )
+import GHC.Core.TyCo.Tidy( tidyOpenTypeX )
 
 import GHC.Builtin.Types ( mkConstraintTupleTy, multiplicityTy, oneDataConTy  )
 import GHC.Builtin.Types.Prim
@@ -77,7 +78,6 @@ import GHC.Types.Name.Env
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
 
-import GHC.Utils.Error
 import GHC.Utils.Misc
 import GHC.Types.Basic
 import GHC.Utils.Outputable as Outputable
@@ -254,20 +254,9 @@ tcLocalBinds (HsIPBinds x (IPBinds _ ip_binds)) thing_inside
     tc_ip_bind ipClass (IPBind _ l_name@(L _ ip) expr)
        = do { ty <- newFlexiTyVarTy liftedTypeKind  -- see #24298
             ; let p = mkStrLitTy $ hsIPNameFS ip
-            ; ip_id <- newDict ipClass [ p, ty ]
+            ; ip_id <- newDict ipClass [p, ty]
             ; expr' <- tcCheckMonoExpr expr ty
-            ; let d = fmap (toDict ipClass p ty) expr'
-            ; return (ip_id, (IPBind ip_id l_name d)) }
-
-    -- Coerces a `t` into a dictionary for `IP "x" t`.
-    -- co : t -> IP "x" t
-    toDict :: Class  -- IP class
-           -> Type   -- type-level string for name of IP
-           -> Type   -- type of IP
-           -> HsExpr GhcTc   -- def'n of IP variable
-           -> HsExpr GhcTc   -- dictionary for IP
-    toDict ipClass x ty = mkHsWrap $ mkWpCastR $
-                          wrapIP $ mkClassPred ipClass [x,ty]
+            ; return (ip_id, IPBind ip_id l_name expr') }
 
 tcValBinds :: TopLevelFlag
            -> [(RecFlag, LHsBinds GhcRn)] -> [LSig GhcRn]
@@ -507,7 +496,7 @@ tcPolyBinds top_lvl sig_fn prag_fn rec_group rec_tc closed bind_list
     ; return result }
   where
     binder_names = collectHsBindListBinders CollNoDictBinders bind_list
-    loc = foldr1 combineSrcSpans (map (locA . getLoc) bind_list)
+    loc = foldr1WithDefault noSrcSpan combineSrcSpans (map (locA . getLoc) bind_list)
          -- The mbinds have been dependency analysed and
          -- may no longer be adjacent; so find the narrowest
          -- span that includes them all
@@ -593,7 +582,7 @@ tcPolyCheck prag_fn
        -- the BinderStack, whence it shows up in "Relevant bindings.."
        ; mono_name <- newNameAt (nameOccName name) (locA nm_loc)
 
-       ; mult <- tcMultAnn (HsNoMultAnn noExtField)
+       ; mult <- newMultiplicityVar
        ; (wrap_gen, (wrap_res, matches'))
              <- tcSkolemiseCompleteSig sig $ \invis_pat_tys rho_ty ->
 
@@ -682,7 +671,6 @@ it's all cool; each signature has distinct type variables from the renamer.)
 
 {- Note [Non-variable pattern bindings aren't linear]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 A fundamental limitation of the typechecking algorithm is that we cannot have a
 binding which, at the same time,
 - is linear in its rhs
@@ -694,17 +682,35 @@ https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0111-linear
 
 To address this we to do a few things
 
-- When a pattern is annotated with a multiplicity annotation `let %q pat = rhs
+- (NVP1) When a pattern is annotated with a multiplicity annotation `let %q pat = rhs
   in body` (note: multiplicity-annotated bindings are always parsed as a
   PatBind, see Note [Multiplicity annotations] in Language.Haskell.Syntax.Binds),
-  then the let is never generalised (we use the NoGen plan).
-- Whenever the typechecker infers an AbsBind *and* the inner binding is a
+  then the let is never generalised (we use the NoGen plan). We do this with a
+  dedicated test in decideGeneralisationPlan.
+- (NVP2) Whenever the typechecker infers an AbsBind *and* the inner binding is a
   non-variable PatBind, then the multiplicity of the binding is inferred to be
-  Many. This is a little infelicitous: sometimes the typechecker infers an
-  AbsBind where it didn't need to. This may cause some programs to be spuriously
-  rejected, when NoMonoLocalBinds is on.
-- LinearLet implies MonoLocalBinds to avoid the AbsBind case altogether.
+  Many. We do this by calling manyIfPats in tcPolyInfer. This is a little
+  infelicitous: sometimes the typechecker infers an AbsBind where it didn't need
+  to. This may cause some programs to be spuriously rejected, when
+  NoMonoLocalBinds is on.
+- (NVP3) LinearLet implies MonoLocalBinds to avoid the AbsBind case altogether.
+- (NVP4) Wrinkle: even when other conditions (including MonoLocalBinds), GHC
+  will generalise some binders, namely so-called closed binding groups. We need
+  to make sure that the test for (NVP1) has priority over the test for closed
+  binders.
+- (NVP5) Wrinkle: Closed binding groups (NVP4) are usually fine to type with
+  multiplicity Many. But there's one exception: when there's no binder at all,
+  the binding group is considered closed. Even if the rhs contains arbitrary
+  variables.
 
+     f :: () %1 -> Bool
+     f x = let !() = x in True
+
+  If we consider `!() = x` as a generalisable group (which does nothing anyway),
+  then (NVP2) will infer the pattern as multiplicity Many, and reject the
+  function. We don't want that, see also #25428. So we take care not to
+  generalise in this case, by excluding the no-binder case from automatic
+  generalisation in decideGeneralisationPlan.
 -}
 
 tcPolyInfer
@@ -722,7 +728,7 @@ tcPolyInfer top_lvl rec_tc prag_fn tc_sig_fn bind_list
        ; apply_mr <- checkMonomorphismRestriction mono_infos bind_list
 
        -- AbsBinds which are PatBinds can't be linear.
-       -- See Note [Non-variable pattern bindings aren't linear]
+       -- See (NVP2) in Note [Non-variable pattern bindings aren't linear]
        ; manyIfPats binds'
 
        ; traceTc "tcPolyInfer" (ppr apply_mr $$ ppr (map mbi_sig mono_infos))
@@ -896,9 +902,11 @@ mkExport prag_fn residual insoluble qtvs theta
         ; poly_id <- mkInferredPolyId residual insoluble qtvs theta poly_name mb_sig mono_ty
 
         -- NB: poly_id has a zonked type
-        ; poly_id <- addInlinePrags poly_id prag_sigs
-        ; spec_prags <- tcSpecPrags poly_id prag_sigs
-                -- tcPrags requires a zonked poly_id
+        ; poly_id    <- addInlinePrags poly_id prag_sigs
+        ; spec_prags <- tcExtendIdEnv1 poly_name poly_id $
+                        tcSpecPrags poly_id prag_sigs
+                        -- tcSpecPrags requires a zonked poly_id.  It also needs poly_id to
+                        -- be in the type env (so we can typecheck the SPECIALISE expression)
 
         -- See Note [Impedance matching]
         -- NB: we have already done checkValidType, including an ambiguity check,
@@ -1117,12 +1125,10 @@ chooseInferredQuantifiers residual inferred_theta tau_tvs qtvs
 chooseInferredQuantifiers _ _ _ _ (Just sig)
   = pprPanic "chooseInferredQuantifiers" (ppr sig)
 
-mk_inf_msg :: Name -> TcType -> TidyEnv -> ZonkM (TidyEnv, SDoc)
+mk_inf_msg :: Name -> TcType -> TidyEnv -> ZonkM (TidyEnv, ErrCtxtMsg)
 mk_inf_msg poly_name poly_ty tidy_env
  = do { (tidy_env1, poly_ty) <- zonkTidyTcType tidy_env poly_ty
-      ; let msg = vcat [ text "When checking the inferred type"
-                       , nest 2 $ ppr poly_name <+> dcolon <+> ppr poly_ty ]
-      ; return (tidy_env1, msg) }
+      ; return (tidy_env1, InferredTypeCtxt poly_name poly_ty) }
 
 -- | Warn the user about polymorphic local binders that lack type signatures.
 localSigWarn :: Id -> Maybe TcIdSigInst -> TcM ()
@@ -1266,27 +1272,6 @@ The impedance matcher can do defaulting: in the above example, we default
 to Integer because of Num. See #7173. If we're dealing with a nondefaultable
 class, impedance matching can fail. See #23427.
 
-Note [SPECIALISE pragmas]
-~~~~~~~~~~~~~~~~~~~~~~~~~
-There is no point in a SPECIALISE pragma for a non-overloaded function:
-   reverse :: [a] -> [a]
-   {-# SPECIALISE reverse :: [Int] -> [Int] #-}
-
-But SPECIALISE INLINE *can* make sense for GADTS:
-   data Arr e where
-     ArrInt :: !Int -> ByteArray# -> Arr Int
-     ArrPair :: !Int -> Arr e1 -> Arr e2 -> Arr (e1, e2)
-
-   (!:) :: Arr e -> Int -> e
-   {-# SPECIALISE INLINE (!:) :: Arr Int -> Int -> Int #-}
-   {-# SPECIALISE INLINE (!:) :: Arr (a, b) -> Int -> (a, b) #-}
-   (ArrInt _ ba)     !: (I# i) = I# (indexIntArray# ba i)
-   (ArrPair _ a1 a2) !: i      = (a1 !: i, a2 !: i)
-
-When (!:) is specialised it becomes non-recursive, and can usefully
-be inlined.  Scary!  So we only warn for SPECIALISE *without* INLINE
-for a non-overloaded function.
-
 ************************************************************************
 *                                                                      *
                          tcMonoBinds
@@ -1317,11 +1302,11 @@ tcMonoBinds is_rec sig_fn no_gen
   | NonRecursive <- is_rec   -- ...binder isn't mentioned in RHS
   , Nothing <- sig_fn name   -- ...with no type signature
   = setSrcSpanA b_loc    $
-    do  { mult <- tcMultAnn (HsNoMultAnn noExtField)
+    do  { mult <- newMultiplicityVar
 
         ; ((co_fn, matches'), rhs_ty')
-            <- tcInferFRR (FRRBinder name) $ \ exp_ty ->
-                 -- tcInferFRR: the type of a let-binder must have
+            <- runInferRhoFRR (FRRBinder name) $ \ exp_ty ->
+                 -- runInferRhoFRR: the type of a let-binder must have
                  -- a fixed runtime rep. See #23176
                tcExtendBinderStack [TcIdBndr_ExpType name exp_ty NotTopLevel] $
                  -- We extend the error context even for a non-recursive
@@ -1345,11 +1330,11 @@ tcMonoBinds is_rec sig_fn no_gen
            [L b_loc (PatBind { pat_lhs = pat, pat_rhs = grhss, pat_mult = mult_ann })]
   | NonRecursive <- is_rec   -- ...binder isn't mentioned in RHS
   , all (isNothing . sig_fn) bndrs
-  = addErrCtxt (patMonoBindsCtxt pat grhss) $
-    do { mult <- tcMultAnn mult_ann
+  = addErrCtxt (PatMonoBindsCtxt pat grhss) $
+    do { mult <- tcMultAnnOnPatBind mult_ann
 
-       ; (grhss', pat_ty) <- tcInferFRR FRRPatBind $ \ exp_ty ->
-                          -- tcInferFRR: the type of each let-binder must have
+       ; (grhss', pat_ty) <- runInferRhoFRR FRRPatBind $ \ exp_ty ->
+                          -- runInferRhoFRR: the type of each let-binder must have
                           -- a fixed runtime rep. See #23176
                              tcGRHSsPat mult grhss exp_ty
 
@@ -1513,12 +1498,12 @@ tcLhs sig_fn no_gen (FunBind { fun_id = L nm_loc name
     --           Just g = ...f...
     -- Hence always typechecked with InferGen
     do { mono_info <- tcLhsSigId no_gen (name, sig)
-       ; mult <- tcMultAnn (HsNoMultAnn noExtField)
+       ; mult <- newMultiplicityVar
        ; return (TcFunBind mono_info (locA nm_loc) mult matches) }
 
   | otherwise  -- No type signature
   = do { mono_ty <- newOpenFlexiTyVarTy
-       ; mult <- tcMultAnn (HsNoMultAnn noExtField)
+       ; mult <- newMultiplicityVar
        ; mono_id <- newLetBndr no_gen name mult mono_ty
        ; let mono_info = MBI { mbi_poly_name = name
                              , mbi_sig       = Nothing
@@ -1533,11 +1518,11 @@ tcLhs sig_fn no_gen (PatBind { pat_lhs = pat, pat_rhs = grhss, pat_mult = mult_a
         ; let inst_sig_fun = lookupNameEnv $ mkNameEnv $
                              [ (mbi_poly_name mbi, mbi_mono_id mbi)
                              | mbi <- sig_mbis ]
-        ; mult <- tcMultAnn mult_ann
+        ; mult <- tcMultAnnOnPatBind mult_ann
             -- See Note [Typechecking pattern bindings]
         ; ((pat', nosig_mbis), pat_ty)
-            <- addErrCtxt (patMonoBindsCtxt pat grhss) $
-               tcInferFRR FRRPatBind $ \ exp_ty ->
+            <- addErrCtxt (PatMonoBindsCtxt pat grhss) $
+               runInferSigmaFRR FRRPatBind $ \ exp_ty ->
                tcLetPat inst_sig_fun no_gen pat (Scaled mult exp_ty) $
                  -- The above inferred type get an unrestricted multiplicity. It may be
                  -- worth it to try and find a finer-grained multiplicity here
@@ -1620,7 +1605,7 @@ tcRhs (TcPatBind infos pat' mult mult_ann grhss pat_ty)
     -- That's why we have the special case for a single FunBind in tcMonoBinds
     tcExtendIdBinderStackForRhs infos        $
     do  { traceTc "tcRhs: pat bind" (ppr pat' $$ ppr pat_ty)
-        ; grhss' <- addErrCtxt (patMonoBindsCtxt pat' grhss) $
+        ; grhss' <- addErrCtxt (PatMonoBindsCtxt pat' grhss) $
                     tcGRHSsPat mult grhss (mkCheckExpType pat_ty)
 
         ; return ( PatBind { pat_lhs = pat', pat_rhs = grhss'
@@ -1628,13 +1613,13 @@ tcRhs (TcPatBind infos pat' mult mult_ann grhss pat_ty)
                            , pat_mult = setTcMultAnn mult mult_ann } )}
 
 
--- | @'tcMultAnn' ann@ takes an optional multiplicity annotation. If
+-- | @'tcMultAnnOnPatBind' ann@ takes an optional multiplicity annotation. If
 -- present the multiplicity is returned, otherwise a fresh unification variable
 -- is generated so that multiplicity can be inferred.
-tcMultAnn :: HsMultAnn GhcRn -> TcM Mult
-tcMultAnn (HsPct1Ann _) = return oneDataConTy
-tcMultAnn (HsMultAnn _ p) = tcCheckLHsTypeInContext p (TheKind multiplicityTy)
-tcMultAnn (HsNoMultAnn _) = newFlexiTyVarTy multiplicityTy
+tcMultAnnOnPatBind :: HsMultAnn GhcRn -> TcM Mult
+tcMultAnnOnPatBind (HsLinearAnn _) = return oneDataConTy
+tcMultAnnOnPatBind (HsExplicitMult _ p) = tcCheckLHsTypeInContext p (TheKind multiplicityTy)
+tcMultAnnOnPatBind (HsUnannotated _) = newMultiplicityVar
 
 tcExtendTyVarEnvForRhs :: Maybe TcIdSigInst -> TcM a -> TcM a
 tcExtendTyVarEnvForRhs Nothing thing_inside
@@ -1826,12 +1811,17 @@ decideGeneralisationPlan dflags top_lvl closed sig_fn lbinds
         -- See Note [Always generalise top-level bindings]
 
       | has_mult_anns_and_pats = False
-        -- See Note [Non-variable pattern bindings aren't linear]
+        -- See (NVP1) and (NVP4) in Note [Non-variable pattern bindings aren't linear]
 
-      | IsGroupClosed _ True <- closed = True
+      | IsGroupClosed _ True <- closed
+      , not (null binders) = True
         -- The 'True' means that all of the group's
         -- free vars have ClosedTypeId=True; so we can ignore
-        -- -XMonoLocalBinds, and generalise anyway
+        -- -XMonoLocalBinds, and generalise anyway.
+        -- Except if 'fv' is empty: there is no binder to generalise, so
+        -- generalising does nothing. And trying to generalise hurts linear
+        -- types (see #25428). So we don't force it.
+        -- See (NVP5) in Note [Non-variable pattern bindings aren't linear] in GHC.Tc.Gen.Bind.
 
       | has_partial_sigs = True
         -- See Note [Partial type signatures and generalisation]
@@ -1853,7 +1843,7 @@ decideGeneralisationPlan dflags top_lvl closed sig_fn lbinds
       Just (TcIdSig (TcPartialSig {})) -> True
       _                                -> False
     has_mult_anns_and_pats = any has_mult_ann_and_pat lbinds
-    has_mult_ann_and_pat (L _ (PatBind{pat_mult=HsNoMultAnn{}})) = False
+    has_mult_ann_and_pat (L _ (PatBind{pat_mult=HsUnannotated{}})) = False
     has_mult_ann_and_pat (L _ (PatBind{pat_lhs=(L _ (VarPat{}))})) = False
     has_mult_ann_and_pat (L _ (PatBind{})) = True
     has_mult_ann_and_pat _ = False
@@ -1925,15 +1915,3 @@ function may be exported.  And it's easier to grok "MonoLocalBinds" as
 applying to, well, local bindings.
 -}
 
-{- *********************************************************************
-*                                                                      *
-               Error contexts and messages
-*                                                                      *
-********************************************************************* -}
-
--- This one is called on LHS, when pat and grhss are both Name
--- and on RHS, when pat is TcId and grhss is still Name
-patMonoBindsCtxt :: (OutputableBndrId p)
-                 => LPat (GhcPass p) -> GRHSs GhcRn (LHsExpr GhcRn) -> SDoc
-patMonoBindsCtxt pat grhss
-  = hang (text "In a pattern binding:") 2 (pprPatBind pat grhss)

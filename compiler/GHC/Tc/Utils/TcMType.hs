@@ -1,7 +1,8 @@
-{-# LANGUAGE LambdaCase      #-}
-{-# LANGUAGE MultiWayIf      #-}
-{-# LANGUAGE RecursiveDo     #-}
-{-# LANGUAGE TupleSections   #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE LambdaCase            #-}
+{-# LANGUAGE MultiWayIf            #-}
+{-# LANGUAGE RecursiveDo           #-}
+{-# LANGUAGE TupleSections         #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 {-
@@ -41,14 +42,13 @@ module GHC.Tc.Utils.TcMType (
   -- Creating new evidence variables
   newEvVar, newEvVars, newDict,
   newWantedWithLoc, newWanted, newWanteds, cloneWanted, cloneWC, cloneWantedCtEv,
-  emitWanted, emitWantedEq, emitWantedEvVar, emitWantedEvVars,
+  emitWanted, emitWantedEq, emitWantedEvVar,
   emitWantedEqs,
   newTcEvBinds, newNoTcEvBinds, addTcEvBind,
   emitNewExprHole,
 
-  newCoercionHole, newCoercionHoleO, newVanillaCoercionHole,
+  newCoercionHole,
   fillCoercionHole, isFilledCoercionHole,
-  unpackCoercionHole, unpackCoercionHole_maybe,
   checkCoercionHole,
 
   newImplication,
@@ -65,7 +65,7 @@ module GHC.Tc.Utils.TcMType (
   -- Expected types
   ExpType(..), ExpSigmaType, ExpRhoType,
   mkCheckExpType, newInferExpType, newInferExpTypeFRR,
-  tcInfer, tcInferFRR,
+  runInfer, runInferRho, runInferSigma, runInferKind, runInferRhoFRR, runInferSigmaFRR,
   readExpType, readExpType_maybe, readScaledExpType,
   expTypeToType, scaledExpTypeToType,
   checkingExpType_maybe, checkingExpType,
@@ -83,7 +83,7 @@ module GHC.Tc.Utils.TcMType (
 
   candidateQTyVarsOfType,  candidateQTyVarsOfKind,
   candidateQTyVarsOfTypes, candidateQTyVarsOfKinds,
-  candidateQTyVarsWithBinders,
+  candidateQTyVarsWithBinders, weedOutCandidates,
   CandidatesQTvs(..), delCandidates,
   candidateKindVars, partitionCandidates,
 
@@ -110,11 +110,10 @@ import {-# SOURCE #-} GHC.Tc.Utils.Unify( unifyInvisibleType, tcSubMult )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Evidence
-import GHC.Tc.Types.CtLoc( CtLoc, ctLocOrigin )
+import GHC.Tc.Types.CtLoc( CtLoc )
 import GHC.Tc.Utils.Monad        -- TcType, amongst others
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Errors.Types
-import GHC.Tc.Zonk.Type
 import GHC.Tc.Zonk.TcType
 
 import GHC.Builtin.Names
@@ -123,6 +122,7 @@ import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Ppr
+import GHC.Core.TyCo.Tidy
 import GHC.Core.Type
 import GHC.Core.TyCon
 import GHC.Core.Coercion
@@ -200,12 +200,13 @@ newEvVar ty = do { name <- newSysName (predTypeOccName ty)
 newWantedWithLoc :: CtLoc -> PredType -> TcM CtEvidence
 newWantedWithLoc loc pty
   = do dst <- case classifyPredType pty of
-                EqPred {} -> HoleDest  <$> newCoercionHole loc pty
+                EqPred {} -> HoleDest  <$> newCoercionHole pty
                 _         -> EvVarDest <$> newEvVar pty
-       return $ CtWanted { ctev_dest      = dst
-                         , ctev_pred      = pty
-                         , ctev_loc       = loc
-                         , ctev_rewriters = emptyRewriterSet }
+       return $ CtWanted $
+         WantedCt { ctev_dest      = dst
+                  , ctev_pred      = pty
+                  , ctev_loc       = loc
+                  , ctev_rewriters = emptyRewriterSet }
 
 -- | Create a new Wanted constraint with the given 'CtOrigin', and
 -- location information taken from the 'TcM' environment.
@@ -225,10 +226,10 @@ newWanteds orig = mapM (newWanted orig Nothing)
 ----------------------------------------------
 
 cloneWantedCtEv :: CtEvidence -> TcM CtEvidence
-cloneWantedCtEv ctev@(CtWanted { ctev_pred = pty, ctev_dest = HoleDest _, ctev_loc = loc })
+cloneWantedCtEv (CtWanted ctev@(WantedCt { ctev_pred = pty, ctev_dest = HoleDest _ }))
   | isEqPred pty
-  = do { co_hole <- newCoercionHole loc pty
-       ; return (ctev { ctev_dest = HoleDest co_hole }) }
+  = do { co_hole <- newCoercionHole pty
+       ; return $ CtWanted (ctev { ctev_dest = HoleDest co_hole }) }
   | otherwise
   = pprPanic "cloneWantedCtEv" (ppr pty)
 cloneWantedCtEv ctev = return ctev
@@ -275,13 +276,13 @@ emitWantedEqs origin pairs
 -- | Emits a new equality constraint
 emitWantedEq :: CtOrigin -> TypeOrKind -> Role -> TcType -> TcType -> TcM Coercion
 emitWantedEq origin t_or_k role ty1 ty2
-  = do { hole <- newCoercionHoleO origin pty
+  = do { hole <- newCoercionHole pty
        ; loc  <- getCtLocM origin (Just t_or_k)
-       ; emitSimple $ mkNonCanonical $
-         CtWanted { ctev_pred      = pty
-                  , ctev_dest      = HoleDest hole
-                  , ctev_loc       = loc
-                  , ctev_rewriters = emptyRewriterSet }
+       ; emitSimple $ mkNonCanonical $ CtWanted $
+           WantedCt { ctev_pred      = pty
+                    , ctev_dest      = HoleDest hole
+                    , ctev_loc       = loc
+                    , ctev_rewriters = emptyRewriterSet }
        ; return (HoleCo hole) }
   where
     pty = mkEqPredRole role ty1 ty2
@@ -292,15 +293,12 @@ emitWantedEvVar :: CtOrigin -> TcPredType -> TcM EvVar
 emitWantedEvVar origin ty
   = do { new_cv <- newEvVar ty
        ; loc <- getCtLocM origin Nothing
-       ; let ctev = CtWanted { ctev_pred      = ty
+       ; let ctev = WantedCt { ctev_pred      = ty
                              , ctev_dest      = EvVarDest new_cv
                              , ctev_loc       = loc
                              , ctev_rewriters = emptyRewriterSet }
-       ; emitSimple $ mkNonCanonical ctev
+       ; emitSimple $ mkNonCanonical $ CtWanted ctev
        ; return new_cv }
-
-emitWantedEvVars :: CtOrigin -> [TcPredType] -> TcM [EvVar]
-emitWantedEvVars orig = mapM (emitWantedEvVar orig)
 
 -- | Emit a new wanted expression hole
 emitNewExprHole :: RdrName         -- of the hole
@@ -357,23 +355,13 @@ newImplication
 ************************************************************************
 -}
 
-newVanillaCoercionHole :: TcPredType -> TcM CoercionHole
-newVanillaCoercionHole = new_coercion_hole False
-
-newCoercionHole :: CtLoc -> TcPredType -> TcM CoercionHole
-newCoercionHole loc = newCoercionHoleO (ctLocOrigin loc)
-
-newCoercionHoleO :: CtOrigin -> TcPredType -> TcM CoercionHole
-newCoercionHoleO (KindEqOrigin {}) pty = new_coercion_hole True pty
-newCoercionHoleO _ pty                 = new_coercion_hole False pty
-
-new_coercion_hole :: Bool -> TcPredType -> TcM CoercionHole
-new_coercion_hole hetero_kind pred_ty
+newCoercionHole :: TcPredType -> TcM CoercionHole
+-- For the Bool, see (EIK2) in Note [Equalities with heterogeneous kinds]
+newCoercionHole pred_ty
   = do { co_var <- newEvVar pred_ty
        ; traceTc "New coercion hole:" (ppr co_var <+> dcolon <+> ppr pred_ty)
        ; ref <- newMutVar Nothing
-       ; return $ CoercionHole { ch_co_var = co_var, ch_ref = ref
-                               , ch_hetero_kind = hetero_kind } }
+       ; return $ CoercionHole { ch_co_var = co_var, ch_ref = ref } }
 
 -- | Put a value in a coercion hole
 fillCoercionHole :: CoercionHole -> Coercion -> TcM ()
@@ -450,30 +438,29 @@ See test case T21325.
 
 -- actual data definition is in GHC.Tc.Utils.TcType
 
-newInferExpType :: TcM ExpType
-newInferExpType = new_inferExpType Nothing
+newInferExpType :: InferInstFlag -> TcM ExpType
+newInferExpType iif = new_inferExpType iif IFRR_Any
 
-newInferExpTypeFRR :: FixedRuntimeRepContext -> TcM ExpTypeFRR
-newInferExpTypeFRR frr_orig
-  = do { th_stage <- getStage
-       ; if
-          -- See [Wrinkle: Typed Template Haskell]
-          -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-          | Brack _ (TcPending {}) <- th_stage
-          -> new_inferExpType Nothing
+newInferExpTypeFRR :: InferInstFlag -> FixedRuntimeRepContext -> TcM ExpTypeFRR
+newInferExpTypeFRR iif frr_orig
+  = do { th_lvl <- getThLevel
+       ; let mb_frr = case th_lvl of
+                        TypedBrack {} -> IFRR_Any
+                        _             -> IFRR_Check frr_orig
+               -- mb_frr: see [Wrinkle: Typed Template Haskell]
+               -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
 
-          | otherwise
-          -> new_inferExpType (Just frr_orig) }
+       ; new_inferExpType iif mb_frr }
 
-new_inferExpType :: Maybe FixedRuntimeRepContext -> TcM ExpType
-new_inferExpType mb_frr_orig
+new_inferExpType :: InferInstFlag -> InferFRRFlag -> TcM ExpType
+new_inferExpType iif ifrr
   = do { u <- newUnique
        ; tclvl <- getTcLevel
        ; traceTc "newInferExpType" (ppr u <+> ppr tclvl)
        ; ref <- newMutVar Nothing
        ; return (Infer (IR { ir_uniq = u, ir_lvl = tclvl
-                           , ir_ref = ref
-                           , ir_frr = mb_frr_orig })) }
+                           , ir_inst = iif, ir_frr  = ifrr
+                           , ir_ref  = ref })) }
 
 -- | Extract a type out of an ExpType, if one exists. But one should always
 -- exist. Unless you're quite sure you know what you're doing.
@@ -527,12 +514,12 @@ inferResultToType (IR { ir_uniq = u, ir_lvl = tc_lvl
   where
     -- See Note [TcLevel of ExpType]
     new_meta = case mb_frr of
-      Nothing  ->  do { rr  <- newMetaTyVarTyAtLevel tc_lvl runtimeRepTy
+      IFRR_Any ->  do { rr  <- newMetaTyVarTyAtLevel tc_lvl runtimeRepTy
                       ; newMetaTyVarTyAtLevel tc_lvl (mkTYPEapp rr) }
-      Just frr -> mdo { rr  <- newConcreteTyVarTyAtLevel conc_orig tc_lvl runtimeRepTy
-                      ; tau <- newMetaTyVarTyAtLevel tc_lvl (mkTYPEapp rr)
-                      ; let conc_orig = ConcreteFRR $ FixedRuntimeRepOrigin tau frr
-                      ; return tau }
+      IFRR_Check frr -> mdo { rr  <- newConcreteTyVarTyAtLevel conc_orig tc_lvl runtimeRepTy
+                            ; tau <- newMetaTyVarTyAtLevel tc_lvl (mkTYPEapp rr)
+                            ; let conc_orig = ConcreteFRR $ FixedRuntimeRepOrigin tau frr
+                            ; return tau }
 
 {- Note [inferResultToType]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -549,20 +536,31 @@ Note [fillInferResult] in GHC.Tc.Utils.Unify.
 -- | Infer a type using a fresh ExpType
 -- See also Note [ExpType] in "GHC.Tc.Utils.TcMType"
 --
--- Use 'tcInferFRR' if you require the type to have a fixed
+-- Use 'runInferFRR' if you require the type to have a fixed
 -- runtime representation.
-tcInfer :: (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
-tcInfer = tc_infer Nothing
+runInferSigma :: (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
+runInferSigma = runInfer IIF_Sigma IFRR_Any
 
--- | Like 'tcInfer', except it ensures that the resulting type
+runInferRho :: (ExpRhoType -> TcM a) -> TcM (a, TcRhoType)
+runInferRho = runInfer IIF_DeepRho IFRR_Any
+
+runInferKind :: (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
+-- Used for kind-checking types, where we never want deep instantiation,
+-- nor FRR checks
+runInferKind = runInfer IIF_Sigma IFRR_Any
+
+-- | Like 'runInferRho', except it ensures that the resulting type
 -- has a syntactically fixed RuntimeRep as per Note [Fixed RuntimeRep] in
 -- GHC.Tc.Utils.Concrete.
-tcInferFRR :: FixedRuntimeRepContext -> (ExpSigmaTypeFRR -> TcM a) -> TcM (a, TcSigmaTypeFRR)
-tcInferFRR frr_orig = tc_infer (Just frr_orig)
+runInferRhoFRR :: FixedRuntimeRepContext -> (ExpRhoTypeFRR -> TcM a) -> TcM (a, TcRhoTypeFRR)
+runInferRhoFRR frr_orig = runInfer IIF_DeepRho (IFRR_Check frr_orig)
 
-tc_infer :: Maybe FixedRuntimeRepContext -> (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
-tc_infer mb_frr tc_check
-  = do { res_ty <- new_inferExpType mb_frr
+runInferSigmaFRR :: FixedRuntimeRepContext -> (ExpSigmaTypeFRR -> TcM a) -> TcM (a, TcSigmaTypeFRR)
+runInferSigmaFRR frr_orig = runInfer IIF_Sigma (IFRR_Check frr_orig)
+
+runInfer :: InferInstFlag -> InferFRRFlag -> (ExpSigmaType -> TcM a) -> TcM (a, TcSigmaType)
+runInfer iif mb_frr tc_check
+  = do { res_ty <- new_inferExpType iif mb_frr
        ; result <- tc_check res_ty
        ; res_ty <- readExpType res_ty
        ; return (result, res_ty) }
@@ -755,7 +753,7 @@ newNamedAnonMetaTyVar tyvar_name meta_info kind
   = do  { name    <- newMetaTyVarName tyvar_name
         ; details <- newMetaDetails meta_info
         ; let tyvar = mkTcTyVar name kind details
-        ; traceTc "newAnonMetaTyVar" (ppr tyvar)
+        ; traceTc "newAnonMetaTyVar" (ppr tyvar <+> dcolon <+> ppr kind)
         ; return tyvar }
 
 -- makes a new skolem tv
@@ -797,11 +795,11 @@ newConcreteTyVar :: HasDebugCallStack => ConcreteTvOrigin
                  -> FastString -> TcKind -> TcM TcTyVar
 newConcreteTyVar reason fs kind
   = assertPpr (isConcreteType kind) assert_msg $
-  do { th_stage <- getStage
+  do { th_lvl <- getThLevel
      ; if
         -- See [Wrinkle: Typed Template Haskell]
         -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-        | Brack _ (TcPending {}) <- th_stage
+        | TypedBrack _ <- th_lvl
         -> newNamedAnonMetaTyVar fs TauTv kind
 
         | otherwise
@@ -830,8 +828,8 @@ cloneAnonMetaTyVar info tv kind
         ; traceTc "cloneAnonMetaTyVar" (ppr tyvar <+> dcolon <+> ppr (tyVarKind tyvar))
         ; return tyvar }
 
--- Make a new CycleBreakerTv. See Note [Type equality cycles]
--- in GHC.Tc.Solver.Equality
+-- | Make a new cycle-breaker type variable. See Note [Type equality cycles]
+-- in GHC.Tc.Solver.Equality.
 newCycleBreakerTyVar :: TcKind -> TcM TcTyVar
 newCycleBreakerTyVar kind
   = do { details <- newMetaDetails CycleBreakerTv
@@ -983,9 +981,9 @@ newOpenFlexiTyVar
 -- in GHC.Tc.Utils.Concrete.
 newOpenFlexiFRRTyVar :: FixedRuntimeRepContext -> TcM TcTyVar
 newOpenFlexiFRRTyVar frr_ctxt
-  = do { th_stage <- getStage
-       ; case th_stage of
-          { Brack _ (TcPending {}) -- See [Wrinkle: Typed Template Haskell]
+  = do { th_lvl <- getThLevel
+       ; case th_lvl of
+          { TypedBrack _ -- See [Wrinkle: Typed Template Haskell]
               -> newOpenFlexiTyVar -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
           ; _ ->
    mdo { let conc_orig = ConcreteFRR $
@@ -1037,11 +1035,11 @@ newMetaTyVarX = new_meta_tv_x TauTv
 -- | Like 'newMetaTyVarX', but for concrete type variables.
 newConcreteTyVarX :: ConcreteTvOrigin -> Subst -> TyVar -> TcM (Subst, TcTyVar)
 newConcreteTyVarX conc subst tv
-  = do { th_stage <- getStage
+  = do { th_lvl <- getThLevel
        ; if
           -- See [Wrinkle: Typed Template Haskell]
           -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-          | Brack _ (TcPending {}) <- th_stage
+          | TypedBrack _  <- th_lvl
           -> new_meta_tv_x TauTv subst tv
           | otherwise
           -> new_meta_tv_x (ConcreteTv conc) subst tv }
@@ -1342,6 +1340,10 @@ instance Outputable CandidatesQTvs where
                                              , text "dv_tvs =" <+> ppr tvs
                                              , text "dv_cvs =" <+> ppr cvs ])
 
+weedOutCandidates :: (DTyVarSet -> DTyVarSet) -> CandidatesQTvs -> CandidatesQTvs
+weedOutCandidates weed_out dv@(DV { dv_kvs = kvs, dv_tvs = tvs })
+  = dv { dv_kvs = weed_out kvs, dv_tvs = weed_out tvs }
+
 isEmptyCandidates :: CandidatesQTvs -> Bool
 isEmptyCandidates (DV { dv_kvs = kvs, dv_tvs = tvs })
   = isEmptyDVarSet kvs && isEmptyDVarSet tvs
@@ -1576,7 +1578,7 @@ collect_cand_qtvs_co orig_ty cur_lvl bound = go_co
     go_co dv (SubCo co)              = go_co dv co
 
     go_co dv (HoleCo hole)
-      = do m_co <- unpackCoercionHole_maybe hole
+      = do m_co <- liftZonkM (unpackCoercionHole_maybe hole)
            case m_co of
              Just co -> go_co dv co
              Nothing -> go_cv dv (coHoleCoVar hole)
@@ -2449,14 +2451,11 @@ checkTypeHasFixedRuntimeRep prov ty =
   unless (typeHasFixedRuntimeRep ty)
     (addDetailedDiagnostic $ TcRnTypeDoesNotHaveFixedRuntimeRep ty prov)
 
-{-
-%************************************************************************
-%*                                                                      *
+{- **********************************************************************
+*                                                                       *
              Error messages
 *                                                                       *
-*************************************************************************
-
--}
+********************************************************************** -}
 
 -- See Note [Naughty quantification candidates]
 naughtyQuantification :: TcType   -- original type user wanted to quantify

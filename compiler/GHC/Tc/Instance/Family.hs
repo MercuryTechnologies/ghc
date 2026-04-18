@@ -1,11 +1,11 @@
-{-# LANGUAGE GADTs, ViewPatterns #-}
+{-# LANGUAGE GADTs, ViewPatterns, LambdaCase #-}
 
 -- | The @FamInst@ type: family instance heads
 module GHC.Tc.Instance.Family (
         FamInstEnvs, tcGetFamInstEnvs,
         checkFamInstConsistency, tcExtendLocalFamInstEnv,
         tcLookupDataFamInst, tcLookupDataFamInst_maybe,
-        tcInstNewTyCon_maybe, tcTopNormaliseNewTypeTF_maybe,
+        tcTopNormaliseNewTypeTF_maybe,
 
         -- * Injectivity
         reportInjectivityErrors, reportConflictingInjectivityErrs
@@ -34,9 +34,7 @@ import GHC.Tc.Utils.TcType
 import GHC.Unit.External
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
-import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.Deps
-import GHC.Unit.Home.ModInfo
 
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Name.Reader
@@ -57,7 +55,8 @@ import qualified Data.List.NonEmpty as NE
 import Data.Function ( on )
 
 import qualified GHC.LanguageExtensions  as LangExt
-import GHC.Unit.Env (unitEnv_hpts)
+import Data.List (sortOn)
+import qualified GHC.Unit.Home.Graph as HUG
 
 {- Note [The type family instance consistency story]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -239,6 +238,49 @@ That situation should be pretty common in practice, there's usually
 a set of utility modules that every module imports directly or indirectly.
 
 This is basically the idea from #13092, comment:14.
+
+Note [Order of type family consistency checks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Consider a module M which imports modules A, B and C, all defining (open) type
+family instances.
+
+We can waste a lot of work in type family consistency checking depending on the
+order in which the modules are processed.
+
+Suppose for example that C imports A and B. When we compiled C, we will have
+checked A and B for consistency against eachother. This means that, when
+processing the imports of M to check type family instance consistency:
+
+* if C is processed first, then A and B will not need to be checked for
+  consistency against eachother again,
+* if we process A and B before C,then the
+  consistency checks between A and B will be performed again. This is wasted
+  work, as we already performed them for C.
+
+This can make a significant difference. Keeping the nomenclature of the above
+example for illustration, we have observed situations in practice in which the
+compilation time of M goes from 1 second (the "processing A and B first" case)
+down to 80 milliseconds (the "processing C first" case).
+
+Clearly we should engineer that C is checked before B and A, but by what scheme?
+
+A simple one is to observe that if a module M is in the transitive closure of X
+then the size of the consistent family set of M is less than or equal to size
+of the consistent family set of X.
+
+Therefore, by sorting the imports by the size of the consistent family set and
+processing the largest first, we make sure to process modules in topological
+order.
+
+For a particular project, without this change we did 40 million checks and with
+this change we did 22.9 million checks. This is significant as before this change
+type family consistency checks accounted for 26% of total type checker allocations which
+was reduced to 15%.
+
+See tickets #25554 for discussion about this exact issue and #25555 for
+why we still do redundant checks.
+
 -}
 
 -- We don't need to check the current module, this is done in
@@ -250,40 +292,44 @@ checkFamInstConsistency directlyImpMods
        ; traceTc "checkFamInstConsistency" (ppr directlyImpMods)
        ; let { -- Fetch the iface of a given module.  Must succeed as
                -- all directly imported modules must already have been loaded.
-               modIface mod =
-                 case lookupIfaceByModule hug (eps_PIT eps) mod of
+               modIface mod = liftIO $
+                 lookupIfaceByModule hug (eps_PIT eps) mod >>= \case
                    Nothing    -> panicDoc "FamInst.checkFamInstConsistency"
-                                          (ppr mod $$ ppr hug)
-                   Just iface -> iface
+                                          (ppr mod $$ ppr (HUG.allUnits hug))
+                   Just iface -> pure iface
 
                -- Which family instance modules were checked for consistency
                -- when we compiled `mod`?
                -- Itself (if a family instance module) and its dep_finsts.
                -- This is df(D_i) from
                -- Note [Checking family instance optimization]
-             ; modConsistent :: Module -> [Module]
-             ; modConsistent mod =
-                 if mi_finsts (mi_final_exts (modIface mod)) then mod:deps else deps
-                 where
-                 deps = dep_finsts . mi_deps . modIface $ mod
+             ; modConsistent :: Module -> TcM [Module]
+             ; modConsistent mod = do
+                 ifc <- modIface mod
+                 deps <- dep_finsts . mi_deps <$> modIface mod
+                 pure $
+                   if mi_finsts ifc
+                      then mod:deps
+                      else deps
 
-             ; hmiModule     = mi_module . hm_iface
-             ; hmiFamInstEnv = extendFamInstEnvList emptyFamInstEnv
-                               . md_fam_insts . hm_details
-             ; hpt_fam_insts = mkModuleEnv [ (hmiModule hmi, hmiFamInstEnv hmi)
-                                           | hpt <- unitEnv_hpts hug
-                                           , hmi <- eltsHpt hpt ]
 
+             -- Sorting the list by size has the effect of performing a topological sort.
+             -- See Note [Order of type family consistency checks]
              }
 
-       ; checkMany hpt_fam_insts modConsistent directlyImpMods
+       ; hpt_fam_insts <- liftIO $ HUG.allFamInstances hug
+       ; debug_consistent_set <- mapM (\x -> (\y -> (x, length y)) <$> modConsistent x) directlyImpMods
+       ; traceTc "init_consistent_set" (ppr debug_consistent_set)
+       ; let init_consistent_set = map fst (reverse (sortOn snd debug_consistent_set))
+       ; checkMany hpt_fam_insts modConsistent init_consistent_set
+
        }
   where
     -- See Note [Checking family instance optimization]
     checkMany
-      :: ModuleEnv FamInstEnv   -- home package family instances
-      -> (Module -> [Module])   -- given A, modules checked when A was checked
-      -> [Module]               -- modules to process
+      :: ModuleEnv FamInstEnv     -- home package family instances
+      -> (Module -> TcM [Module]) -- given A, modules checked when A was checked
+      -> [Module]                 -- modules to process
       -> TcM ()
     checkMany hpt_fam_insts modConsistent mods = go [] emptyModuleSet mods
       where
@@ -294,6 +340,41 @@ checkFamInstConsistency directlyImpMods
          -> TcM ()
       go _ _ [] = return ()
       go consistent consistent_set (mod:mods) = do
+        mod_deps_consistent <- modConsistent mod
+        let
+          mod_deps_consistent_set = mkModuleSet mod_deps_consistent
+          consistent' = to_check_from_mod ++ consistent
+          consistent_set' =
+            extendModuleSetList consistent_set to_check_from_mod
+          to_check_from_consistent =
+            filterOut (`elemModuleSet` mod_deps_consistent_set) consistent
+          to_check_from_mod =
+            filterOut (`elemModuleSet` consistent_set) mod_deps_consistent
+            -- Why don't we just minusModuleSet here (above)?
+            -- We could, but doing so means one of two things:
+            --
+            --   1. When looping over the cartesian product we convert
+            --   a set into a non-deterministically ordered list. Which
+            --   happens to be fine for interface file determinism
+            --   in this case, today, because the order only
+            --   determines the order of deferred checks. But such
+            --   invariants are hard to keep.
+            --
+            --   2. When looping over the cartesian product we convert
+            --   a set into a deterministically ordered list - this
+            --   adds some additional cost of sorting for every
+            --   direct import.
+            --
+            --   That also explains why we need to keep both 'consistent'
+            --   and 'consistentSet'.
+            --
+            --   See also Note [ModuleEnv performance and determinism].
+
+        traceTc "checkManySize" (vcat [text "mod:" <+> ppr mod
+                                      , text "m1:" <+> ppr (length to_check_from_mod)
+                                      , text "m2:" <+> ppr (length (to_check_from_consistent))
+                                      , text "product:" <+> ppr (length to_check_from_mod * length to_check_from_consistent)
+                                      ])
         sequence_
           [ check hpt_fam_insts m1 m2
           | m1 <- to_check_from_mod
@@ -302,35 +383,6 @@ checkFamInstConsistency directlyImpMods
           , m2 <- to_check_from_consistent
           ]
         go consistent' consistent_set' mods
-        where
-        mod_deps_consistent =  modConsistent mod
-        mod_deps_consistent_set = mkModuleSet mod_deps_consistent
-        consistent' = to_check_from_mod ++ consistent
-        consistent_set' =
-          extendModuleSetList consistent_set to_check_from_mod
-        to_check_from_consistent =
-          filterOut (`elemModuleSet` mod_deps_consistent_set) consistent
-        to_check_from_mod =
-          filterOut (`elemModuleSet` consistent_set) mod_deps_consistent
-        -- Why don't we just minusModuleSet here?
-        -- We could, but doing so means one of two things:
-        --
-        --   1. When looping over the cartesian product we convert
-        --   a set into a non-deterministically ordered list. Which
-        --   happens to be fine for interface file determinism
-        --   in this case, today, because the order only
-        --   determines the order of deferred checks. But such
-        --   invariants are hard to keep.
-        --
-        --   2. When looping over the cartesian product we convert
-        --   a set into a deterministically ordered list - this
-        --   adds some additional cost of sorting for every
-        --   direct import.
-        --
-        --   That also explains why we need to keep both 'consistent'
-        --   and 'consistentSet'.
-        --
-        --   See also Note [ModuleEnv performance and determinism].
     check hpt_fam_insts m1 m2
       = do { env1' <- getFamInsts hpt_fam_insts m1
            ; env2' <- getFamInsts hpt_fam_insts m2
@@ -354,7 +406,7 @@ getFamInsts hpt_fam_insts mod
   | Just env <- lookupModuleEnv hpt_fam_insts mod = return env
   | otherwise = do { _ <- initIfaceTcRn (loadSysInterface doc mod)
                    ; eps <- getEps
-                   ; return (expectJust "checkFamInstConsistency" $
+                   ; return (expectJust $
                              lookupModuleEnv (eps_mod_fam_inst_env eps) mod) }
   where
     doc = ppr mod <+> text "is a family-instance module"
@@ -367,15 +419,6 @@ getFamInsts hpt_fam_insts mod
 ************************************************************************
 
 -}
-
--- | If @co :: T ts ~ rep_ty@ then:
---
--- > instNewTyCon_maybe T ts = Just (rep_ty, co)
---
--- Checks for a newtype, and for being saturated
--- Just like Coercion.instNewTyCon_maybe, but returns a TcCoercion
-tcInstNewTyCon_maybe :: TyCon -> [TcType] -> Maybe (TcType, TcCoercion)
-tcInstNewTyCon_maybe = instNewTyCon_maybe
 
 -- | Like 'tcLookupDataFamInst_maybe', but returns the arguments back if
 -- there is no data family to unwrap.

@@ -46,7 +46,7 @@ module GHC.Internal.List (
 import GHC.Internal.Data.Maybe
 import GHC.Internal.Base
 import GHC.Internal.Num (Num(..))
-import GHC.Num.Integer (Integer)
+import GHC.Internal.Bignum.Integer (Integer)
 import GHC.Internal.Stack.Types (HasCallStack)
 
 infixl 9  !?, !!
@@ -601,7 +601,7 @@ scanl' = scanlGo'
 -- See Note [scanl rewrite rules]
 {-# RULES
 "scanl'"  [~1] forall f a bs . scanl' f a bs =
-  build (\c n -> a `c` foldr (scanlFB' f c) (flipSeq n) bs a)
+  build (\c n -> a `seq` (a `c` foldr (scanlFB' f c) (flipSeq n) bs a))
 "scanlList'" [1] forall f a bs .
     foldr (scanlFB' f (:)) (flipSeq []) bs a = tail (scanl' f a bs)
  #-}
@@ -1642,6 +1642,8 @@ xs !! n
 -- This is the total variant of the partial '!!' operator.
 --
 -- WARNING: This function takes linear time in the index.
+--
+-- @since base-4.19.0.0
 --
 -- ==== __Examples__
 --

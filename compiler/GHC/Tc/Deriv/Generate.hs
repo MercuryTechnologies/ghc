@@ -263,7 +263,7 @@ gen_Eq_binds loc dit@(DerivInstTys{ dit_rep_tc = tycon
     ------------------------------------------------------------------
     nested_eq_expr []  [] [] = true_Expr
     nested_eq_expr tys as bs
-      = foldr1 and_Expr (zipWith3Equal "nested_eq" nested_eq tys as bs)
+      = foldr1 and_Expr $ expectNonEmpty $ zipWith3Equal nested_eq tys as bs
       -- Using 'foldr1' here ensures that the derived code is correctly
       -- associated. See #10859.
       where
@@ -914,7 +914,7 @@ gen_Ix_binds loc (DerivInstTys{dit_rep_tc = tycon}) = do
           (noLocA [nlTuplePat [con_pat as_needed, con_pat bs_needed] Boxed]) $
         noLocA (mkHsComp ListComp stmts con_expr)
       where
-        stmts = zipWith3Equal "single_con_range" mk_qual as_needed bs_needed cs_needed
+        stmts = zipWith3Equal mk_qual as_needed bs_needed cs_needed
 
         mk_qual a b c = noLocA $ mkPsBindStmt noAnn (nlVarPat c)
                                  (nlHsApp (nlHsVar range_RDR)
@@ -955,8 +955,8 @@ gen_Ix_binds loc (DerivInstTys{dit_rep_tc = tycon}) = do
              -- If the product type has no fields, inRange is trivially true
              -- (see #12853).
              then true_Expr
-             else foldl1 and_Expr (zipWith3Equal "single_con_inRange" in_range
-                    as_needed bs_needed cs_needed)
+             else foldl1 and_Expr $ expectNonEmpty $
+                  zipWith3Equal in_range as_needed bs_needed cs_needed
       where
         in_range a b c
           = nlHsApps inRange_RDR [mkLHsVarTuple [a,b] noAnn, nlHsVar c]
@@ -1055,9 +1055,9 @@ gen_Read_binds get_fixity loc dit@(DerivInstTys{dit_rep_tc = tycon})
         rhs | null data_cons -- See Note [Read for empty data types]
             = nlHsVar pfail_RDR
             | otherwise
-            = nlHsApp (nlHsVar parens_RDR)
-                      (foldr1 mk_alt (read_nullary_cons ++
-                                      read_non_nullary_cons))
+            = nlHsApp (nlHsVar parens_RDR) $
+              foldr1 mk_alt $ expectNonEmpty $
+              read_nullary_cons ++ read_non_nullary_cons
 
     read_non_nullary_cons = map read_non_nullary_con non_nullary_cons
 
@@ -1117,7 +1117,7 @@ gen_Read_binds get_fixity loc dit@(DerivInstTys{dit_rep_tc = tycon})
             ++ concat (intersperse [read_punc ","] field_stmts)
             ++ [read_punc "}"]
 
-        field_stmts  = zipWithEqual "lbl_stmts" read_field labels as_needed
+        field_stmts  = zipWithEqual read_field labels as_needed
 
         con_arity    = dataConSourceArity data_con
         labels       = map (field_label . flLabel) $ dataConFieldLabels data_con
@@ -1125,7 +1125,7 @@ gen_Read_binds get_fixity loc dit@(DerivInstTys{dit_rep_tc = tycon})
         is_infix     = dataConIsInfix data_con
         is_record    = labels `lengthExceeds` 0
         as_needed    = take con_arity as_RDRs
-        read_args    = zipWithEqual "gen_Read_binds" read_arg as_needed (derivDataConInstArgTys data_con dit)
+        read_args    = zipWithEqual read_arg as_needed (derivDataConInstArgTys data_con dit)
         (read_a1:read_a2:_) = read_args
 
         prefix_prec = appPrecedence
@@ -1269,7 +1269,7 @@ gen_Show_binds get_fixity loc dit@(DerivInstTys{ dit_rep_tc = tycon
                  where
                    nm       = wrapOpParens (unpackFS l)
 
-             show_args               = zipWithEqual "gen_Show_binds" show_arg bs_needed arg_tys
+             show_args               = zipWithEqual show_arg bs_needed arg_tys
              (show_arg1:show_arg2:_) = show_args
              show_prefix_args        = intersperse (nlHsVar showSpace_RDR) show_args
 
@@ -1278,8 +1278,7 @@ gen_Show_binds get_fixity loc dit@(DerivInstTys{ dit_rep_tc = tycon
              show_record_args = concat $
                                 intersperse [comma_space] $
                                 [ [show_label lbl, arg]
-                                | (lbl,arg) <- zipEqual "gen_Show_binds"
-                                                        labels show_args ]
+                                | (lbl,arg) <- zipEqual labels show_args ]
 
              show_arg :: RdrName -> Type -> LHsExpr GhcPs
              show_arg b arg_ty
@@ -1407,7 +1406,7 @@ gen_Data_binds loc (DerivInstTys{dit_rep_tc = rep_tc})
 
     gfoldl_eqn con
       = ([nlVarPat k_RDR, z_Pat, nlConVarPat con_name as_needed],
-                   foldl' mk_k_app (z_Expr `nlHsApp` (eta_expand_data_con con)) as_needed)
+                   foldl' mk_k_app (z_Expr `nlHsApp` (nlHsVar (getRdrName con))) as_needed)
                    where
                      con_name ::  RdrName
                      con_name = getRdrName con
@@ -1427,17 +1426,8 @@ gen_Data_binds loc (DerivInstTys{dit_rep_tc = rep_tc})
 
     gunfold_alt dc = mkHsCaseAlt (mk_unfold_pat dc) (mk_unfold_rhs dc)
     mk_unfold_rhs dc = foldr nlHsApp
-                           (z_Expr `nlHsApp` (eta_expand_data_con dc))
+                           (z_Expr `nlHsApp` (nlHsVar (getRdrName dc)))
                            (replicate (dataConSourceArity dc) (nlHsVar k_RDR))
-
-    eta_expand_data_con dc =
-        mkHsLam (noLocA eta_expand_pats)
-          (foldl nlHsApp (nlHsVar (getRdrName dc)) eta_expand_hsvars)
-      where
-        eta_expand_pats = map nlVarPat eta_expand_vars
-        eta_expand_hsvars = map nlHsVar eta_expand_vars
-        eta_expand_vars = take (dataConSourceArity dc) as_RDRs
-
 
     mk_unfold_pat dc    -- Last one is a wild-pat, to avoid
                         -- redundant test, and annoying warning
@@ -1634,14 +1624,14 @@ Example:
     ==>
 
     instance (Lift a) => Lift (Foo a) where
-        lift (Foo a) = [| Foo $(lift a) |]
-        lift ((:^:) u v) = [| (:^:) $(lift u) $(lift v) |]
+        lift (Foo a) = ConE 'Foo `appE` (lift a)
+        lift ((:^:) u v) = ConE '(:^:) `appE` (lift u) `appE` (lift v)
 
-        liftTyped (Foo a) = [|| Foo $$(liftTyped a) ||]
-        liftTyped ((:^:) u v) = [|| (:^:) $$(liftTyped u) $$(liftTyped v) ||]
+        liftTyped (Foo a) = unsafeCodeCoerce (ConE 'Foo `appE` (lift a))
+        liftTyped ((:^:) u v) = unsafeCodeCoerce (ConE '(:^:) `appE` (lift u) `appE` (lift v))
 
-Note that we use explicit splices here in order to not trigger the implicit
-lifting warning in derived code. (See #20688)
+Note that we use variable quotes, in order to avoid the constructor being
+lifted by implicit cross-stage lifting when `-XNoImplicitStagePersistence` is enabled.
 -}
 
 
@@ -1651,33 +1641,37 @@ gen_Lift_binds loc (DerivInstTys{ dit_rep_tc = tycon
   ([lift_bind, liftTyped_bind], emptyBag)
   where
     lift_bind      = mkFunBindEC 1 loc lift_RDR (nlHsApp pure_Expr)
-                                 (map (pats_etc mk_untyped_bracket mk_usplice liftName) data_cons)
+                                 (map (pats_etc mk_untyped_bracket ) data_cons)
     liftTyped_bind = mkFunBindEC 1 loc liftTyped_RDR (nlHsApp unsafeCodeCoerce_Expr . nlHsApp pure_Expr)
-                                 (map (pats_etc mk_typed_bracket mk_tsplice liftTypedName) data_cons)
+                                 (map (pats_etc mk_typed_bracket ) data_cons)
 
-    mk_untyped_bracket = HsUntypedBracket noExtField . ExpBr noAnn
-    mk_typed_bracket = HsTypedBracket noAnn
+    mk_untyped_bracket = id
+    mk_typed_bracket = nlHsApp unsafeCodeCoerce_Expr
 
-    mk_tsplice = HsTypedSplice noAnn
-    mk_usplice = HsUntypedSplice noExtField . HsUntypedSpliceExpr noAnn
     data_cons = getPossibleDataCons tycon tycon_args
 
-    pats_etc mk_bracket mk_splice lift_name data_con
+
+    pats_etc :: (LHsExpr GhcPs -> LHsExpr GhcPs) -> DataCon -> ([LPat GhcPs], LHsExpr GhcPs)
+    pats_etc mk_bracket data_con
       = ([con_pat], lift_Expr)
        where
             con_pat      = nlConVarPat data_con_RDR as_needed
             data_con_RDR = getRdrName data_con
             con_arity    = dataConSourceArity data_con
             as_needed    = take con_arity as_RDRs
-            lift_Expr    = noLocA (mk_bracket br_body)
-            br_body      = nlHsApps (Exact (dataConName data_con))
-                                    (map lift_var as_needed)
+            lift_Expr    = mk_bracket finish
+            con_brack :: LHsExpr GhcPs
+            con_brack    = nlHsApps (Exact conEName)
+                            [noLocA $ HsUntypedBracket noExtField
+                              $ VarBr noSrcSpanA True (noLocA (Exact (dataConName data_con)))]
+
+            finish = foldl' (\b1 b2 -> nlHsApps (Exact appEName) [b1, b2]) con_brack (map lift_var as_needed)
 
             lift_var :: RdrName -> LHsExpr (GhcPass 'Parsed)
-            lift_var x   = noLocA (mk_splice (nlHsPar (mk_lift_expr x)))
+            lift_var x   = nlHsPar (mk_lift_expr x)
 
             mk_lift_expr :: RdrName -> LHsExpr (GhcPass 'Parsed)
-            mk_lift_expr x = nlHsApps (Exact lift_name) [nlHsVar x]
+            mk_lift_expr x = nlHsApps (Exact liftName) [nlHsVar x]
 
 {-
 ************************************************************************
@@ -2136,7 +2130,7 @@ nlHsAppType e s = noLocA (HsAppType noAnn e hs_ty)
     hs_ty = mkHsWildCardBndrs $ parenthesizeHsType appPrec $ nlHsCoreTy s
 
 nlHsCoreTy :: HsCoreTy -> LHsType GhcPs
-nlHsCoreTy = noLocA . XHsType
+nlHsCoreTy = noLocA . XHsType . HsCoreTy
 
 mkCoerceClassMethEqn :: Class   -- the class being derived
                      -> [TyVar] -- the tvs in the instance head (this includes
@@ -2209,7 +2203,7 @@ genAuxBindSpecOriginal loc spec
       where
         tc_name = tyConName tycon
         tc_name_string = occNameFS (getOccName tc_name)
-        definition_mod_name = moduleNameFS (moduleName (expectJust "gen_bind DerivDataDataType" $ nameModule_maybe tc_name))
+        definition_mod_name = moduleNameFS (moduleName (expectJust $ nameModule_maybe tc_name))
         rhs = nlHsVar mkDataType_RDR
               `nlHsApp` nlHsLit (mkHsStringFS (concatFS [definition_mod_name, fsLit ".", tc_name_string]))
               `nlHsApp` nlList (map nlHsVar dataC_RDRs)
@@ -2253,10 +2247,10 @@ genAuxBindSpecSig :: SrcSpan -> AuxBindSpec -> LHsSigWcType GhcPs
 genAuxBindSpecSig loc spec = case spec of
   DerivTag2Con tycon _
     -> mk_sig $ L (noAnnSrcSpan loc) $
-       XHsType $ mkSpecForAllTys (tyConTyVars tycon) $
+       XHsType $ HsCoreTy $ mkSpecForAllTys (tyConTyVars tycon) $
        intTy `mkVisFunTyMany` mkParentType tycon
   DerivMaxTag _ _
-    -> mk_sig (L (noAnnSrcSpan loc) (XHsType intTy))
+    -> mk_sig (L (noAnnSrcSpan loc) (XHsType (HsCoreTy intTy)))
   DerivDataDataType _ _ _
     -> mk_sig (nlHsTyVar NotPromoted dataType_RDR)
   DerivDataConstr _ _ _
@@ -2528,20 +2522,21 @@ showParen_Expr
 showParen_Expr e1 e2 = nlHsApp (nlHsApp (nlHsVar showParen_RDR) e1) e2
 
 nested_compose_Expr :: [LHsExpr GhcPs] -> LHsExpr GhcPs
-
-nested_compose_Expr []  = panic "nested_compose_expr"   -- Arg is always non-empty
-nested_compose_Expr [e] = parenify e
-nested_compose_Expr (e:es)
-  = nlHsApp (nlHsApp (nlHsVar compose_RDR) (parenify e)) (nested_compose_Expr es)
+nested_compose_Expr =
+  nlHsLam . mkSimpleMatch (LamAlt LamSingle) (noLocA [z_Pat]) . go
+  where
+    -- Previously we used (`.`), but inlining its definition improves compiler
+    -- performance significantly since we no longer need to typecheck lots of
+    -- (.) applications (each which needed three type applications, all @String)
+    -- (See #25453 for why this is especially slow currently)
+    go []  = panic "nested_compose_expr"   -- Arg is always non-empty
+    go [e] = nlHsApp e z_Expr
+    go (e:es) = nlHsApp e (go es)
 
 -- impossible_Expr is used in case RHSs that should never happen.
 -- We generate these to keep the desugarer from complaining that they *might* happen!
 error_Expr :: FastString -> LHsExpr GhcPs
 error_Expr string = nlHsApp (nlHsVar error_RDR) (nlHsLit (mkHsStringFS string))
-
-parenify :: LHsExpr GhcPs -> LHsExpr GhcPs
-parenify e@(L _ (HsVar _ _)) = e
-parenify e                   = mkHsPar e
 
 -- genOpApp wraps brackets round the operator application, so that the
 -- renamer won't subsequently try to re-associate it.

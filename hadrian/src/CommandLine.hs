@@ -15,6 +15,7 @@ import Settings.Parser
 import System.Console.GetOpt
 import System.Environment
 import qualified System.Directory as Directory
+import Debug.Trace ( trace )
 
 import qualified Data.Set as Set
 
@@ -138,7 +139,9 @@ readFreeze2 = Right $ \flags -> flags { freeze1 = True, freeze2 = True }
 readSkipDepends = Right $ \flags -> flags { skipDepends = True }
 
 readUnitIdHash :: Either String (CommandLineArgs -> CommandLineArgs)
-readUnitIdHash = Right $ \flags -> flags { unitIdHash = True }
+readUnitIdHash = Right $ \flags ->
+  trace "--hash-unit-ids is deprecated. It is enabled by release flavour or +hash_unit_ids flavour transformer" $
+  flags { unitIdHash = True }
 
 readProgressInfo :: String -> Either String (CommandLineArgs -> CommandLineArgs)
 readProgressInfo ms =
@@ -278,7 +281,7 @@ optDescrs =
     , Option [] ["skip-depends"] (NoArg readSkipDepends)
       "Skip rebuilding dependency information."
     , Option [] ["bignum"] (OptArg readBignum "BACKEND")
-      "Select ghc-bignum backend: native, gmp (default), check-gmp, ffi."
+      "Select bignum backend: native, gmp (default), check-gmp (gmp compared to native), ffi."
     , Option [] ["progress-info"] (ReqArg readProgressInfo "STYLE")
       "Progress info style (None, Brief, Normal or Unicorn)."
     , Option [] ["docs"] (ReqArg readDocsArg "TARGET")

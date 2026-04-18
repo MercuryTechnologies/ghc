@@ -26,12 +26,6 @@ module GHC.Exts
      -- **  Legacy interface for arrays of arrays
      module GHC.Internal.ArrayArray,
      -- *  Primitive operations
-     {-# DEPRECATED ["The BCO, mkApUpd0#, and newBCO# re-exports from GHC.Exts have been deprecated and will be removed in 9.14", "These symbols should be imported from ghc-internal instead if needed."] #-}
-     Prim.BCO,
-     {-# DEPRECATED ["The BCO, mkApUpd0#, and newBCO# re-exports from GHC.Exts have been deprecated and will be removed in 9.14", "These symbols should be imported from ghc-internal instead if needed."] #-}
-     Prim.mkApUpd0#,
-     {-# DEPRECATED ["The BCO, mkApUpd0#, and newBCO# re-exports from GHC.Exts have been deprecated and will be removed in 9.14", "These symbols should be imported from ghc-internal instead if needed."] #-}
-     Prim.newBCO#,
      module GHC.Prim,
      module GHC.Prim.Ext,
      -- **  Running 'RealWorld' state thread
@@ -55,7 +49,6 @@ module GHC.Exts
      sameMVar#,
      sameMutVar#,
      sameTVar#,
-     sameIOPort#,
      samePromptTag#,
      -- **  Compat wrapper
      atomicModifyMutVar#,
@@ -130,9 +123,6 @@ import GHC.Prim hiding
   -- whereFrom# is similarly internal.
   , whereFrom#
   , isByteArrayWeaklyPinned#, isMutableByteArrayWeaklyPinned#
-
-  -- deprecated
-  , BCO, mkApUpd0#, newBCO#
 
   -- Don't re-export vector FMA instructions
   , fmaddFloatX4#
@@ -256,8 +246,6 @@ import GHC.Prim hiding
   , minWord8X32#
   , minWord8X64#
   )
-import qualified GHC.Prim as Prim
-  ( BCO, mkApUpd0#, newBCO# )
 
 import GHC.Prim.Ext
 
@@ -267,7 +255,7 @@ import GHC.Types hiding (
   -- GHC's internal representation of 'TyCon's, for 'Typeable'
   Module, TrName, TyCon, TypeLitSort, KindRep, KindBndr,
   Unit#,
-  Solo#,
+  Solo#(..),
   Tuple0#,
   Tuple1#,
   Tuple2#,

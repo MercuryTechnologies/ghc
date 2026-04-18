@@ -33,6 +33,7 @@
 
 #define DEBUG_LOG(...) IF_DEBUG(linker, debugBelch("loadArchive: " __VA_ARGS__))
 
+
 #if defined(darwin_HOST_OS) || defined(ios_HOST_OS)
 /* Read 4 bytes and convert to host byte order */
 static uint32_t read4Bytes(const char buf[static 4])
@@ -40,7 +41,7 @@ static uint32_t read4Bytes(const char buf[static 4])
     return ntohl(*(uint32_t*)buf);
 }
 
-static StgBool loadFatArchive(char tmp[static 20], FILE* f, pathchar* path)
+static bool loadFatArchive(char input[static 20], FILE* f, pathchar* path)
 {
     uint32_t nfat_arch, nfat_offset, cputype, cpusubtype;
 #if defined(i386_HOST_ARCH)
@@ -58,8 +59,9 @@ static StgBool loadFatArchive(char tmp[static 20], FILE* f, pathchar* path)
 #error Unknown Darwin architecture
 #endif
 
-    nfat_arch = read4Bytes(tmp + 4);
+    nfat_arch = read4Bytes(input + 4);
     DEBUG_LOG("found a fat archive containing %d architectures\n", nfat_arch);
+    char tmp[20];
     nfat_offset = 0;
     for (uint32_t i = 0; i < nfat_arch; i++) {
         /* search for the right arch */
@@ -90,6 +92,7 @@ static StgBool loadFatArchive(char tmp[static 20], FILE* f, pathchar* path)
         }
 
         /* Read the header */
+        char tmp[20];
         n = fread(tmp, 1, 8, f);
         if (n != 8) {
             errorBelch("Failed reading header from `%" PATH_FMT "'", path);
@@ -107,10 +110,55 @@ static StgBool loadFatArchive(char tmp[static 20], FILE* f, pathchar* path)
 }
 #endif
 
-static StgBool readThinArchiveMember(int n, int memberSize, pathchar* path,
+enum ObjectFileFormat {
+    NotObject,
+    COFFAmd64,
+    COFFI386,
+    COFFAArch64,
+    ELF,
+    MachO32,
+    MachO64,
+};
+
+static enum ObjectFileFormat identifyObjectFile_(char* buf, size_t sz)
+{
+    if (sz > 2 && ((uint16_t*)buf)[0] == 0x8664) {
+        return COFFAmd64;
+    }
+    if (sz > 2 && ((uint16_t*)buf)[0] == 0x014c) {
+        return COFFI386;
+    }
+    if (sz > 2 && ((uint16_t*)buf)[0] == 0xaa64) {
+        return COFFAArch64;
+    }
+    if (sz > 4 && memcmp(buf, "\x7f" "ELF", 4) == 0) {
+        return ELF;
+    }
+    if (sz > 4 && ((uint32_t*)buf)[0] == 0xfeedface) {
+        return MachO32;
+    }
+    if (sz > 4 && ((uint32_t*)buf)[0] == 0xfeedfacf) {
+        return MachO64;
+    }
+    // BigObj COFF files ...
+    if (sz > 8 && ((uint64_t*)buf)[0] == 0x86640002ffff0000) {
+        return COFFAmd64;
+    }
+    return NotObject;
+}
+
+static enum ObjectFileFormat identifyObjectFile(FILE *f)
+{
+    char buf[32];
+    ssize_t sz = fread(buf, 1, 32, f);
+    CHECK(fseek(f, -sz, SEEK_CUR) == 0);
+    return identifyObjectFile_(buf, sz);
+}
+
+static bool readThinArchiveMember(int n, int memberSize, pathchar* path,
         char* fileName, char* image)
 {
-    StgBool has_succeeded = false;
+    bool has_succeeded = false;
     FILE* member = NULL;
     pathchar *pathCopy, *dirName, *memberPath, *objFileName;
     memberPath = NULL;
@@ -148,10 +196,9 @@ inner_fail:
     return has_succeeded;
 }
 
-static StgBool checkFatArchive(char magic[static 20], FILE* f, pathchar* path)
+static bool checkFatArchive(char magic[static 4], FILE* f, pathchar* path)
 {
-    StgBool success;
-    success = false;
+    bool success = false;
 #if defined(darwin_HOST_OS) || defined(ios_HOST_OS)
     /* Not a standard archive, look for a fat archive magic number: */
     if (read4Bytes(magic) == FAT_MAGIC)
@@ -175,26 +222,27 @@ static StgBool checkFatArchive(char magic[static 20], FILE* f, pathchar* path)
  * be reallocated on return; the old value is now _invalid_.
  * @param gnuFileIndexSize The size of the index.
  */
-static StgBool
+static bool
 lookupGNUArchiveIndex(int gnuFileIndexSize, char **fileName_,
     char* gnuFileIndex, pathchar* path, size_t* thisFileNameSize,
     size_t* fileNameSize)
 {
-    int n;
     char *fileName = *fileName_;
     if (isdigit(fileName[1])) {
-        int i;
-        for (n = 2; isdigit(fileName[n]); n++)
-            ;
-
-        fileName[n] = '\0';
-        n = atoi(fileName + 1);
         if (gnuFileIndex == NULL) {
             errorBelch("loadArchive: GNU-variant filename "
                     "without an index while reading from `%" PATH_FMT "'",
                     path);
             return false;
         }
+
+        int n;
+        for (n = 2; isdigit(fileName[n]); n++)
+            ;
+
+        char *end;
+        fileName[n] = '\0';
+        n = strtol(fileName + 1, &end, 10);
         if (n < 0 || n > gnuFileIndexSize) {
             errorBelch("loadArchive: GNU-variant filename "
                     "offset %d out of range [0..%d] "
@@ -202,17 +250,27 @@ lookupGNUArchiveIndex(int gnuFileIndexSize, char **fileName_,
                     n, gnuFileIndexSize, path);
             return false;
         }
-        if (n != 0 && gnuFileIndex[n - 1] != '\n') {
+
+        // Check that the previous entry ends with the expected
+        // end-of-string delimiter.
+#if defined(mingw32_HOST_OS)
+#define IS_SYMBOL_DELIMITER(STR) (STR =='\n' || STR == '\0')
+#else
+#define IS_SYMBOL_DELIMITER(STR) (STR =='\n')
+#endif
+        if (n != 0 && !IS_SYMBOL_DELIMITER(gnuFileIndex[n - 1])) {
             errorBelch("loadArchive: GNU-variant filename offset "
                     "%d invalid (range [0..%d]) while reading "
                     "filename from `%" PATH_FMT "'",
                     n, gnuFileIndexSize, path);
             return false;
         }
-        for (i = n; gnuFileIndex[i] != '\n'; i++)
+
+        int i;
+        for (i = n; !IS_SYMBOL_DELIMITER(gnuFileIndex[i]); i++)
             ;
 
-        size_t FileNameSize = i - n - 1;
+        size_t FileNameSize = i - n;
         if (FileNameSize >= *fileNameSize) {
             /* Double it to avoid potentially continually
              increasing it by 1 */
@@ -221,6 +279,13 @@ lookupGNUArchiveIndex(int gnuFileIndexSize, char **fileName_,
                     "loadArchive(fileName)");
         }
         memcpy(fileName, gnuFileIndex + n, FileNameSize);
+
+
+       /* llvm-ar terminates string table entries with `/\n`. */
+       if (fileName[FileNameSize-1] == '/') {
+           FileNameSize--;
+       }
+
         fileName[FileNameSize] = '\0';
         *thisFileNameSize = FileNameSize;
     }
@@ -241,46 +306,20 @@ lookupGNUArchiveIndex(int gnuFileIndexSize, char **fileName_,
     return true;
 }
 
-HsInt loadArchive_ (pathchar *path)
+enum ArchiveFormat {
+    StandardArchive,
+    ThinArchive,
+    FatArchive,
+};
+
+static bool identifyArchiveFormat(FILE *f, pathchar *path, enum ArchiveFormat *out)
 {
-    char *image = NULL;
-    HsInt retcode = 0;
-    int memberSize;
-    int memberIdx = 0;
-    FILE *f = NULL;
-    int n;
-    size_t thisFileNameSize = (size_t)-1; /* shut up bogus GCC warning */
-    char *fileName;
-    size_t fileNameSize;
-    int isObject, isGnuIndex, isThin, isImportLib;
-    char tmp[20];
-    char *gnuFileIndex;
-    int gnuFileIndexSize;
-    int misalignment = 0;
-
-    DEBUG_LOG("start\n");
-    DEBUG_LOG("Loading archive `%" PATH_FMT "'\n", path);
-
-    /* Check that we haven't already loaded this archive.
-       Ignore requests to load multiple times */
-    if (isAlreadyLoaded(path)) {
-        IF_DEBUG(linker,
-                 debugBelch("ignoring repeated load of %" PATH_FMT "\n", path));
-        return 1; /* success */
+    char tmp[8];
+    size_t n = fread(tmp, 1, 8, f);
+    if (n != 8) {
+        errorBelch("loadArchive: Failed reading header from `%" PATH_FMT "'", path); \
+        return false;
     }
-
-    gnuFileIndex = NULL;
-    gnuFileIndexSize = 0;
-
-    fileNameSize = 32;
-    fileName = stgMallocBytes(fileNameSize, "loadArchive(fileName)");
-
-    isThin = 0;
-    isImportLib = 0;
-
-    f = pathopen(path, WSTR("rb"));
-    if (!f)
-        FAIL("loadObj: can't read `%" PATH_FMT "'", path);
 
     /* Check if this is an archive by looking for the magic "!<arch>\n"
      * string.  Usually, if this fails, we belch an error and return.  On
@@ -300,12 +339,10 @@ HsInt loadArchive_ (pathchar *path)
      * its magic "!<arch>\n" string and continue processing just as if
      * we had a single architecture archive.
      */
-
-    n = fread ( tmp, 1, 8, f );
-    if (n != 8) {
-        FAIL("Failed reading header from `%" PATH_FMT "'", path);
+    if (strncmp(tmp, "!<arch>\n", 8) == 0) {
+        *out = StandardArchive;
+        return true;
     }
-    if (strncmp(tmp, "!<arch>\n", 8) == 0) {}
     /* Check if this is a thin archive by looking for the magic string "!<thin>\n"
      *
      * ar thin libraries have the exact same format as normal archives except they
@@ -322,16 +359,59 @@ HsInt loadArchive_ (pathchar *path)
      *
      */
     else if (strncmp(tmp, "!<thin>\n", 8) == 0) {
-        isThin = 1;
+        *out = ThinArchive;
+        return true;
     }
     else {
-        StgBool success = checkFatArchive(tmp, f, path);
-        if (!success)
-            goto fail;
+        bool success = checkFatArchive(tmp, f, path);
+        if (!success) {
+            return false;
+        }
+        *out = FatArchive;
+        return true;
     }
+}
+
+HsInt loadArchive_ (pathchar *path)
+{
+    char *image = NULL;
+    HsInt retcode = 0;
+    int memberIdx = 0;
+    FILE *f = NULL;
+    size_t thisFileNameSize = (size_t) -1; /* shut up bogus GCC warning */
+    int misalignment = 0;
+
+    DEBUG_LOG("start\n");
+    DEBUG_LOG("Loading archive `%" PATH_FMT "'\n", path);
+
+    /* Check that we haven't already loaded this archive.
+       Ignore requests to load multiple times */
+    if (isAlreadyLoaded(path)) {
+        IF_DEBUG(linker,
+                 debugBelch("ignoring repeated load of %" PATH_FMT "\n", path));
+        return 1; /* success */
+    }
+
+    char *gnuFileIndex = NULL;
+    int gnuFileIndexSize = 0;
+
+    size_t fileNameSize = 32;
+    char *fileName = stgMallocBytes(fileNameSize, "loadArchive(fileName)");
+
+    f = pathopen(path, WSTR("rb"));
+    if (!f)
+        FAIL("loadObj: can't read `%" PATH_FMT "'", path);
+
+    enum ArchiveFormat archive_fmt;
+    if (!identifyArchiveFormat(f, path, &archive_fmt)) {
+        FAIL("failed to identify archive format of %" PATH_FMT ".", path);
+    }
+    bool isThin = archive_fmt == ThinArchive;
+
     DEBUG_LOG("loading archive contents\n");
 
     while (1) {
+        size_t n;
         DEBUG_LOG("reading at %ld\n", ftell(f));
         n = fread ( fileName, 1, 16, f );
         if (n != 16) {
@@ -351,6 +431,7 @@ HsInt loadArchive_ (pathchar *path)
         }
 #endif
 
+        char tmp[32];
         n = fread ( tmp, 1, 12, f );
         if (n != 12)
             FAIL("Failed reading mod time from `%" PATH_FMT "'", path);
@@ -369,9 +450,16 @@ HsInt loadArchive_ (pathchar *path)
         tmp[10] = '\0';
         for (n = 0; isdigit(tmp[n]); n++);
         tmp[n] = '\0';
-        memberSize = atoi(tmp);
+        size_t memberSize;
+        {
+            char *end;
+            memberSize = strtol(tmp, &end, 10);
+            if (tmp == end) {
+                FAIL("Failed to decode member size");
+            }
+        }
 
-        DEBUG_LOG("size of this archive member is %d\n", memberSize);
+        DEBUG_LOG("size of this archive member is %zd\n", memberSize);
         n = fread ( tmp, 1, 2, f );
         if (n != 2)
             FAIL("Failed reading magic from `%" PATH_FMT "'", path);
@@ -379,7 +467,7 @@ HsInt loadArchive_ (pathchar *path)
             FAIL("Failed reading magic from `%" PATH_FMT "' at %ld. Got %c%c",
                  path, ftell(f), tmp[0], tmp[1]);
 
-        isGnuIndex = 0;
+        bool isGnuIndex = false;
         /* Check for BSD-variant large filenames */
         if (0 == strncmp(fileName, "#1/", 3)) {
             size_t n = 0;
@@ -419,7 +507,7 @@ HsInt loadArchive_ (pathchar *path)
         else if (0 == strncmp(fileName, "//", 2)) {
             fileName[0] = '\0';
             thisFileNameSize = 0;
-            isGnuIndex = 1;
+            isGnuIndex = true;
         }
         /* Check for a file in the GNU file index */
         else if (fileName[0] == '/') {
@@ -460,12 +548,8 @@ HsInt loadArchive_ (pathchar *path)
 
         DEBUG_LOG("Found member file `%s'\n", fileName);
 
-        /* TODO: Stop relying on file extensions to determine input formats.
-                 Instead try to match file headers. See #13103.  */
-        isObject = (thisFileNameSize >= 2 && strncmp(fileName + thisFileNameSize - 2, ".o"  , 2) == 0)
-                || (thisFileNameSize >= 3 && strncmp(fileName + thisFileNameSize - 3, ".lo" , 3) == 0)
-                || (thisFileNameSize >= 4 && strncmp(fileName + thisFileNameSize - 4, ".p_o", 4) == 0)
-                || (thisFileNameSize >= 4 && strncmp(fileName + thisFileNameSize - 4, ".obj", 4) == 0);
+        bool is_symbol_table = strcmp("", fileName) == 0;
+        enum ObjectFileFormat object_fmt = is_symbol_table ? NotObject : identifyObjectFile(f);
 
 #if defined(OBJFORMAT_PEi386)
         /*
@@ -479,15 +563,15 @@ HsInt loadArchive_ (pathchar *path)
         *
         * Linker members (e.g. filename / are skipped since they are not needed)
         */
-        isImportLib = thisFileNameSize >= 4 && strncmp(fileName + thisFileNameSize - 4, ".dll", 4) == 0;
+        bool isImportLib = thisFileNameSize >= 4 && strncmp(fileName + thisFileNameSize - 4, ".dll", 4) == 0;
+#else
+        bool isImportLib = false;
 #endif // windows
 
         DEBUG_LOG("\tthisFileNameSize = %d\n", (int)thisFileNameSize);
-        DEBUG_LOG("\tisObject = %d\n", isObject);
+        DEBUG_LOG("\tisObject = %d\n", object_fmt);
 
-        if (isObject) {
-            pathchar *archiveMemberName;
-
+        if ((!is_symbol_table && isThin) || object_fmt != NotObject) {
             DEBUG_LOG("Member is an object file...loading...\n");
 
 #if defined(darwin_HOST_OS) || defined(ios_HOST_OS)
@@ -505,14 +589,13 @@ HsInt loadArchive_ (pathchar *path)
             image = stgMallocBytes(memberSize, "loadArchive(image)");
 #endif
             if (isThin) {
-                if (!readThinArchiveMember(n, memberSize, path,
-                        fileName, image)) {
+                if (!readThinArchiveMember(n, memberSize, path, fileName, image)) {
                     goto fail;
                 }
             }
             else
             {
-                n = fread ( image, 1, memberSize, f );
+                size_t n = fread ( image, 1, memberSize, f );
                 if (n != memberSize) {
                     FAIL("error whilst reading `%" PATH_FMT "'", path);
                 }
@@ -523,16 +606,18 @@ HsInt loadArchive_ (pathchar *path)
             // I don't understand why this extra +1 is needed here; pathprintf
             // should have given us the correct length but in practice it seems
             // to be one byte short on Win32.
-            archiveMemberName = stgMallocBytes((size+1+1) * sizeof(pathchar), "loadArchive(file)");
+            pathchar *archiveMemberName = stgMallocBytes((size+1+1) * sizeof(pathchar), "loadArchive(file)");
             pathprintf(archiveMemberName, size+1, WSTR("%" PATH_FMT "(#%d:%.*s)"),
                        path, memberIdx, (int)thisFileNameSize, fileName);
 
             ObjectCode *oc = mkOc(STATIC_OBJECT, path, image, memberSize, false, archiveMemberName,
                                   misalignment);
 #if defined(OBJFORMAT_MACHO)
+            ASSERT(object_fmt == MachO32 || object_fmt == MachO64);
             ocInit_MachO( oc );
 #endif
 #if defined(OBJFORMAT_ELF)
+            ASSERT(object_fmt == ELF);
             ocInit_ELF( oc );
 #endif
 
@@ -577,7 +662,7 @@ while reading filename from `%" PATH_FMT "'", path);
                           "Skipping...\n");
                 n = fseek(f, memberSize, SEEK_CUR);
                 if (n != 0)
-                    FAIL("error whilst seeking by %d in `%" PATH_FMT "'",
+                    FAIL("error whilst seeking by %zd in `%" PATH_FMT "'",
                     memberSize, path);
             }
 #endif
@@ -588,7 +673,7 @@ while reading filename from `%" PATH_FMT "'", path);
             if (!isThin || thisFileNameSize == 0) {
                 n = fseek(f, memberSize, SEEK_CUR);
                 if (n != 0)
-                    FAIL("error whilst seeking by %d in `%" PATH_FMT "'",
+                    FAIL("error whilst seeking by %zd in `%" PATH_FMT "'",
                          memberSize, path);
             }
         }

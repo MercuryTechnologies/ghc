@@ -62,6 +62,10 @@ module GHC.Driver.DynFlags (
         versionedAppDir, versionedFilePath,
         extraGccViaCFlags, globalPackageDatabasePath,
 
+        --
+        baseUnitId,
+
+
         -- * Include specifications
         IncludeSpecs(..), addGlobalInclude, addQuoteInclude, flattenIncludes,
         addImplicitQuoteInclude,
@@ -71,6 +75,8 @@ module GHC.Driver.DynFlags (
         initPromotionTickContext,
 
         -- * Platform features
+        isSse3Enabled,
+        isSsse3Enabled,
         isSse4_1Enabled,
         isSse4_2Enabled,
         isAvxEnabled,
@@ -98,6 +104,7 @@ import GHC.Data.Maybe
 import GHC.Builtin.Names ( mAIN_NAME )
 import GHC.Driver.Backend
 import GHC.Driver.Flags
+import GHC.Driver.IncludeSpecs
 import GHC.Driver.Phases ( Phase(..), phaseInputExt )
 import GHC.Driver.Plugins.External
 import GHC.Settings
@@ -165,6 +172,8 @@ data DynFlags = DynFlags {
   -- formerly Settings
   ghcNameVersion    :: {-# UNPACK #-} !GhcNameVersion,
   fileSettings      :: {-# UNPACK #-} !FileSettings,
+  unitSettings      :: {-# UNPACK #-} !UnitSettings,
+
   targetPlatform    :: Platform,       -- Filled in by SysTools
   toolSettings      :: {-# UNPACK #-} !ToolSettings,
   platformMisc      :: {-# UNPACK #-} !PlatformMisc,
@@ -398,6 +407,13 @@ data DynFlags = DynFlags {
   maxForcedSpecArgs     :: Int,
 
   ghciHistSize          :: Int,
+
+  -- wasm ghci browser mode
+  ghciBrowserHost                  :: !String,
+  ghciBrowserPort                  :: !Int,
+  ghciBrowserPuppeteerLaunchOpts   :: !(Maybe String),
+  ghciBrowserPlaywrightBrowserType :: !(Maybe String),
+  ghciBrowserPlaywrightLaunchOpts  :: !(Maybe String),
 
   flushOut              :: FlushOut,
 
@@ -634,6 +650,7 @@ defaultDynFlags mySettings =
         splitInfo               = Nothing,
 
         ghcNameVersion = sGhcNameVersion mySettings,
+        unitSettings   = sUnitSettings mySettings,
         fileSettings = sFileSettings mySettings,
         toolSettings = sToolSettings mySettings,
         targetPlatform = sTargetPlatform mySettings,
@@ -683,6 +700,12 @@ defaultDynFlags mySettings =
 
         ghciHistSize = 50, -- keep a log of length 50 by default
 
+        ghciBrowserHost = "127.0.0.1",
+        ghciBrowserPort = 0,
+        ghciBrowserPuppeteerLaunchOpts = Nothing,
+        ghciBrowserPlaywrightBrowserType = Nothing,
+        ghciBrowserPlaywrightLaunchOpts = Nothing,
+
         flushOut = defaultFlushOut,
         pprUserLength = 5,
         pprCols = 100,
@@ -728,16 +751,6 @@ newtype FlushOut = FlushOut (IO ())
 
 defaultFlushOut :: FlushOut
 defaultFlushOut = FlushOut $ hFlush stdout
-
-
-
-data OnOff a = On a
-             | Off a
-  deriving (Eq, Show)
-
-instance Outputable a => Outputable (OnOff a) where
-  ppr (On x)  = text "On" <+> ppr x
-  ppr (Off x) = text "Off" <+> ppr x
 
 -- OnOffs accumulate in reverse order, so we use foldr in order to
 -- process them in the right order
@@ -925,44 +938,6 @@ data PkgDbRef
   | PkgDbPath FilePath
   deriving Eq
 
--- | Used to differentiate the scope an include needs to apply to.
--- We have to split the include paths to avoid accidentally forcing recursive
--- includes since -I overrides the system search paths. See #14312.
-data IncludeSpecs
-  = IncludeSpecs { includePathsQuote  :: [String]
-                 , includePathsGlobal :: [String]
-                 -- | See Note [Implicit include paths]
-                 , includePathsQuoteImplicit :: [String]
-                 }
-  deriving Show
-
--- | Append to the list of includes a path that shall be included using `-I`
--- when the C compiler is called. These paths override system search paths.
-addGlobalInclude :: IncludeSpecs -> [String] -> IncludeSpecs
-addGlobalInclude spec paths  = let f = includePathsGlobal spec
-                               in spec { includePathsGlobal = f ++ paths }
-
--- | Append to the list of includes a path that shall be included using
--- `-iquote` when the C compiler is called. These paths only apply when quoted
--- includes are used. e.g. #include "foo.h"
-addQuoteInclude :: IncludeSpecs -> [String] -> IncludeSpecs
-addQuoteInclude spec paths  = let f = includePathsQuote spec
-                              in spec { includePathsQuote = f ++ paths }
-
--- | These includes are not considered while fingerprinting the flags for iface
--- | See Note [Implicit include paths]
-addImplicitQuoteInclude :: IncludeSpecs -> [String] -> IncludeSpecs
-addImplicitQuoteInclude spec paths  = let f = includePathsQuoteImplicit spec
-                              in spec { includePathsQuoteImplicit = f ++ paths }
-
-
--- | Concatenate and flatten the list of global and quoted includes returning
--- just a flat list of paths.
-flattenIncludes :: IncludeSpecs -> [String]
-flattenIncludes specs =
-    includePathsQuote specs ++
-    includePathsQuoteImplicit specs ++
-    includePathsGlobal specs
 
 
 -- An argument to --reexported-module which can optionally specify a module renaming.
@@ -1166,6 +1141,7 @@ defaultFlags settings
       Opt_GenManifest,
       Opt_GhciHistory,
       Opt_GhciSandbox,
+      Opt_GhciDoLoadTargets,
       Opt_HelpfulErrors,
       Opt_KeepHiFiles,
       Opt_KeepOFiles,
@@ -1181,7 +1157,8 @@ defaultFlags settings
       Opt_ShowErrorContext,
       Opt_SuppressStgReps,
       Opt_UnoptimizedCoreForInterpreter,
-      Opt_SpecialiseIncoherents
+      Opt_SpecialiseIncoherents,
+      Opt_WriteSelfRecompInfo
     ]
 
     ++ [f | (ns,f) <- optLevelFlags, 0 `elem` ns]
@@ -1193,7 +1170,6 @@ defaultFlags settings
     ++ default_PIC platform
 
     ++ validHoleFitDefaults
-
 
     where platform = sTargetPlatform settings
 
@@ -1290,6 +1266,8 @@ optLevelFlags -- see Note [Documenting optimisation flags]
 --   RegsGraph suffers performance regression. See #7679
 --  , ([2],     Opt_StaticArgumentTransformation)
 --   Static Argument Transformation needs investigation. See #9374
+    , ([0,1,2], Opt_SpecEval)
+    , ([],      Opt_SpecEvalDictFun)
     ]
 
 
@@ -1318,6 +1296,7 @@ default_PIC platform =
                                          -- always generate PIC. See
                                          -- #10597 for more
                                          -- information.
+    (OSLinux,   ArchLoongArch64) -> [Opt_PIC, Opt_ExternalDynamicRefs]
     _                      -> []
 
 -- | The language extensions implied by the various language variants.
@@ -1346,7 +1325,8 @@ languageExtensions (Just Haskell98)
            -- default unless you specify another language.
        LangExt.DeepSubsumption,
        -- Non-standard but enabled for backwards compatability (see GHC proposal #511)
-       LangExt.ListTuplePuns
+       LangExt.ListTuplePuns,
+       LangExt.ImplicitStagePersistence
       ]
 
 languageExtensions (Just Haskell2010)
@@ -1364,7 +1344,9 @@ languageExtensions (Just Haskell2010)
        LangExt.FieldSelectors,
        LangExt.RelaxedPolyRec,
        LangExt.DeepSubsumption,
-       LangExt.ListTuplePuns ]
+       LangExt.ListTuplePuns,
+       LangExt.ImplicitStagePersistence
+       ]
 
 languageExtensions (Just GHC2021)
     = [LangExt.ImplicitPrelude,
@@ -1415,7 +1397,9 @@ languageExtensions (Just GHC2021)
        LangExt.TupleSections,
        LangExt.TypeApplications,
        LangExt.TypeOperators,
-       LangExt.TypeSynonymInstances]
+       LangExt.TypeSynonymInstances,
+       LangExt.ImplicitStagePersistence
+       ]
 
 languageExtensions (Just GHC2024)
     = languageExtensions (Just GHC2021) ++
@@ -1484,6 +1468,11 @@ versionedAppDir appname platform = do
 versionedFilePath :: ArchOS -> FilePath
 versionedFilePath platform = uniqueSubdir platform
 
+-- | Access the unit-id of the version of `base` which we will automatically link
+-- against.
+baseUnitId :: DynFlags -> UnitId
+baseUnitId dflags = unitSettings_baseUnitId (unitSettings dflags)
+
 -- SDoc
 -------------------------------------------
 -- | Initialize the pretty-printing options
@@ -1542,6 +1531,12 @@ initPromotionTickContext dflags =
 
 -- -----------------------------------------------------------------------------
 -- SSE, AVX, FMA
+
+isSse3Enabled :: DynFlags -> Bool
+isSse3Enabled dflags = sseVersion dflags >= Just SSE3
+
+isSsse3Enabled :: DynFlags -> Bool
+isSsse3Enabled dflags = sseVersion dflags >= Just SSSE3
 
 isSse4_1Enabled :: DynFlags -> Bool
 isSse4_1Enabled dflags = sseVersion dflags >= Just SSE4

@@ -31,6 +31,7 @@ extra-source-files:
     aclocal.m4
     ghc-internal.buildinfo.in
     CHANGELOG.md
+    cbits/gmp_wrappers.c
     configure
     configure.ac
     include/CTypes.h
@@ -40,12 +41,41 @@ extra-source-files:
     include/md5.h
     include/fs.h
     include/winio_structs.h
+    include/WordSize.h
+    include/HsIntegerGmp.h.in
+    include/RtsIfaceSymbols.h
     install-sh
 
 source-repository head
     type:     git
     location: https://gitlab.haskell.org/ghc/ghc.git
     subdir:   libraries/base
+
+Flag bignum-native
+    Description: Enable native Haskell bignum backend
+    Manual: True
+    Default: False
+
+Flag bignum-ffi
+    Description: Enable FFI bignum backend
+    Manual: True
+    Default: False
+
+Flag bignum-gmp
+    Description: Enable GMP bignum backend
+    Manual: True
+    Default: False
+
+Flag bignum-check
+    Description: Validate results of the enabled backend against native backend.
+    Manual: True
+    Default: False
+
+Flag need-atomic
+    Description: Enable linking with "atomic" library (for 64-bit atomic ops on armel, #20549)
+    Manual: True
+    Default: False
+
 
 Library
     default-language: Haskell2010
@@ -90,11 +120,10 @@ Library
         Unsafe
 
     build-depends:
-        rts == 1.0.*,
-        ghc-prim >= 0.11 && < 0.12,
-        ghc-bignum >= 1.0 && < 2.0
+        rts == 1.0.*
 
     exposed-modules:
+        GHC.Internal.AllocationLimitHandler
         GHC.Internal.ClosureTypes
         GHC.Internal.Control.Arrow
         GHC.Internal.Control.Category
@@ -117,7 +146,6 @@ Library
         GHC.Internal.Data.Dynamic
         GHC.Internal.Data.Either
         GHC.Internal.Data.Eq
-        GHC.Internal.Data.Enum
         GHC.Internal.Data.Foldable
         GHC.Internal.Data.Function
         GHC.Internal.Data.Functor
@@ -130,6 +158,7 @@ Library
         GHC.Internal.Data.List.NonEmpty
         GHC.Internal.Data.Maybe
         GHC.Internal.Data.Monoid
+        GHC.Internal.Data.NonEmpty
         GHC.Internal.Data.OldList
         GHC.Internal.Data.Ord
         GHC.Internal.Data.Proxy
@@ -203,6 +232,12 @@ Library
         GHC.Internal.GHCi
         GHC.Internal.GHCi.Helpers
         GHC.Internal.Generics
+        GHC.Internal.Heap.Closures
+        GHC.Internal.Heap.Constants
+        GHC.Internal.Heap.InfoTable
+        GHC.Internal.Heap.InfoTable.Types
+        GHC.Internal.Heap.InfoTableProf
+        GHC.Internal.Heap.ProfInfo.Types
         GHC.Internal.InfoProv
         GHC.Internal.InfoProv.Types
         GHC.Internal.IO
@@ -255,14 +290,18 @@ Library
         GHC.Internal.RTS.Flags
         GHC.Internal.RTS.Flags.Test
         GHC.Internal.ST
-        GHC.Internal.Stack.CloneStack
         GHC.Internal.StaticPtr
         GHC.Internal.STRef
         GHC.Internal.Show
         GHC.Internal.Stable
         GHC.Internal.StableName
         GHC.Internal.Stack
+        GHC.Internal.Stack.Annotation
         GHC.Internal.Stack.CCS
+        GHC.Internal.Stack.CloneStack
+        GHC.Internal.Stack.Constants
+        GHC.Internal.Stack.ConstantsProf
+        GHC.Internal.Stack.Decode
         GHC.Internal.Stack.Types
         GHC.Internal.Stats
         GHC.Internal.Storable
@@ -299,14 +338,24 @@ Library
         GHC.Internal.Type.Reflection
         GHC.Internal.Type.Reflection.Unsafe
         GHC.Internal.Unsafe.Coerce
-        -- TODO: remove
-        GHC.Internal.IOPort
 
-    reexported-modules:
-          GHC.Num.Integer
-        , GHC.Num.Natural
-        , GHC.Num.BigNat
-        , GHC.Tuple
+        GHC.Internal.CString
+        GHC.Internal.Classes
+        GHC.Internal.Debug
+        GHC.Internal.Magic
+        GHC.Internal.Magic.Dict
+        GHC.Internal.Prim
+        GHC.Internal.Prim.Ext
+        GHC.Internal.Prim.Panic
+        GHC.Internal.Prim.Exception
+        GHC.Internal.Prim.PtrEq
+        GHC.Internal.PrimopWrappers
+        GHC.Internal.Tuple
+        GHC.Internal.Types
+
+    autogen-modules:
+        GHC.Internal.Prim
+        GHC.Internal.PrimopWrappers
 
     other-modules:
         GHC.Internal.Data.Typeable.Internal
@@ -324,7 +373,6 @@ Library
         GHC.Internal.Event.IntVar
         GHC.Internal.Event.PSQ
         GHC.Internal.Event.Unique
-        -- GHC.Internal.IOPort -- TODO: hide again after debug
         GHC.Internal.Unicode.Bits
         GHC.Internal.Unicode.Char.DerivedCoreProperties
         GHC.Internal.Unicode.Char.UnicodeData.GeneralCategory
@@ -333,6 +381,55 @@ Library
         GHC.Internal.Unicode.Char.UnicodeData.SimpleUpperCaseMapping
         GHC.Internal.Unicode.Version
         GHC.Internal.System.Environment.ExecutablePath
+
+
+    ----------------------------------------
+    -- Bignum configuration
+    ----------------------------------------
+    -- check that at least one backend is enabled
+    if !flag(bignum-native) && !flag(bignum-gmp) && !flag(bignum-ffi)
+      buildable: False
+
+    -- check that at most one flag is set
+    if flag(bignum-native) && (flag(bignum-gmp) || flag(bignum-ffi))
+      buildable: False
+    if flag(bignum-gmp) && flag(bignum-ffi)
+      buildable: False
+
+    if flag(bignum-gmp)
+        cpp-options: -DBIGNUM_GMP
+        other-modules:
+           GHC.Internal.Bignum.Backend.GMP
+        c-sources:
+           cbits/gmp_wrappers.c
+
+    if flag(bignum-ffi)
+        cpp-options: -DBIGNUM_FFI
+        other-modules:
+           GHC.Internal.Bignum.Backend.FFI
+
+    if flag(bignum-native)
+        cpp-options: -DBIGNUM_NATIVE
+
+    if flag(bignum-check)
+        cpp-options: -DBIGNUM_CHECK
+        other-modules:
+           GHC.Internal.Bignum.Backend.Check
+
+    exposed-modules:
+      GHC.Internal.Bignum.Primitives
+      GHC.Internal.Bignum.WordArray
+      GHC.Internal.Bignum.BigNat
+      GHC.Internal.Bignum.Backend
+      GHC.Internal.Bignum.Backend.Selected
+      GHC.Internal.Bignum.Backend.Native
+      GHC.Internal.Bignum.Natural
+      GHC.Internal.Bignum.Integer
+
+    -- some other properties related to bignum are set via the
+    -- ghc-internal.buildinfo file generated by this package's configure script
+    ----------------------------------------
+
 
     if !arch(javascript)
       c-sources:
@@ -346,9 +443,14 @@ Library
           cbits/sysconf.c
           cbits/fs.c
           cbits/strerror.c
+          cbits/debug.c
+          cbits/Stack_c.c
+          cbits/RtsIface.c
 
       cmm-sources:
           cbits/StackCloningDecoding.cmm
+          cbits/Stack.cmm
+          cbits/HeapPrim.cmm
 
     if arch(javascript)
       js-sources:
@@ -366,10 +468,16 @@ Library
         HsBase.h
         consUtils.h
 
+    if flag(need-atomic)
+        -- for 64-bit atomic ops on armel (#20549)
+        extra-libraries: atomic
+
     -- OS Specific
     if os(windows)
         -- Windows requires some extra libraries for linking because the RTS
-        -- is no longer re-exporting them.
+        -- is no longer re-exporting them (see #11223)
+        -- ucrt: standard C library. The RTS will automatically include this,
+        --       but is added for completeness.
         -- mingwex: provides GNU POSIX extensions that aren't provided by ucrt.
         -- mingw32: Unfortunately required because of a resource leak between
         --          mingwex and mingw32. the __math_err symbol is defined in
@@ -381,9 +489,11 @@ Library
         -- ntdll: provides access to functions to inspect window handles
         -- kernel32: provides GetConsoleCP
         -- advapi32: provides advanced kernel functions
+        -- user32: provides access to apis to modify user components (UI etc)
+        --         on Windows. Required because of mingw32.
         extra-libraries:
             wsock32, user32, shell32, mingw32, kernel32, advapi32,
-            mingwex, ws2_32, shlwapi, ole32, rpcrt4, ntdll
+            mingwex, ws2_32, shlwapi, ole32, rpcrt4, ntdll, ucrt
         -- Minimum supported Windows version.
         -- These numbers can be found at:
         --  https://msdn.microsoft.com/en-us/library/windows/desktop/aa383745(v=vs.85).aspx
@@ -426,9 +536,10 @@ Library
             GHC.Internal.Event.Thread
             GHC.Internal.Event.TimerManager
 
-
-        if arch(javascript)
-          other-modules:
+    if os(linux)
+        -- we need libm, but for musl and other's we might need libc, as libm
+        -- is just an empty shell.
+        extra-libraries: c, m
 
     -- The Ports framework always passes this flag when building software that
     -- uses iconv to make iconv from Ports compatible with iconv from the base system

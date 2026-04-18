@@ -8,6 +8,7 @@ module Flavour
   , splitSections
   , enableThreadSanitizer
   , enableLateCCS
+  , enableHashUnitIds
   , enableDebugInfo, enableTickyGhc
   , viaLlvmBackend
   , enableProfiledGhc
@@ -16,9 +17,11 @@ module Flavour
   , disableProfiledLibs
   , enableLinting
   , enableHaddock
+  , disableSelfRecompInfo
   , enableHiCore
   , useNativeBignum
   , enableTextWithSIMDUTF
+  , enableHieFiles
   , omitPragmas
 
   , completeSetting
@@ -67,10 +70,13 @@ flavourTransformers = M.fromList
     , "debug_stage1_ghc" =: debugGhc Stage1
     , "lint"             =: enableLinting
     , "haddock"          =: enableHaddock
+    , "no_self_recomp"   =: disableSelfRecompInfo
     , "hi_core"          =: enableHiCore
     , "late_ccs"         =: enableLateCCS
     , "boot_nonmoving_gc" =: enableBootNonmovingGc
     , "dump_stg"         =: enableDumpStg
+    , "hash_unit_ids"    =: enableHashUnitIds
+    , "hie_files"        =: enableHieFiles
     ]
   where (=:) = (,)
 
@@ -133,6 +139,7 @@ werror =
         ? notStage0
         ? mconcat
           [ arg "-Werror"
+          , arg "-Wno-error=pattern-namespace-specifier"   -- not until the boot compiler is >=9.14
             -- unix has many unused imports
           , package unix
               ? mconcat [arg "-Wwarn=unused-imports", arg "-Wwarn=unused-top-binds"]
@@ -208,6 +215,17 @@ enableHaddock =
       [ arg "-haddock"
       ]
 
+-- | Disable self recompilation information in interface files
+disableSelfRecompInfo :: Flavour -> Flavour
+disableSelfRecompInfo =
+    addArgs $ stage1 ? mconcat
+      [ builder (Ghc CompileHs) ? selfRecomp
+      ]
+  where
+    selfRecomp = mconcat
+      [ arg "-fno-write-if-self-recomp"
+      ]
+
 -- | Build stage2 dependencies with options to emit Core into
 -- interface files which is sufficient to restart code generation.
 enableHiCore :: Flavour -> Flavour
@@ -236,7 +254,7 @@ enableThreadSanitizer instrumentCmm = addArgs $ notStage0 ? mconcat
     , builder Testsuite ? arg "--config=have_thread_sanitizer=True"
     , builder (Ghc CompileHs) ? mconcat
         [ package pkg ? (arg "-optc-fsanitize=thread" <> arg "-fcmm-thread-sanitizer")
-        | pkg <- [base, ghcPrim, array, rts]
+        | pkg <- [base, ghcInternal, array, rts]
         ]
     ]
 
@@ -304,6 +322,12 @@ enableTextWithSIMDUTF :: Flavour -> Flavour
 enableTextWithSIMDUTF flavour = flavour {
   textWithSIMDUTF = True
 }
+
+enableHashUnitIds :: Flavour -> Flavour
+enableHashUnitIds flavour = flavour { hashUnitIds = True }
+
+enableHieFiles :: Flavour -> Flavour
+enableHieFiles flavour = flavour { ghcHieFiles = (>= Stage1) }
 
 -- | Build stage2 compiler with -fomit-interface-pragmas to reduce
 -- recompilation.

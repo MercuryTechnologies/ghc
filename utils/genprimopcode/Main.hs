@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -Wno-x-partial #-}
 ------------------------------------------------------------------
 -- A primop-table mangling program                              --
 --
@@ -9,11 +10,13 @@ module Main where
 import Parser
 import Syntax
 
+import Control.Applicative (asum)
 import Data.Char
-import Data.List (union, intersperse, intercalate, nub)
-import Data.Maybe ( catMaybes )
+import Data.List (union, intersperse, intercalate, nub, sort)
+import Data.Maybe ( catMaybes, mapMaybe )
 import System.Environment ( getArgs )
 import System.IO ( hSetEncoding, stdin, stdout, utf8 )
+
 
 vecOptions :: Entry -> [(String,String,Int)]
 vecOptions i =
@@ -114,9 +117,15 @@ desugarVectorSpec i              = case vecOptions i of
 main :: IO ()
 main = getArgs >>= \args ->
        if length args /= 1 || head args `notElem` known_args
-       then error ("usage: genprimopcode command < primops.txt > ...\n"
+       then error ("Usage: genprimopcode command < primops.txt > ...\n"
                    ++ "   where command is one of\n"
                    ++ unlines (map ("            "++) known_args)
+                   ++ unlines
+                        [ ""
+                        , "Nota Bene:  Be sure to manually run primops.txt through the C Pre-Processor"
+                        , "            before sending the input stream to STDIN, i.e:"
+                        , ""
+                        , "                cpp -P -w primops.txt | genprimopcode command" ]
                   )
        else
        do hSetEncoding stdin  utf8 -- The input file is in UTF-8. Set the encoding explicitly.
@@ -204,6 +213,9 @@ main = getArgs >>= \args ->
                       "--wired-in-deprecations"
                          -> putStr (gen_wired_in_deprecations p_o_specs)
 
+                      "--foundation-tests"
+                         -> putStr (gen_foundation_tests p_o_specs)
+
                       _ -> error "Should not happen, known_args out of sync?"
                    )
 
@@ -229,7 +241,8 @@ known_args
        "--make-haskell-source",
        "--make-latex-doc",
        "--wired-in-docs",
-       "--wired-in-deprecations"
+       "--wired-in-deprecations",
+       "--foundation-tests"
      ]
 
 ------------------------------------------------------------------
@@ -246,7 +259,7 @@ gen_hs_source (Info defaults entries) =
     ++ "\n"
         ++ (replicate 77 '-' ++ "\n") -- For 80-col cleanliness
         ++ "-- |\n"
-        ++ "-- Module      :  GHC.Prim\n"
+        ++ "-- Module      :  GHC.Internal.Prim\n"
         ++ "-- \n"
         ++ "-- Maintainer  :  ghc-devs@haskell.org\n"
         ++ "-- Stability   :  internal\n"
@@ -271,15 +284,17 @@ gen_hs_source (Info defaults entries) =
                 -- and we don't want a complaint that the constraint is redundant
                 -- Remember, this silly file is only for Haddock's consumption
 
-        ++ "{-# OPTIONS_HADDOCK print-explicit-runtime-reps #-}"
-        ++ "module GHC.Prim (\n"
+        ++ "{-# OPTIONS_HADDOCK print-explicit-runtime-reps #-}\n"
+        ++ "module GHC.Internal.Prim (\n"
         ++ unlines (map (("        " ++) . hdr) entries')
         ++ ") where\n"
     ++ "\n"
     ++ "{-\n"
         ++ unlines (map opt defaults)
     ++ "-}\n"
-    ++ "import GHC.Types (Coercible)\n"
+    -- this import introduces a loop between GHC.Internal.Types and
+    -- GHC.Internal.Prim.
+    -- ++ "import GHC.Internal.Types (Coercible)\n"
 
     ++ "default ()"  -- If we don't say this then the default type include Integer
                      -- so that runs off and loads modules that are not part of
@@ -304,6 +319,7 @@ gen_hs_source (Info defaults entries) =
            opt (OptionVector _)    = ""
            opt (OptionFixity mf) = "fixity = " ++ show mf
            opt (OptionEffect eff) = "effect = " ++ show eff
+           opt (OptionDefinedBits bc) = "defined_bits = " ++ show bc
            opt (OptionCanFailWarnFlag wf) = "can_fail_warning = " ++ show wf
 
            hdr s@(Section {})                                    = sec s
@@ -387,7 +403,7 @@ getName _ = Nothing
 
 {- Note [Placeholder declarations]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We are generating fake declarations for things in GHC.Prim, just to
+We are generating fake declarations for things in GHC.Internal.Prim, just to
 keep GHC's renamer and typechecker happy enough for what Haddock
 needs.  Our main plan is to say
         foo :: <type>
@@ -397,7 +413,7 @@ That works for all the primitive functions except tagToEnum#.
 If we generate the binding
         tagToEnum# = tagToEnum#
 GHC will complain about "tagToEnum# must appear applied to one argument".
-We could hack GHC to silence this complaint when compiling GHC.Prim,
+We could hack GHC to silence this complaint when compiling GHC.Internal.Prim,
 but it seems easier to generate
         tagToEnum# = let x = x in x
 We don't do this for *all* bindings because for ones with an unboxed
@@ -468,10 +484,10 @@ gen_wrappers (Info _ entries)
         -- don't need the Prelude here so we add NoImplicitPrelude.
      ++ "{-# OPTIONS_GHC -Wno-deprecations -O0 -fno-do-eta-reduction #-}\n"
         -- Very important OPTIONS_GHC!  See Note [OPTIONS_GHC in GHC.PrimopWrappers]
-     ++ "module GHC.PrimopWrappers where\n"
-     ++ "import qualified GHC.Prim\n"
-     ++ "import GHC.Tuple ()\n"
-     ++ "import GHC.Prim (" ++ types ++ ")\n"
+     ++ "module GHC.Internal.PrimopWrappers where\n"
+     ++ "import qualified GHC.Internal.Prim\n"
+     ++ "import GHC.Internal.Tuple ()\n"
+     ++ "import GHC.Internal.Prim (" ++ types ++ ")\n"
      ++ unlines (concatMap mk_wrapper wrappers)
      where
         wrappers = filter want_wrapper entries
@@ -488,8 +504,8 @@ gen_wrappers (Info _ entries)
               lhs ++ " = " ++ rhs]
         wrap nm | isLower (head nm) = nm
                 | otherwise = "(" ++ nm ++ ")"
-        wrap_qual nm | isLower (head nm) = "GHC.Prim." ++ nm
-                     | otherwise         = "(GHC.Prim." ++ nm ++ ")"
+        wrap_qual nm | isLower (head nm) = "GHC.Internal.Prim." ++ nm
+                     | otherwise         = "(GHC.Internal.Prim." ++ nm ++ ")"
 
         want_wrapper :: Entry -> Bool
         want_wrapper entry =
@@ -630,6 +646,7 @@ gen_switch_from_attribs attrib_name fn_name (Info defaults entries)
          getAltRhs (OptionVector _) = "True"
          getAltRhs (OptionFixity mf) = show mf
          getAltRhs (OptionEffect eff) = show eff
+         getAltRhs (OptionDefinedBits bc) = show bc
          getAltRhs (OptionCanFailWarnFlag wf) = show wf
 
          mkAlt po
@@ -675,6 +692,107 @@ gen_wired_in_deprecations (Info _ entries)
                   Section{}         -> error "impossible(Section)"
           in Just $ "(" ++ mkOcc ++ " " ++ show poName ++ ", fsLit " ++ show depMsg ++ ")"
         | otherwise = Nothing
+
+
+gen_foundation_tests :: Info -> String
+gen_foundation_tests (Info _ entries)
+  = "tests =\n  [ "
+    ++ intercalate "\n  , " (catMaybes $ map mkTest entries)
+    ++ "\n  ]\n"
+    ++ "\n" ++ intercalate "\n" (map mkInstances testable_tys)
+  where
+    testable_tys = nub (sort (mapMaybe (\po -> ty po <$ mkTest po) entries))
+
+    mkInstances inst_ty =
+      let test_lambda = "\\ " ++ intercalate " " (zipWith mkArg [0::Int ..] (arg_tys)) ++ " -> " ++ mk_body "l" ++ " === " ++ mk_body "r"
+      in  unlines $
+      [ "instance TestPrimop (" ++ pprTy inst_ty ++ ") where"
+      , "  testPrimop s l r = Property s $ " ++ test_lambda ]
+      ++ (if mb_divable_tys
+          then ["  testPrimopDivLike s l r = Property s $ twoNonZero $ " ++ test_lambda]
+          else [])
+      where
+        arg_tys = args inst_ty
+        -- eg Int -> Int -> a
+        mb_divable_tys = case arg_tys of
+            [ty1,ty2] -> ty1 == ty2 && ty1 `elem` divableTyCons
+            _         -> False
+
+        mk_body s = res_ty inst_ty (" (" ++ s ++ " " ++ intercalate " " vs ++ ")")
+
+        vs = zipWith (\n _ -> "x" ++ show n) [0::Int ..] (arg_tys)
+
+    mkArg n t = "(" ++ unwrapper t  ++ "-> x" ++ show n ++ ")"
+
+
+    wrapper s = "w" ++ s
+    unwrapper s = "u" ++ s
+
+
+    args (TyF (TyApp (TyCon c) []) t2) = c : args t2
+    args (TyApp {}) = []
+    args (TyUTup {}) = []
+    -- If you hit this you will need to handle the foundation tests to handle the
+    -- type it failed on.
+    args arg_ty = error ("Unexpected primop type:" ++ pprTy arg_ty)
+
+    res_ty (TyF _ t2) x = res_ty t2 x
+    res_ty (TyApp (TyCon c) []) x = wrapper c ++ x
+    res_ty (TyUTup tup_tys) x =
+      let wtup = case length tup_tys of
+                   2 -> "WTUP2"
+                   3 -> "WTUP3"
+                   -- Only handles primops returning unboxed tuples up to 3 args currently
+                   _ -> error "Unexpected primop result type"
+      in wtup ++"(" ++ intercalate "," (map (\a -> res_ty a "") tup_tys ++ [x]) ++ ")"
+    -- If you hit this you will need to handle the foundation tests to handle the
+    -- type it failed on.
+    res_ty unexpected_ty x = error ("Unexpected primop result type:" ++ pprTy unexpected_ty ++ "," ++ x)
+
+
+    wrap qual nm | isLower (head nm) = qual ++ "." ++ nm
+            | otherwise = "(" ++ qual ++ "." ++ nm ++ ")"
+    mkTest po
+      | Just poName <- getName po
+      , is_primop po
+      , not $ is_vector po
+      , poName /= "tagToEnum#"
+      , poName /= "quotRemWord2#"
+      , (testable (ty po))
+      = let testPrimOpHow = if is_divLikeOp po
+              then "testPrimopDivLike"
+              else "testPrimop"
+            qualOp qualification =
+              let qName = wrap qualification poName
+              in  case mb_defined_bits po of
+                    Nothing -> qName
+                    Just bs -> concat ["(", show bs, " `LowerBitsAreDefined` ", qName, ")"]
+        in Just $ intercalate " " [testPrimOpHow, "\"" ++ poName ++ "\"", qualOp "Primop", qualOp "Wrapper"]
+      | otherwise = Nothing
+
+
+
+    testable (TyF t1 t2) = testable t1 && testable t2
+    testable (TyC _  t2) = testable t2
+    testable (TyApp tc tys) = testableTyCon tc && all testable tys
+    testable (TyVar _a)   = False
+    testable (TyUTup tys)  = all testable tys
+
+    testableTyCon (TyCon c) =
+      c `elem` ["Int#", "Word#", "Word8#", "Word16#", "Word32#", "Word64#"
+               , "Int8#", "Int16#", "Int32#", "Int64#", "Char#"]
+    testableTyCon _ = False
+    divableTyCons = ["Int#", "Word#", "Word8#", "Word16#", "Word32#", "Word64#"
+                    ,"Int8#", "Int16#", "Int32#", "Int64#"]
+
+    mb_defined_bits :: Entry -> Maybe Word
+    mb_defined_bits op@(PrimOpSpec{}) =
+      let opOpts = opts op
+          getDefBits :: Option -> Maybe Word
+          getDefBits (OptionDefinedBits x) = x
+          getDefBits _ = Nothing
+      in  asum $ getDefBits <$> opOpts
+    mb_defined_bits _ = Nothing
 
 
 ------------------------------------------------------------------
@@ -834,8 +952,6 @@ ppType (TyApp (TyCon "StablePtr#")  [x]) = "mkStablePtrPrimTy " ++ ppType x
 ppType (TyApp (TyCon "StableName#") [x]) = "mkStableNamePrimTy " ++ ppType x
 
 ppType (TyApp (TyCon "MVar#") [x,y])     = "mkMVarPrimTy " ++ ppType x
-                                           ++ " " ++ ppType y
-ppType (TyApp (TyCon "IOPort#") [x,y])   = "mkIOPortPrimTy " ++ ppType x
                                            ++ " " ++ ppType y
 ppType (TyApp (TyCon "TVar#") [x,y])     = "mkTVarPrimTy " ++ ppType x
                                            ++ " " ++ ppType y

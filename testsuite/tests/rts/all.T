@@ -71,6 +71,8 @@ test('divbyzero',
       # Apparently the output can be different on different
       # Linux setups, so just ignore it. As long as we get
       # the right exit code we're OK.
+      when(arch('loongarch64'), skip),
+      # LoongArch64 has no exception for this, too.
       when(opsys('linux'), ignore_stderr),
       # On OpenBSD the output varies depending on ulimit, exit code is enough.
       when(opsys('openbsd'), ignore_stderr),
@@ -116,6 +118,7 @@ test('outofmem2',
 test('T2047',
      [ignore_stdout,
       extra_run_opts('+RTS -c -RTS'),
+      when(opsys('freebsd'), fragile(25751)),
       # Non-moving collector doesn't support -c
       omit_ways(['nonmoving', 'nonmoving_thr', 'nonmoving_thr_sanity', 'nonmoving_thr_ghc'])],
      compile_and_run, ['-package containers'])
@@ -306,7 +309,7 @@ test('ffishutdown', [ignore_stderr, only_ways(['threaded1','threaded2'])],
 test('T7919', [ when(fast(), skip)
               , omit_ghci
               , req_th
-              , when(platform('x86_64-unknown-linux'), fragile(22283))
+              , when(arch('i386') or platform('x86_64-unknown-linux'), fragile(22283))
               , js_fragile(24259)
               ]
               , compile_and_run, [config.ghc_th_way_flags])
@@ -423,9 +426,7 @@ test('T10296b', [only_ways(['threaded2'])], compile_and_run, [''])
 test('numa001', [ extra_run_opts('8'), unless(unregisterised(), extra_ways(['debug_numa'])), req_ghc_with_threaded_rts ]
                 , compile_and_run, [''])
 
-test('T12497', [ unless(opsys('mingw32'), skip), expect_broken(22694)
-               ],
-               makefile_test, ['T12497'])
+test('T12497', unless(opsys('mingw32'), skip), makefile_test, ['T12497'])
 
 test('T13617', [ unless(opsys('mingw32'), skip)],
                makefile_test, ['T13617'])
@@ -444,6 +445,13 @@ test('T13894', js_skip, compile_and_run, [''])
 # this test fails with the profasm way on some machines but not others,
 # so we just skip it.
 test('T14497', [omit_ways(['profasm']), multi_cpu_race], compile_and_run, ['-O'])
+# The issue in the above test also happened with compaction enabled.
+test('T14497-compact',
+               [ extra_files(['T14497.hs'])
+               , only_ways(['normal'])
+               , multi_cpu_race
+               , extra_run_opts('+RTS -c -RTS')
+               ] , compile_and_run, ['-O'])
 test('T14695', [js_broken(22359), ignore_stderr], makefile_test, ['T14695'])
 test('T14702', [ ignore_stdout
                , when(unregisterised(), skip)
@@ -462,6 +470,8 @@ test('InternalCounters',
     # The ways which build against the debug RTS are built with PROF_SPIN and
     # therefore differ in output
   , omit_ways(['nonmoving_thr_sanity', 'threaded2_sanity', 'sanity'])
+    # Likewise when ghc is linked with debug RTS using +debug_ghc
+  , when(debug_rts(), skip)
   ], makefile_test, ['InternalCounters'])
 test('alloccounter1', js_broken(22261), compile_and_run,
   [
@@ -524,7 +534,9 @@ test('InitEventLogging',
      ],
      compile_and_run, ['InitEventLogging_c.c'])
 test('RestartEventLogging',
-     [only_ways(['threaded1','threaded2']), extra_run_opts('+RTS -la -RTS')],
+     [only_ways(['threaded1','threaded2']),
+      extra_run_opts('+RTS -la -RTS'),
+      when(opsys('freebsd'), fragile(19724))],
      compile_and_run, ['RestartEventLogging_c.c'])
 
 test('T17088',
@@ -623,3 +635,14 @@ test('T24142', [req_target_smp], compile_and_run, ['-threaded -with-rtsopts "-N2
 
 test('T25232', [unless(have_profiling(), skip), only_ways(['normal','nonmoving','nonmoving_prof','nonmoving_thr_prof']), extra_ways(['nonmoving', 'nonmoving_prof'] + (['nonmoving_thr_prof'] if have_threaded() else []))], compile_and_run, [''])
 test('T25280', [unless(opsys('linux'),skip),req_process,js_skip], compile_and_run, [''])
+
+# N.B. This will likely issue a warning on stderr but we merely care that the
+# program doesn't crash.
+test('T25560', [req_c_rts, ignore_stderr], compile_and_run, [''])
+
+test('TestProddableBlockSet', [req_c_rts], multimod_compile_and_run, ['TestProddableBlockSet.c', '-no-hs-main'])
+test('T22859', 
+     [js_skip,
+      # Allocation behaviour differs with the wasm backend so we get different output
+      when(arch('wasm32'), skip)],
+     compile_and_run, ['-with-rtsopts -A8K'])

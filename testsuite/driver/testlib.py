@@ -161,6 +161,12 @@ def js_broken( bug: IssueNumber ):
     else:
         return normal;
 
+def wasm_broken( bug: IssueNumber ):
+    if wasm_arch():
+        return expect_broken(bug);
+    else:
+        return normal;
+
 # expect occasional failures for the JS backend
 def js_fragile( bug: IssueNumber ):
     if js_arch():
@@ -268,6 +274,10 @@ def req_bco( name, opts ):
     req_interp(name, opts)
 
     # JS backend doesn't support ByteCode
+    js_skip(name, opts)
+
+def req_c_rts( name, opts ):
+    """ Require the C runtime system (rather than, e.g. the Javascript RTS). """
     js_skip(name, opts)
 
 def req_rts_linker( name, opts ):
@@ -970,6 +980,9 @@ def tables_next_to_code() -> bool:
 def fast() -> bool:
     return config.speed == 2
 
+def slow() -> bool:
+    return config.speed == 0
+
 def platform( plat: str ) -> bool:
     return config.platform == plat
 
@@ -1530,7 +1543,7 @@ async def test_common_work(name: TestName, opts,
             all_ways = config.compile_ways
         elif func in [compile_and_run, multi_compile_and_run, multimod_compile_and_run]:
             all_ways = config.run_ways
-        elif func == ghci_script:
+        elif func == ghci_script or func == ghci_multiunit_script:
             if config.have_interp:
                 all_ways = [WayName('ghci'), WayName('ghci-opt')]
             else:
@@ -1627,6 +1640,11 @@ async def test_common_work(name: TestName, opts,
             do_ways = []
             config.hadrian_deps |= getTestOpts().hadrian_deps
 
+        # Skip tests which require hadrian dependencies if we are testing
+        # an out-of-tree compiler as Hadrian is unavailable. See #13897.
+        if not config.in_tree_compiler and getTestOpts().hadrian_deps - {'test:ghc'}:
+            do_ways = []
+
         # Run the required tests...
         for way in do_ways:
             if stopping():
@@ -1721,7 +1739,7 @@ async def do_test(name: TestName,
         dst_makefile = in_testdir('Makefile')
         if src_makefile.exists():
             makefile = src_makefile.read_text(encoding='UTF-8')
-            makefile = re.sub('TOP=.*', 'TOP=%s' % config.top, makefile, 1)
+            makefile = re.sub('TOP=.*', 'TOP=%s' % config.top, makefile, count=1)
             dst_makefile.write_text(makefile, encoding='UTF-8')
 
     if opts.pre_cmd:
@@ -1851,6 +1869,20 @@ async def ghci_script( name, way, script):
     # script can invoke the correct compiler by using ':! $HC $HC_OPTS'
     cmd = ('HC={{compiler}} HC_OPTS="{flags}" {{compiler}} {way_flags} {flags}'
           ).format(flags=flags, way_flags=way_flags)
+      # NB: put way_flags before flags so that flags in all.T can override others
+
+    getTestOpts().stdin = script
+    return await simple_run( name, way, cmd, getTestOpts().extra_run_opts )
+
+async def ghci_multiunit_script( name, way, units, script):
+    flags = ' '.join(get_compiler_flags())
+    way_flags = ' '.join(config.way_flags[way])
+    unit_flags = ' '.join(['-unit @%s' % unit for unit in units])
+
+    # We pass HC and HC_OPTS as environment variables, so that the
+    # script can invoke the correct compiler by using ':! $HC $HC_OPTS'
+    cmd = ('HC={{compiler}} HC_OPTS="{flags}" {{compiler}} {way_flags} {flags} {units}'
+          ).format(flags=flags, way_flags=way_flags, units=unit_flags)
       # NB: put way_flags before flags so that flags in all.T can override others
 
     getTestOpts().stdin = script
@@ -2933,9 +2965,6 @@ def normalise_errmsg(s: str) -> str:
     s = re.sub('hpc-[0-9.]+', 'hpc', s)
     s = re.sub('ghc-pkg-[0-9.]+', 'ghc-pkg', s)
 
-    # Error messages sometimes contain ghc-bignum implementation package
-    s = re.sub('ghc-bignum-[0-9.]+', 'ghc-bignum-<VERSION>', s)
-
     # Error messages sometimes contain these blurbs which can vary
     # spuriously depending upon build configuration (e.g. based on bignum
     # backend)
@@ -2959,7 +2988,7 @@ def normalise_errmsg(s: str) -> str:
 
     # filter out unsupported GNU_PROPERTY_TYPE (5), which is emitted by LLVM10
     # and not understood by older binutils (ar, ranlib, ...)
-    s = modify_lines(s, lambda l: re.sub(r'^(.+)warning: (.+): unsupported GNU_PROPERTY_TYPE \(5\) type: 0xc000000(.*)$', '', l))
+    s = modify_lines(s, lambda l: re.sub(r'^(.+)warning: (.+): unsupported GNU_PROPERTY_TYPE (?:\(5\) )?type: 0xc000000(.*)$', '', l))
 
     s = re.sub(r'ld: warning: passed .* min versions \(.*\) for platform macOS. Using [\.0-9]+.','',s)
     s = re.sub('ld: warning: -sdk_version and -platform_version are not compatible, ignoring -sdk_version','',s)

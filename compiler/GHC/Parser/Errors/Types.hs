@@ -69,7 +69,7 @@ data PsMessage
         arbitrary messages to be embedded. The typical use case would be GHC plugins
         willing to emit custom diagnostics.
     -}
-    PsUnknownMessage (UnknownDiagnostic (DiagnosticOpts PsMessage))
+    PsUnknownMessage (UnknownDiagnosticFor PsMessage)
 
     {-| A group of parser messages emitted in 'GHC.Parser.Header'.
         See Note [Messages from GHC.Parser.Header].
@@ -207,11 +207,14 @@ data PsMessage
    -- | Import: multiple occurrences of 'qualified'
    | PsErrImportQualifiedTwice
 
+   -- | Multiple occurrences of a splice or quote keyword
+   | PsErrSpliceOrQuoteTwice
+
    -- | Post qualified import without 'ImportQualifiedPost'
    | PsErrImportPostQualified
 
    -- | Explicit namespace keyword without 'ExplicitNamespaces'
-   | PsErrIllegalExplicitNamespace
+   | PsErrIllegalExplicitNamespace !ExplicitNamespaceKeyword
 
    -- | Expecting a type constructor but found a variable
    | PsErrVarForTyCon !RdrName
@@ -466,7 +469,7 @@ data PsMessage
    | PsErrParseRightOpSectionInPat !RdrName !(PatBuilder GhcPs)
 
    -- | Illegal linear arrow or multiplicity annotation in GADT record syntax
-   | PsErrIllegalGadtRecordMultiplicity !(HsArrow GhcPs)
+   | PsErrIllegalGadtRecordMultiplicity !(HsMultAnn GhcPs)
 
    | PsErrInvalidCApiImport
 
@@ -490,6 +493,27 @@ data PsMessage
    --               T24159_pat_parse_error_5
    --               T24159_pat_parse_error_6
    | PsErrTypeSyntaxInPat !PsErrTypeSyntaxDetails
+
+   -- | 'PsErrSpecExprMultipleTypeAscription' is an error that occurs when
+   -- a user attempts to use the new form SPECIALISE pragma syntax with
+   -- multiple type signatures, e.g.
+   --
+   -- @{-# SPECIALISE foo 3 :: Float -> Float; Double -> Double #-}
+   | PsErrSpecExprMultipleTypeAscription
+
+   -- | 'PsWarnSpecMultipleTypeAscription' is a warning that occurs when
+   -- a user uses the old-form SPECIALISE pragma syntax with
+   -- multiple type signatures, e.g.
+   --
+   -- @{-# SPECIALISE bar :: Float -> Float; Double -> Double #-}
+   --
+   -- This constructor is deprecated and will be removed in GHC 9.18.
+   | PsWarnSpecMultipleTypeAscription
+
+   -- | The deprecated ``pattern`` namespace specifier was used in an import or
+   -- export list. Suggested fix: use the ``data`` keyword instead.
+   | PsWarnPatternNamespaceSpecifier
+      !Bool -- ^ Is ExplicitNamespaces on?
 
    deriving Generic
 
@@ -539,8 +563,6 @@ data ParseContext
 data PsErrInPatDetails
   = PEIP_NegApp
     -- ^ Negative application pattern?
-  | PEIP_TypeArgs [HsConPatTyArg GhcPs]
-    -- ^ The list of type arguments for the pattern
   | PEIP_RecPattern [LPat GhcPs]    -- ^ The pattern arguments
                     !PatIsRecursive -- ^ Is the parsed pattern recursive?
                     !ParseContext
@@ -554,7 +576,7 @@ data PsErrPunDetails
 data PsErrTypeSyntaxDetails
   = PETS_FunctionArrow
       !(LocatedA (PatBuilder GhcPs))
-      !(HsArrowOf (LocatedA (PatBuilder GhcPs)) GhcPs)
+      !(HsMultAnnOf (LocatedA (PatBuilder GhcPs)) GhcPs)
       !(LocatedA (PatBuilder GhcPs))
   | PETS_Multiplicity
       !(EpToken "%")
@@ -594,6 +616,7 @@ data LexErr
    | LexUnterminatedComment -- ^ Unterminated `{-'
    | LexUnterminatedOptions -- ^ Unterminated OPTIONS pragma
    | LexUnterminatedQQ      -- ^ Unterminated quasiquotation
+   deriving (Show,Eq,Ord)
 
 -- | Errors from the Cmm parser
 data CmmParserError

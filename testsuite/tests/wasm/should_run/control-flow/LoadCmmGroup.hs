@@ -19,7 +19,6 @@ import GHC
 import GHC.Cmm
 import GHC.Cmm.Parser
 import GHC.Core.Lint.Interactive
-import GHC.Core.TyCon
 import GHC.CoreToStg
 import GHC.CoreToStg.Prep
 import GHC.Data.Stream hiding (mapM, map)
@@ -34,7 +33,6 @@ import GHC.Stg.FVs
 import GHC.Stg.Syntax
 import GHC.StgToCmm (codeGen)
 import GHC.Types.CostCentre (emptyCollectedCCs)
-import GHC.Types.HpcInfo (emptyHpcInfo)
 import GHC.Types.IPE (emptyInfoTableProvMap)
 import GHC.Types.Unique.DSM
 import GHC.Unit.Home
@@ -70,14 +68,12 @@ cmmOfSummary summ = do
       tycons = []
       ccs = emptyCollectedCCs
       stg' = fmap fst (depSortWithAnnotStgPgm (ms_mod summ) stg)
-      hpcinfo = emptyHpcInfo False
       tmpfs = hsc_tmpfs env
-      stg_to_cmm dflags mod = codeGen logger tmpfs (initStgToCmmConfig dflags mod)
   (groups, _infos) <-
       liftIO $ fmap fst $
       runUDSMT (initDUniqSupply 't' 0) $
       collectAll $
-      stg_to_cmm dflags (ms_mod summ) infotable tycons ccs stg' hpcinfo
+      codeGen logger tmpfs (initStgToCmmConfig dflags (ms_mod summ)) infotable tycons ccs stg'
   return groups
 
 frontend :: DynFlags -> HscEnv -> ModSummary -> IO ModGuts
@@ -97,14 +93,10 @@ stgify summary guts = do
     let dflags = hsc_dflags hsc_env
     prepd_binds <- liftIO $ do
       cp_cfg <- initCorePrepConfig hsc_env
-      corePrepPgm (hsc_logger hsc_env) cp_cfg (initCorePrepPgmConfig dflags (interactiveInScope $ hsc_IC hsc_env)) this_mod location core_binds data_tycons
+      corePrepPgm (hsc_logger hsc_env) cp_cfg (initCorePrepPgmConfig dflags (interactiveInScope $ hsc_IC hsc_env)) this_mod core_binds
     return $ fstOf3 $ coreToStg (initCoreToStgOpts dflags) (ms_mod summary) (ms_location summary) prepd_binds
   where this_mod = mg_module guts
-        location = ms_location summary
         core_binds = mg_binds guts
-        data_tycons = filter isDataTyCon tycons
-        tycons = mg_tcs guts
-
 
 slurpCmm :: HscEnv -> FilePath -> IO (CmmGroup)
 slurpCmm hsc_env filename = runHsc hsc_env $ do

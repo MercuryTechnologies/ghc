@@ -43,7 +43,7 @@ module GHC.Hs.Decls (
   isFamilyDecl, isTypeFamilyDecl, isDataFamilyDecl,
   isOpenTypeFamilyInfo, isClosedTypeFamilyInfo,
   tyFamInstDeclName, tyFamInstDeclLName,
-  countTyClDecls, pprTyClDeclFlavour,
+  countTyClDecls, tyClDeclFlavour,
   tyClDeclLName, tyClDeclTyVars,
   hsDeclHasCusk, famResultKindSignature,
   FamilyDecl(..), LFamilyDecl,
@@ -67,7 +67,7 @@ module GHC.Hs.Decls (
   XViaStrategyPs(..),
   -- ** @RULE@ declarations
   LRuleDecls,RuleDecls(..),RuleDecl(..),LRuleDecl,HsRuleRn(..),
-  HsRuleAnn(..), ActivationAnn(..),
+  HsRuleAnn(..),
   RuleBndr(..),LRuleBndr,
   collectRuleBndrSigTys,
   flattenRuleDecls, pprFullRuleName,
@@ -234,17 +234,16 @@ hsGroupTopLevelFixitySigs (HsGroup{ hs_fixds = fixds, hs_tyclds = tyclds }) =
 hsGroupInstDecls :: HsGroup (GhcPass p) -> [LInstDecl (GhcPass p)]
 hsGroupInstDecls = (=<<) group_instds . hs_tyclds
 
+-- Helpers to flatten TyClGroups.
+-- See (TCDEP1) in Note [Dependency analysis of type and class decls] in GHC.Rename.Module
 tyClGroupTyClDecls :: [TyClGroup (GhcPass p)] -> [LTyClDecl (GhcPass p)]
-tyClGroupTyClDecls = Data.List.concatMap group_tyclds
-
 tyClGroupInstDecls :: [TyClGroup (GhcPass p)] -> [LInstDecl (GhcPass p)]
-tyClGroupInstDecls = Data.List.concatMap group_instds
-
 tyClGroupRoleDecls :: [TyClGroup (GhcPass p)] -> [LRoleAnnotDecl (GhcPass p)]
+tyClGroupKindSigs  :: [TyClGroup (GhcPass p)] -> [LStandaloneKindSig (GhcPass p)]
+tyClGroupTyClDecls = Data.List.concatMap group_tyclds
+tyClGroupInstDecls = Data.List.concatMap group_instds
 tyClGroupRoleDecls = Data.List.concatMap group_roles
-
-tyClGroupKindSigs :: [TyClGroup (GhcPass p)] -> [LStandaloneKindSig (GhcPass p)]
-tyClGroupKindSigs = Data.List.concatMap group_kisigs
+tyClGroupKindSigs  = Data.List.concatMap group_kisigs
 
 appendGroups :: HsGroup (GhcPass p) -> HsGroup (GhcPass p)
              -> HsGroup (GhcPass p)
@@ -572,13 +571,18 @@ pp_vanilla_decl_head thing (HsQTvs { hsq_explicit = tyvars }) fixity context
                   , hsep (map (ppr.unLoc) (varl:varsr))]
     pp_tyvars [] = pprPrefixOcc (unLoc thing)
 
-pprTyClDeclFlavour :: TyClDecl (GhcPass p) -> SDoc
-pprTyClDeclFlavour (ClassDecl {})   = text "class"
-pprTyClDeclFlavour (SynDecl {})     = text "type"
-pprTyClDeclFlavour (FamDecl { tcdFam = FamilyDecl { fdInfo = info }})
-  = pprFlavour info <+> text "family"
-pprTyClDeclFlavour (DataDecl { tcdDataDefn = HsDataDefn { dd_cons = nd } })
-  = ppr (dataDefnConsNewOrData nd)
+tyClDeclFlavour :: TyClDecl (GhcPass p) -> TyConFlavour tc
+tyClDeclFlavour (ClassDecl {})   = ClassFlavour
+tyClDeclFlavour (SynDecl {})     = TypeSynonymFlavour
+tyClDeclFlavour (FamDecl { tcdFam = FamilyDecl { fdInfo = info }})
+  = case info of
+      DataFamily          -> OpenFamilyFlavour (IAmData DataType) Nothing
+      OpenTypeFamily      -> OpenFamilyFlavour IAmType Nothing
+      ClosedTypeFamily {} -> ClosedTypeFamilyFlavour
+tyClDeclFlavour (DataDecl { tcdDataDefn = HsDataDefn { dd_cons = nd } })
+  = case dataDefnConsNewOrData nd of
+      NewType  -> NewtypeFlavour
+      DataType -> DataTypeFlavour
 
 instance OutputableBndrId p => Outputable (FunDep (GhcPass p)) where
   ppr = pprFunDep
@@ -601,7 +605,14 @@ pprFunDep (FunDep _ us vs) = hsep [interppSP us, arrow, interppSP vs]
 *                                                                      *
 ********************************************************************* -}
 
-type instance XCTyClGroup (GhcPass _) = NoExtField
+type instance XCTyClGroup GhcPs = NoExtField
+
+type instance XCTyClGroup GhcRn = NameSet     -- Lexical dependencies of an SCC
+  -- What names exactly are in this NameSet? See Note [Prepare TyClGroup FVs] in GHC.Rename.Module
+  -- How is this NameSet used? See Note [Retrying TyClGroups] in GHC.Tc.TyCl
+
+type instance XCTyClGroup GhcTc = DataConCantHappen
+
 type instance XXTyClGroup (GhcPass _) = DataConCantHappen
 
 
@@ -688,7 +699,7 @@ instance OutputableBndrId p
                   TyVarSig _ tv_bndr -> text "=" <+> ppr tv_bndr
       pp_inj = case mb_inj of
                  Just (L _ (InjectivityAnn _ lhs rhs)) ->
-                   hsep [ vbar, ppr lhs, text "->", hsep (map ppr rhs) ]
+                   hsep [ vbar, ppr lhs, arrow, hsep (map ppr rhs) ]
                  Nothing -> empty
       (pp_where, pp_eqns) = case info of
         ClosedTypeFamily mb_eqns ->
@@ -800,7 +811,7 @@ getConNames ConDeclGADT {con_names = names} = toList names
 -- | Return @'Just' fields@ if a data constructor declaration uses record
 -- syntax (i.e., 'RecCon'), where @fields@ are the field selectors.
 -- Otherwise, return 'Nothing'.
-getRecConArgs_maybe :: ConDecl GhcRn -> Maybe (LocatedL [LConDeclField GhcRn])
+getRecConArgs_maybe :: ConDecl GhcRn -> Maybe (LocatedL [LHsConDeclRecField GhcRn])
 getRecConArgs_maybe (ConDeclH98{con_args = args}) = case args of
   PrefixCon{} -> Nothing
   RecCon flds -> Just flds
@@ -857,7 +868,7 @@ instance OutputableBndrId p
 instance OutputableBndrId p
        => Outputable (StandaloneKindSig (GhcPass p)) where
   ppr (StandaloneKindSig _ v ki)
-    = text "type" <+> pprPrefixOcc (unLoc v) <+> text "::" <+> ppr ki
+    = text "type" <+> pprPrefixOcc (unLoc v) <+> dcolon <+> ppr ki
 
 pp_condecls :: forall p. OutputableBndrId p => [LConDecl (GhcPass p)] -> SDoc
 pp_condecls cs
@@ -881,27 +892,31 @@ pprConDecl (ConDeclH98 { con_name = L _ con
   where
     -- In ppr_details: let's not print the multiplicities (they are always 1, by
     -- definition) as they do not appear in an actual declaration.
-    ppr_details (InfixCon t1 t2) = hsep [ppr (hsScaledThing t1),
+    ppr_details (InfixCon t1 t2) = hsep [pprHsConDeclFieldNoMult t1,
                                          pprInfixOcc con,
-                                         ppr (hsScaledThing t2)]
-    ppr_details (PrefixCon _ tys) = hsep (pprPrefixOcc con
-                                    : map (pprHsType . unLoc . hsScaledThing) tys)
+                                         pprHsConDeclFieldNoMult t2]
+    ppr_details (PrefixCon tys)  = hsep (pprPrefixOcc con
+                                    : map pprHsConDeclFieldNoMult tys)
     ppr_details (RecCon fields)  = pprPrefixOcc con
-                                 <+> pprConDeclFields (unLoc fields)
+                                    <+> pprHsConDeclRecFields (unLoc fields)
 
-pprConDecl (ConDeclGADT { con_names = cons, con_bndrs = L _ outer_bndrs
+pprConDecl (ConDeclGADT { con_names = cons
+                        , con_outer_bndrs = L _ outer_bndrs
+                        , con_inner_bndrs = inner_bndrs
                         , con_mb_cxt = mcxt, con_g_args = args
                         , con_res_ty = res_ty, con_doc = doc })
   = pprMaybeWithDoc doc $ ppr_con_names (toList cons) <+> dcolon
-    <+> (sep [pprHsOuterSigTyVarBndrs outer_bndrs <+> pprLHsContext mcxt,
+    <+> (sep [pprHsOuterSigTyVarBndrs outer_bndrs
+                <+> hsep (map pprHsForAllTelescope inner_bndrs)
+                <+> pprLHsContext mcxt,
               sep (ppr_args args ++ [ppr res_ty]) ])
   where
-    ppr_args (PrefixConGADT _ args) = map (\(HsScaled arr t) -> ppr t <+> ppr_arr arr) args
-    ppr_args (RecConGADT _ fields) = [pprConDeclFields (unLoc fields) <+> arrow]
+    ppr_args (PrefixConGADT _ args) = map (pprHsConDeclFieldWith (\arr tyDoc -> tyDoc <+> ppr_arr arr)) args
+    ppr_args (RecConGADT _ fields) = [pprHsConDeclRecFields (unLoc fields) <+> arrow]
 
     -- Display linear arrows as unrestricted with -XNoLinearTypes
     -- (cf. dataConDisplayType in Note [Displaying linear fields] in GHC.Core.DataCon)
-    ppr_arr (HsLinearArrow _) = sdocOption sdocLinearTypes $ \show_linear_types ->
+    ppr_arr (HsLinearAnn _) = sdocOption sdocLinearTypes $ \show_linear_types ->
                                   if show_linear_types then lollipop else arrow
     ppr_arr arr = pprHsArrow arr
 
@@ -1097,10 +1112,6 @@ instDeclDataFamInsts inst_decls
 newOrDataToFlavour :: NewOrData -> TyConFlavour tc
 newOrDataToFlavour NewType  = NewtypeFlavour
 newOrDataToFlavour DataType = DataTypeFlavour
-
-instance Outputable NewOrData where
-  ppr NewType  = text "newtype"
-  ppr DataType = text "data"
 
 -- At the moment we only call this with @f = '[]'@ and @f = 'DataDefnCons'@.
 anyLConIsGadt :: Foldable f => f (GenLocated l (ConDecl pass)) -> Bool
@@ -1316,14 +1327,12 @@ type instance XCRuleDecls    GhcTc = SourceText
 
 type instance XXRuleDecls    (GhcPass _) = DataConCantHappen
 
-type instance XHsRule       GhcPs = (HsRuleAnn, SourceText)
+type instance XHsRule       GhcPs = ((ActivationAnn, EpToken "="), SourceText)
 type instance XHsRule       GhcRn = (HsRuleRn, SourceText)
 type instance XHsRule       GhcTc = (HsRuleRn, SourceText)
 
 data HsRuleRn = HsRuleRn NameSet NameSet -- Free-vars from the LHS and RHS
   deriving Data
-
-type instance XXRuleDecl    (GhcPass _) = DataConCantHappen
 
 data HsRuleAnn
   = HsRuleAnn
@@ -1336,12 +1345,10 @@ data HsRuleAnn
 instance NoAnn HsRuleAnn where
   noAnn = HsRuleAnn Nothing Nothing noAnn noAnn
 
+type instance XXRuleDecl    (GhcPass _) = DataConCantHappen
+
 flattenRuleDecls :: [LRuleDecls (GhcPass p)] -> [LRuleDecl (GhcPass p)]
 flattenRuleDecls decls = concatMap (rds_rules . unLoc) decls
-
-type instance XCRuleBndr    (GhcPass _) = AnnTyVarBndr
-type instance XRuleBndrSig  (GhcPass _) = AnnTyVarBndr
-type instance XXRuleBndr    (GhcPass _) = DataConCantHappen
 
 instance (OutputableBndrId p) => Outputable (RuleDecls (GhcPass p)) where
   ppr (HsRules { rds_ext = ext
@@ -1357,27 +1364,17 @@ instance (OutputableBndrId p) => Outputable (RuleDecl (GhcPass p)) where
   ppr (HsRule { rd_ext  = ext
               , rd_name = name
               , rd_act  = act
-              , rd_tyvs = tys
-              , rd_tmvs = tms
+              , rd_bndrs = bndrs
               , rd_lhs  = lhs
               , rd_rhs  = rhs })
         = sep [pprFullRuleName st name <+> ppr act,
-               nest 4 (pp_forall_ty tys <+> pp_forall_tm tys
-                                        <+> pprExpr (unLoc lhs)),
+               nest 4 (ppr bndrs <+> pprExpr (unLoc lhs)),
                nest 6 (equals <+> pprExpr (unLoc rhs)) ]
         where
-          pp_forall_ty Nothing     = empty
-          pp_forall_ty (Just qtvs) = forAllLit <+> fsep (map ppr qtvs) <> dot
-          pp_forall_tm Nothing | null tms = empty
-          pp_forall_tm _ = forAllLit <+> fsep (map ppr tms) <> dot
           st = case ghcPass @p of
                  GhcPs | (_, st) <- ext -> st
                  GhcRn | (_, st) <- ext -> st
                  GhcTc | (_, st) <- ext -> st
-
-instance (OutputableBndrId p) => Outputable (RuleBndr (GhcPass p)) where
-   ppr (RuleBndr _ name) = ppr name
-   ppr (RuleBndrSig _ name ty) = parens (ppr name <> dcolon <> ppr ty)
 
 pprFullRuleName :: SourceText -> GenLocated a (RuleName) -> SDoc
 pprFullRuleName st (L _ n) = pprWithSourceText st (doubleQuotes $ ftext n)
@@ -1492,7 +1489,7 @@ type instance Anno (DerivClauseTys (GhcPass _)) = SrcSpanAnnC
 type instance Anno (StandaloneKindSig (GhcPass p)) = SrcSpanAnnA
 type instance Anno (ConDecl (GhcPass p)) = SrcSpanAnnA
 type instance Anno Bool = EpAnnCO
-type instance Anno [LocatedA (ConDeclField (GhcPass _))] = SrcSpanAnnL
+type instance Anno [LocatedA (HsConDeclRecField (GhcPass _))] = SrcSpanAnnL
 type instance Anno (FamEqn p (LocatedA (HsType p))) = SrcSpanAnnA
 type instance Anno (TyFamInstDecl (GhcPass p)) = SrcSpanAnnA
 type instance Anno (DataFamInstDecl (GhcPass p)) = SrcSpanAnnA
@@ -1508,7 +1505,6 @@ type instance Anno (ForeignDecl (GhcPass p)) = SrcSpanAnnA
 type instance Anno (RuleDecls (GhcPass p)) = SrcSpanAnnA
 type instance Anno (RuleDecl (GhcPass p)) = SrcSpanAnnA
 type instance Anno (SourceText, RuleName) = EpAnnCO
-type instance Anno (RuleBndr (GhcPass p)) = EpAnnCO
 type instance Anno (WarnDecls (GhcPass p)) = SrcSpanAnnA
 type instance Anno (WarnDecl (GhcPass p)) = SrcSpanAnnA
 type instance Anno (AnnDecl (GhcPass p)) = SrcSpanAnnA

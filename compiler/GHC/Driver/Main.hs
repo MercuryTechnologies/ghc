@@ -47,6 +47,7 @@ module GHC.Driver.Main
     , initModDetails
     , initWholeCoreBindings
     , loadIfaceByteCode
+    , loadIfaceByteCodeLazy
     , hscMaybeWriteIface
     , hscCompileCmmFile
 
@@ -104,6 +105,7 @@ module GHC.Driver.Main
     , hscAddSptEntries
     , writeInterfaceOnlyMode
     , loadByteCode
+    , genModDetails
     ) where
 
 import GHC.Prelude
@@ -116,6 +118,7 @@ import GHC.Driver.Backend
 import GHC.Driver.Env
 import GHC.Driver.Env.KnotVars
 import GHC.Driver.Errors
+import GHC.Driver.Messager
 import GHC.Driver.Errors.Types
 import GHC.Driver.CodeOutput
 import GHC.Driver.Config.Cmm.Parser (initCmmParserConfig)
@@ -162,7 +165,7 @@ import GHC.JS.Syntax
 
 import GHC.IfaceToCore  ( typecheckIface, typecheckWholeCoreBindings )
 
-import GHC.Iface.Load   ( ifaceStats, writeIface, flagsToIfCompression )
+import GHC.Iface.Load   ( ifaceStats, writeIface, flagsToIfCompression, getGhcPrimIface )
 import GHC.Iface.Make
 import GHC.Iface.Recomp
 import GHC.Iface.Tidy
@@ -187,7 +190,8 @@ import GHC.Core.LateCC
 import GHC.Core.LateCC.Types
 
 
-import GHC.CoreToStg.Prep
+import GHC.CoreToStg.Prep( CorePrepPgmConfig, corePrepPgm, corePrepExpr )
+import GHC.CoreToStg.AddImplicitBinds( addImplicitBinds )
 import GHC.CoreToStg    ( coreToStg )
 
 import GHC.Parser.Errors.Types
@@ -202,7 +206,6 @@ import GHC.Tc.Zonk.Env ( ZonkFlexi (DefaultFlexi) )
 import GHC.Stg.Syntax
 import GHC.Stg.Pipeline ( stg2stg, StgCgInfos )
 
-import GHC.Builtin.Utils
 import GHC.Builtin.Names
 
 import qualified GHC.StgToCmm as StgToCmm ( codeGen )
@@ -219,7 +222,6 @@ import GHC.Cmm.UniqueRenamer
 import GHC.Unit
 import GHC.Unit.Env
 import GHC.Unit.Finder
-import GHC.Unit.External
 import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.ModGuts
 import GHC.Unit.Module.ModIface
@@ -244,11 +246,10 @@ import GHC.Types.IPE
 import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
 import GHC.Types.Name
-import GHC.Types.Name.Cache ( initNameCache )
+import GHC.Types.Name.Cache ( newNameCache )
 import GHC.Types.Name.Reader
 import GHC.Types.Name.Ppr
 import GHC.Types.TyThing
-import GHC.Types.HpcInfo
 import GHC.Types.Unique.Supply (uniqFromTag)
 import GHC.Types.Unique.Set
 
@@ -302,6 +303,8 @@ import GHC.Types.Unique.FM
 import GHC.Types.Unique.DFM
 import GHC.Cmm.Config (CmmConfig)
 import Data.Bifunctor
+import qualified GHC.Unit.Home.Graph as HUG
+import GHC.Unit.Home.PackageTable
 
 {- **********************************************************************
 %*                                                                      *
@@ -310,25 +313,26 @@ import Data.Bifunctor
 %********************************************************************* -}
 
 newHscEnv :: FilePath -> DynFlags -> IO HscEnv
-newHscEnv top_dir dflags = newHscEnvWithHUG top_dir dflags (homeUnitId_ dflags) home_unit_graph
+newHscEnv top_dir dflags = do
+  hpt <- emptyHomePackageTable
+  newHscEnvWithHUG top_dir dflags (homeUnitId_ dflags) (home_unit_graph hpt)
   where
-    home_unit_graph = unitEnv_singleton
+    home_unit_graph hpt = HUG.unitEnv_singleton
                         (homeUnitId_ dflags)
-                        (mkHomeUnitEnv dflags emptyHomePackageTable Nothing)
+                        (HUG.mkHomeUnitEnv emptyUnitState Nothing dflags hpt Nothing)
 
 newHscEnvWithHUG :: FilePath -> DynFlags -> UnitId -> HomeUnitGraph -> IO HscEnv
 newHscEnvWithHUG top_dir top_dynflags cur_unit home_unit_graph = do
-    nc_var  <- initNameCache 'r' knownKeyNames
+    nc_var  <- newNameCache
     fc_var  <- initFinderCache
     logger  <- initLogger
     tmpfs   <- initTmpFs
-    let dflags = homeUnitEnv_dflags $ unitEnv_lookup cur_unit home_unit_graph
+    let dflags = homeUnitEnv_dflags $ HUG.unitEnv_lookup cur_unit home_unit_graph
     unit_env <- initUnitEnv cur_unit home_unit_graph (ghcNameVersion dflags) (targetPlatform dflags)
     llvm_config <- initLlvmConfigCache top_dir
     return HscEnv { hsc_dflags         = top_dynflags
                   , hsc_logger         = setLogFlags logger (initLogFlags top_dynflags)
                   , hsc_targets        = []
-                  , hsc_mod_graph      = emptyMG
                   , hsc_IC             = emptyInteractiveContext dflags
                   , hsc_NC             = nc_var
                   , hsc_FC             = fc_var
@@ -810,7 +814,6 @@ This is the only thing that isn't caught by the type-system.
 -}
 
 
-type Messager = HscEnv -> (Int,Int) -> RecompileRequired -> ModuleGraphNode -> IO ()
 
 -- | Do the recompilation avoidance checks for both one-shot and --make modes
 -- This function is the *only* place in the compiler where we decide whether to
@@ -827,7 +830,7 @@ hscRecompStatus
   = do
     let
         msg what = case mHscMessage of
-          Just hscMessage -> hscMessage hsc_env mod_index what (ModuleNode [] mod_summary)
+          Just hscMessage -> hscMessage hsc_env mod_index what (ModuleNode [] (ModuleNodeCompile mod_summary))
           Nothing -> return ()
 
     -- First check to see if the interface file agrees with the
@@ -842,7 +845,7 @@ hscRecompStatus
     case recomp_if_result of
       OutOfDateItem reason mb_checked_iface -> do
         msg $ NeedsRecompile reason
-        return $ HscRecompNeeded $ fmap (mi_iface_hash . mi_final_exts) mb_checked_iface
+        return $ HscRecompNeeded $ fmap mi_iface_hash mb_checked_iface
       UpToDateItem checked_iface -> do
         let lcl_dflags = ms_hspp_opts mod_summary
         if | not (backendGeneratesCode (backend lcl_dflags)) -> do
@@ -860,7 +863,7 @@ hscRecompStatus
            , xopt LangExt.TemplateHaskell lcl_dflags
            -> do
               msg $ needsRecompileBecause THWithJS
-              return $ HscRecompNeeded $ Just $ mi_iface_hash $ mi_final_exts $ checked_iface
+              return $ HscRecompNeeded $ Just $ mi_iface_hash $ checked_iface
 
            | otherwise -> do
                -- Do need linkable
@@ -916,7 +919,7 @@ hscRecompStatus
                    return $ HscUpToDate checked_iface $ linkable
                  OutOfDateItem reason _ -> do
                    msg $ NeedsRecompile reason
-                   return $ HscRecompNeeded $ Just $ mi_iface_hash $ mi_final_exts $ checked_iface
+                   return $ HscRecompNeeded $ Just $ mi_iface_hash $ checked_iface
 
 -- | Check that the .o files produced by compilation are already up-to-date
 -- or not.
@@ -966,10 +969,8 @@ loadByteCode iface mod_sum = do
     let
       this_mod   = ms_mod mod_sum
       if_date    = fromJust $ ms_iface_date mod_sum
-    case mi_extra_decls iface of
-      Just extra_decls -> do
-          let fi = WholeCoreBindings extra_decls this_mod (ms_location mod_sum)
-                   (mi_foreign iface)
+    case iface_core_bindings iface (ms_location mod_sum) of
+      Just fi -> do
           return (UpToDateItem (Linkable if_date this_mod (NE.singleton (CoreBindings fi))))
       _ -> return $ outOfDateItemBecause MissingBytecode Nothing
 
@@ -977,23 +978,21 @@ loadByteCode iface mod_sum = do
 -- Compilers
 --------------------------------------------------------------
 
-add_iface_to_hpt :: ModIface -> ModDetails -> HscEnv -> HscEnv
+add_iface_to_hpt :: ModIface -> ModDetails -> HscEnv -> IO ()
 add_iface_to_hpt iface details =
-  hscUpdateHPT $ \ hpt ->
-    addToHpt hpt (moduleName (mi_module iface))
-    (HomeModInfo iface details emptyHomeModInfoLinkable)
+  hscInsertHPT (HomeModInfo iface details emptyHomeModInfoLinkable)
 
 -- Knot tying!  See Note [Knot-tying typecheckIface]
 -- See Note [ModDetails and --make mode]
 initModDetails :: HscEnv -> ModIface -> IO ModDetails
 initModDetails hsc_env iface =
   fixIO $ \details' -> do
-    let !hsc_env' = add_iface_to_hpt iface details' hsc_env
+    add_iface_to_hpt iface details' hsc_env
     -- NB: This result is actually not that useful
     -- in one-shot mode, since we're not going to do
     -- any further typechecking.  It's much more useful
     -- in make mode, since this HMI will go into the HPT.
-    genModDetails hsc_env' iface
+    genModDetails hsc_env iface
 
 -- | Modify flags such that objects are compiled for the interpreter's way.
 -- This is necessary when building foreign objects for Template Haskell, since
@@ -1019,15 +1018,15 @@ compile_for_interpreter hsc_env use =
 -- | Assemble 'WholeCoreBindings' if the interface contains Core bindings.
 iface_core_bindings :: ModIface -> ModLocation -> Maybe WholeCoreBindings
 iface_core_bindings iface wcb_mod_location =
-  mi_extra_decls <&> \ wcb_bindings ->
+  mi_simplified_core <&> \(IfaceSimplifiedCore bindings foreign') ->
     WholeCoreBindings {
-      wcb_bindings,
+      wcb_bindings = bindings,
       wcb_module = mi_module,
       wcb_mod_location,
-      wcb_foreign = mi_foreign
+      wcb_foreign = foreign'
     }
   where
-    ModIface {mi_module, mi_extra_decls, mi_foreign} = iface
+    ModIface {mi_module, mi_simplified_core} = iface
 
 -- | Return an 'IO' that hydrates Core bindings and compiles them to bytecode if
 -- the interface contains any, using the supplied type env for typechecking.
@@ -1059,6 +1058,27 @@ loadIfaceByteCode hsc_env iface location type_env =
       time <- maybe getCurrentTime pure if_time
       return $! Linkable time (mi_module iface) parts
 
+loadIfaceByteCodeLazy ::
+  HscEnv ->
+  ModIface ->
+  ModLocation ->
+  TypeEnv ->
+  IO (Maybe Linkable)
+loadIfaceByteCodeLazy hsc_env iface location type_env =
+  case iface_core_bindings iface location of
+    Nothing -> return Nothing
+    Just wcb -> do
+      Just <$> compile wcb
+  where
+    compile decls = do
+      ~(bcos, fos) <- unsafeInterleaveIO $ compileWholeCoreBindings hsc_env type_env decls
+      linkable $ NE.singleton (LazyBCOs bcos fos)
+
+    linkable parts = do
+      if_time <- modificationTimeIfExists (ml_hi_file location)
+      time <- maybe getCurrentTime pure if_time
+      return $!Linkable time (mi_module iface) parts
+
 -- | If the 'Linkable' contains Core bindings loaded from an interface, replace
 -- them with a lazy IO thunk that compiles them to bytecode and foreign objects,
 -- using the supplied environment for type checking.
@@ -1075,23 +1095,29 @@ loadIfaceByteCode hsc_env iface location type_env =
 --
 -- This is sound because generateByteCode just depends on things already loaded
 -- in the interface file.
+
+-- TODO: We should just use loadIfaceByteCodeLazy instead of the two stage process with
+-- loadByteCode and initWholeCoreBindings. The main reason it is like this is because
+-- initWholeCoreBindings requires a ModDetails, which we don't have during recompilation
+-- checking. We should modify recompilation checking to return a HomeModInfo directly.
+
 initWholeCoreBindings ::
   HscEnv ->
   ModIface ->
   ModDetails ->
   Linkable ->
   IO Linkable
-initWholeCoreBindings hsc_env iface details (Linkable utc_time this_mod uls) =
-  Linkable utc_time this_mod <$> mapM go uls
+initWholeCoreBindings hsc_env iface details (Linkable utc_time this_mod uls) = do
+  Linkable utc_time this_mod <$> mapM (go hsc_env) uls
   where
-    go = \case
+    go hsc_env' = \case
       CoreBindings wcb -> do
+        add_iface_to_hpt iface details hsc_env
         ~(bco, fos) <- unsafeInterleaveIO $
                        compileWholeCoreBindings hsc_env' type_env wcb
         pure (LazyBCOs bco fos)
       l -> pure l
 
-    hsc_env' = add_iface_to_hpt iface details hsc_env
     type_env = md_types details
 
 -- | Hydrate interface Core bindings and compile them to bytecode.
@@ -1243,11 +1269,11 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
           (cg_guts, details) <-
               liftIO $ hscTidy hsc_env simplified_guts
 
-          let !partial_iface =
+          !partial_iface <- liftIO $
                 {-# SCC "GHC.Driver.Main.mkPartialIface" #-}
                 -- This `force` saves 2M residency in test T10370
                 -- See Note [Avoiding space leaks in toIface*] for details.
-                force (mkPartialIface hsc_env (cg_binds cg_guts) details summary (tcg_import_decls tc_result) simplified_guts)
+                fmap force (mkPartialIface hsc_env (cg_binds cg_guts) details summary (tcg_import_decls tc_result) simplified_guts)
 
           return HscRecomp { hscs_guts = cg_guts,
                              hscs_mod_location = ms_location summary,
@@ -1270,7 +1296,11 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
           liftIO $ hscMaybeWriteIface logger dflags True iface mb_old_hash (ms_location summary)
 
-          return $ HscUpdate iface
+          -- when compiling gHC_PRIM without generating code (e.g. with
+          -- Haddock), we still want the virtual interface in the cache
+          if ms_mod summary == gHC_PRIM
+            then return $ HscUpdate (getGhcPrimIface (hsc_hooks hsc_env))
+            else return $ HscUpdate iface
 
 
       -- We are not generating code or writing an interface with simplified core so we can skip simplification
@@ -1281,7 +1311,11 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
 
         liftIO $ hscMaybeWriteIface logger dflags True iface mb_old_hash (ms_location summary)
 
-        return $ HscUpdate iface
+        -- when compiling gHC_PRIM without generating code (e.g. with
+        -- Haddock), we still want the virtual interface in the cache
+        if ms_mod summary == gHC_PRIM
+          then return $ HscUpdate (getGhcPrimIface (hsc_hooks hsc_env))
+          else return $ HscUpdate iface
 
 {-
 Note [Writing interface files]
@@ -1368,7 +1402,7 @@ hscMaybeWriteIface logger dflags is_simple iface old_iface mod_location = do
       --    dynamic interfaces. Hopefully both the dynamic and the non-dynamic
       --    interfaces stay in sync...
       --
-      let change = old_iface /= Just (mi_iface_hash (mi_final_exts iface))
+      let change = old_iface /= Just (mi_iface_hash iface)
 
       let dt = dynamicTooState dflags
 
@@ -1441,45 +1475,6 @@ genModDetails hsc_env old_iface
     dumpIfaceStats hsc_env
     return new_details
 
---------------------------------------------------------------
--- Progress displayers.
---------------------------------------------------------------
-
-oneShotMsg :: Logger -> RecompileRequired -> IO ()
-oneShotMsg logger recomp =
-    case recomp of
-        UpToDate -> compilationProgressMsg logger $ text "compilation IS NOT required"
-        NeedsRecompile _ -> return ()
-
-batchMsg :: Messager
-batchMsg = batchMsgWith (\_ _ _ _ -> empty)
-batchMultiMsg :: Messager
-batchMultiMsg = batchMsgWith (\_ _ _ node -> brackets (ppr (moduleGraphNodeUnitId node)))
-
-batchMsgWith :: (HscEnv -> (Int, Int) -> RecompileRequired -> ModuleGraphNode -> SDoc) -> Messager
-batchMsgWith extra hsc_env_start mod_index recomp node =
-      case recomp of
-        UpToDate
-          | logVerbAtLeast logger 2 -> showMsg (text "Skipping") empty
-          | otherwise -> return ()
-        NeedsRecompile reason0 -> showMsg (text herald) $ case reason0 of
-          MustCompile            -> empty
-          (RecompBecause reason) -> text " [" <> pprWithUnitState state (ppr reason) <> text "]"
-    where
-        herald = case node of
-                    LinkNode {} -> "Linking"
-                    InstantiationNode {} -> "Instantiating"
-                    ModuleNode {} -> "Compiling"
-        hsc_env = hscSetActiveUnitId (moduleGraphNodeUnitId node) hsc_env_start
-        dflags = hsc_dflags hsc_env
-        logger = hsc_logger hsc_env
-        state  = hsc_units hsc_env
-        showMsg msg reason =
-            compilationProgressMsg logger $
-            (showModuleIndex mod_index <>
-            msg <+> showModMsg dflags (recompileRequired recomp) node)
-                <> extra hsc_env mod_index recomp node
-                <> reason
 
 --------------------------------------------------------------
 -- Safe Haskell
@@ -1767,10 +1762,7 @@ hscCheckSafe' m l = do
     lookup' :: Module -> Hsc (Maybe ModIface)
     lookup' m = do
         hsc_env <- getHscEnv
-        hsc_eps <- liftIO $ hscEPS hsc_env
-        let pkgIfaceT = eps_PIT hsc_eps
-            hug       = hsc_HUG hsc_env
-            iface     = lookupIfaceByModule hug pkgIfaceT m
+        iface <- liftIO $ lookupIfaceByModuleHsc hsc_env m
         -- the 'lookupIfaceByModule' method will always fail when calling from GHCi
         -- as the compiler hasn't filled in the various module tables
         -- so we need to call 'getModuleInterface' to load from disk
@@ -1925,7 +1917,7 @@ hscSimpleIface' mb_core_program tc_result summary = do
 hscGenHardCode :: HscEnv -> CgGuts -> ModLocation -> FilePath
                -> IO (FilePath, Maybe FilePath, [(ForeignSrcLang, FilePath)], Maybe StgCgInfos, Maybe CmmCgInfos )
                 -- ^ @Just f@ <=> _stub.c is f
-hscGenHardCode hsc_env cgguts location output_filename = do
+hscGenHardCode hsc_env cgguts mod_loc output_filename = do
         let CgGuts{ cg_module   = this_mod,
                     cg_binds    = core_binds,
                     cg_ccs      = local_ccs
@@ -1933,14 +1925,21 @@ hscGenHardCode hsc_env cgguts location output_filename = do
             dflags = hsc_dflags hsc_env
             logger = hsc_logger hsc_env
 
+        -------------------
+        -- ADD IMPLICIT BINDINGS
+        -- NB: we must feed mkImplicitBinds through corePrep too
+        -- so that they are suitably cloned and eta-expanded
+        let cp_pgm_cfg :: CorePrepPgmConfig
+            cp_pgm_cfg = initCorePrepPgmConfig (hsc_dflags hsc_env)
+                                               (interactiveInScope $ hsc_IC hsc_env)
+        binds_with_implicits <- addImplicitBinds cp_pgm_cfg mod_loc (cg_tycons cgguts) core_binds
 
         -------------------
-        -- Insert late cost centres based on the provided flags.
+        -- INSERT LATE COST CENTRES, based on the provided flags.
         --
         -- If -fprof-late-inline is enabled, we will skip adding CCs on any
-        -- top-level bindings here (via shortcut in `addLateCostCenters`),
-        -- since it will have already added a superset of the CCs we would add
-        -- here.
+        -- top-level bindings here (via shortcut in `addLateCostCenters`), since
+        -- it will have already added a superset of the CCs we would add here.
         let
           late_cc_config :: LateCCConfig
           late_cc_config =
@@ -1959,30 +1958,29 @@ hscGenHardCode hsc_env cgguts location output_filename = do
               , lateCCConfig_env =
                   LateCCEnv
                     { lateCCEnv_module = this_mod
-                    , lateCCEnv_file = fsLit <$> ml_hs_file location
+                    , lateCCEnv_file = fsLit <$> ml_hs_file mod_loc
                     , lateCCEnv_countEntries= gopt Opt_ProfCountEntries dflags
                     , lateCCEnv_collectCCs = True
                     }
               }
 
         (late_cc_binds, late_cc_state) <-
-          addLateCostCenters logger late_cc_config core_binds
+          addLateCostCenters logger late_cc_config binds_with_implicits
 
         when (dopt Opt_D_dump_late_cc dflags || dopt Opt_D_verbose_core2core dflags) $
           putDumpFileMaybe logger Opt_D_dump_late_cc "LateCC" FormatCore (vcat (map ppr late_cc_binds))
 
         -------------------
-        -- Run late plugins
-        -- This is the last use of the ModGuts in a compilation.
+        -- RUN LATE PLUGINS
+        -- This is the last use of the CgGuts in a compilation.
         -- From now on, we just use the bits we need.
         ( CgGuts
             { cg_tycons        = tycons,
               cg_foreign       = foreign_stubs0,
               cg_foreign_files = foreign_files,
               cg_dep_pkgs      = dependencies,
-              cg_hpc_info      = hpc_info,
               cg_spt_entries   = spt_entries,
-              cg_binds         = late_binds,
+              cg_binds         = binds_to_prep,
               cg_ccs           = late_local_ccs
             }
           , _
@@ -2006,22 +2004,15 @@ hscGenHardCode hsc_env cgguts location output_filename = do
           tmpfs  = hsc_tmpfs hsc_env
           llvm_config = hsc_llvm_config hsc_env
           profile = targetProfile dflags
-          data_tycons = filter isDataTyCon tycons
-          -- cg_tycons includes newtypes, for the benefit of External Core,
-          -- but we don't generate any code for newtypes
-
-
 
         -------------------
         -- PREPARE FOR CODE GENERATION
         -- Do saturation and convert to A-normal form
-        (prepd_binds) <- {-# SCC "CorePrep" #-} do
-          cp_cfg <- initCorePrepConfig hsc_env
-          corePrepPgm
-            (hsc_logger hsc_env)
-            cp_cfg
-            (initCorePrepPgmConfig (hsc_dflags hsc_env) (interactiveInScope $ hsc_IC hsc_env))
-            this_mod location late_binds data_tycons
+        cp_cfg <- initCorePrepConfig hsc_env
+        (prepd_binds) <- {-# SCC "CorePrep" #-}
+                         corePrepPgm
+                           (hsc_logger hsc_env) cp_cfg cp_pgm_cfg
+                           this_mod binds_to_prep
 
         -----------------  Convert to STG ------------------
         (stg_binds_with_deps, denv, (caf_ccs, caf_cc_stacks), stg_cg_infos)
@@ -2034,7 +2025,7 @@ hscGenHardCode hsc_env cgguts location output_filename = do
                         c `seqList`
                         d `seqList`
                         (seqEltsUFM (seqTagSig) tag_env))
-                   (myCoreToStg logger dflags (interactiveInScope (hsc_IC hsc_env)) False this_mod location prepd_binds)
+                   (myCoreToStg logger dflags (interactiveInScope (hsc_IC hsc_env)) False this_mod mod_loc prepd_binds)
 
         let (stg_binds,_stg_deps) = unzip stg_binds_with_deps
 
@@ -2082,9 +2073,9 @@ hscGenHardCode hsc_env cgguts location output_filename = do
             _          ->
               do
               cmms <- {-# SCC "StgToCmm" #-}
-                doCodeGen hsc_env this_mod denv data_tycons
+                doCodeGen hsc_env this_mod denv tycons
                 cost_centre_info
-                stg_binds hpc_info
+                stg_binds
 
               ------------------  Code output -----------------------
               rawcmms0 <- {-# SCC "cmmToRawCmm" #-}
@@ -2103,7 +2094,7 @@ hscGenHardCode hsc_env cgguts location output_filename = do
 
               (output_filename, (_stub_h_exists, stub_c_exists), foreign_fps, cmm_cg_infos)
                   <- {-# SCC "codeOutput" #-}
-                    codeOutput logger tmpfs llvm_config dflags (hsc_units hsc_env) this_mod output_filename location
+                    codeOutput logger tmpfs llvm_config dflags (hsc_units hsc_env) this_mod output_filename mod_loc
                     foreign_stubs foreign_files dependencies (initDUniqSupply 'n' 0) rawcmms1
               return  ( output_filename, stub_c_exists, foreign_fps
                       , Just stg_cg_infos, Just cmm_cg_infos)
@@ -2127,7 +2118,7 @@ hscInteractive :: HscEnv
                -> CgInteractiveGuts
                -> ModLocation
                -> IO (Maybe FilePath, CompiledByteCode) -- ^ .c stub path (if any) and ByteCode
-hscInteractive hsc_env cgguts location = do
+hscInteractive hsc_env cgguts mod_loc = do
     let dflags = hsc_dflags hsc_env
     let logger = hsc_logger hsc_env
     let tmpfs  = hsc_tmpfs hsc_env
@@ -2140,35 +2131,35 @@ hscInteractive hsc_env cgguts location = do
                cgi_modBreaks = mod_breaks,
                cgi_spt_entries = spt_entries } = cgguts
 
-        data_tycons = filter isDataTyCon tycons
-        -- cg_tycons includes newtypes, for the benefit of External Core,
-        -- but we don't generate any code for newtypes
+    -------------------
+    -- ADD IMPLICIT BINDINGS
+    let cp_pgm_cfg :: CorePrepPgmConfig
+        cp_pgm_cfg = initCorePrepPgmConfig (hsc_dflags hsc_env)
+                                           (interactiveInScope $ hsc_IC hsc_env)
+    binds_to_prep <- addImplicitBinds cp_pgm_cfg mod_loc tycons core_binds
 
     -------------------
     -- PREPARE FOR CODE GENERATION
     -- Do saturation and convert to A-normal form
-    prepd_binds <- {-# SCC "CorePrep" #-} do
-      cp_cfg <- initCorePrepConfig hsc_env
-      corePrepPgm
-        (hsc_logger hsc_env)
-        cp_cfg
-        (initCorePrepPgmConfig (hsc_dflags hsc_env) (interactiveInScope $ hsc_IC hsc_env))
-        this_mod location core_binds data_tycons
+    cp_cfg <- initCorePrepConfig hsc_env
+    prepd_binds <- {-# SCC "CorePrep" #-}
+                   corePrepPgm (hsc_logger hsc_env) cp_cfg cp_pgm_cfg
+                               this_mod binds_to_prep
 
     -- The stg cg info only provides a runtime benfit, but is not requires so we just
     -- omit it here
     (stg_binds_with_deps, _infotable_prov, _caf_ccs__caf_cc_stacks, _ignore_stg_cg_infos)
       <- {-# SCC "CoreToStg" #-}
-          myCoreToStg logger dflags (interactiveInScope (hsc_IC hsc_env)) True this_mod location prepd_binds
+          myCoreToStg logger dflags (interactiveInScope (hsc_IC hsc_env)) True this_mod mod_loc prepd_binds
 
     let (stg_binds,_stg_deps) = unzip stg_binds_with_deps
 
     -----------------  Generate byte code ------------------
-    comp_bc <- byteCodeGen hsc_env this_mod stg_binds data_tycons mod_breaks spt_entries
+    comp_bc <- byteCodeGen hsc_env this_mod stg_binds tycons mod_breaks spt_entries
 
     ------------------ Create f-x-dynamic C-side stuff -----
     (_istub_h_exists, istub_c_exists)
-        <- outputForeignStubs logger tmpfs dflags (hsc_units hsc_env) this_mod location foreign_stubs
+        <- outputForeignStubs logger tmpfs dflags (hsc_units hsc_env) this_mod mod_loc foreign_stubs
     return (istub_c_exists, comp_bc)
 
 -- | Compile Core bindings and foreign inputs that were loaded from an
@@ -2291,13 +2282,12 @@ This reduces residency towards the end of the CodeGen phase significantly
 doCodeGen :: HscEnv -> Module -> InfoTableProvMap -> [TyCon]
           -> CollectedCCs
           -> [CgStgTopBinding] -- ^ Bindings come already annotated with fvs
-          -> HpcInfo
           -> IO (CgStream CmmGroupSRTs CmmCgInfos)
          -- Note we produce a 'Stream' of CmmGroups, so that the
          -- backend can be run incrementally.  Otherwise it generates all
          -- the C-- up front, which has a significant space cost.
-doCodeGen hsc_env this_mod denv data_tycons
-              cost_centre_info stg_binds_w_fvs hpc_info = do
+doCodeGen hsc_env this_mod denv tycons
+              cost_centre_info stg_binds_w_fvs = do
     let dflags     = hsc_dflags hsc_env
         logger     = hsc_logger hsc_env
         hooks      = hsc_hooks  hsc_env
@@ -2308,14 +2298,14 @@ doCodeGen hsc_env this_mod denv data_tycons
     putDumpFileMaybe logger Opt_D_dump_stg_final "Final STG:" FormatSTG
         (pprGenStgTopBindings stg_ppr_opts stg_binds_w_fvs)
 
-    let stg_to_cmm dflags mod a b c d e = case stgToCmmHook hooks of
-          Nothing -> StgToCmm.codeGen logger tmpfs (initStgToCmmConfig dflags mod) a b c d e
-          Just h  -> (,emptyDetUFM) <$> h          (initStgToCmmConfig dflags mod) a b c d e
+    let stg_to_cmm dflags mod a b c d = case stgToCmmHook hooks of
+          Nothing -> StgToCmm.codeGen logger tmpfs (initStgToCmmConfig dflags mod) a b c d
+          Just h  -> (,emptyDetUFM) <$> h          (initStgToCmmConfig dflags mod) a b c d
 
     let cmm_stream :: CgStream CmmGroup (ModuleLFInfos, DetUniqFM)
         -- See Note [Forcing of stg_binds]
         cmm_stream = stg_binds_w_fvs `seqList` {-# SCC "StgToCmm" #-}
-            stg_to_cmm dflags this_mod denv data_tycons cost_centre_info stg_binds_w_fvs hpc_info
+            stg_to_cmm dflags this_mod denv tycons cost_centre_info stg_binds_w_fvs
 
         -- codegen consumes a stream of CmmGroup, and produces a new
         -- stream of CmmGroup (not necessarily synchronised: one
@@ -2809,8 +2799,7 @@ hscCompileCoreExpr' hsc_env srcspan ds_expr = do
       (fv_hvs, mods_needed, units_needed) <- loadDecls interp hsc_env srcspan $
         Linkable bco_time this_mod $ NE.singleton $ BCOs bcos
       {- Get the HValue for the root -}
-      return (expectJust "hscCompileCoreExpr'"
-         $ lookup (idName binding_id) fv_hvs, mods_needed, units_needed)
+      return (expectJust $ lookup (idName binding_id) fv_hvs, mods_needed, units_needed)
 
 
 
@@ -2894,7 +2883,7 @@ jsCodeGen hsc_env srcspan i this_mod stg_binds_with_deps binding_id = do
     jsLinkObject logger tmpfs tmp_dir js_config unit_env inst out_obj roots
 
   -- look up "id_sym" closure and create a StablePtr (HValue) from it
-  href <- lookupClosure interp (unpackFS id_sym) >>= \case
+  href <- lookupClosure interp (IFaststringSymbol id_sym) >>= \case
     Nothing -> pprPanic "Couldn't find just linked TH closure" (ppr id_sym)
     Just r  -> pure r
 
@@ -2921,18 +2910,6 @@ dumpIfaceStats hsc_env = do
     logDumpMsg logger "Interface statistics" (ifaceStats eps)
 
 
-{- **********************************************************************
-%*                                                                      *
-        Progress Messages: Module i of n
-%*                                                                      *
-%********************************************************************* -}
-
-showModuleIndex :: (Int, Int) -> SDoc
-showModuleIndex (i,n) = text "[" <> pad <> int i <> text " of " <> int n <> text "] "
-  where
-    -- compute the length of x > 0 in base 10
-    len x = ceiling (logBase 10 (fromIntegral x+1) :: Float)
-    pad = text (replicate (len n - len i) ' ') -- TODO: use GHC.Utils.Ppr.RStr
 
 writeInterfaceOnlyMode :: DynFlags -> Bool
 writeInterfaceOnlyMode dflags =

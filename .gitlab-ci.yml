@@ -1,8 +1,17 @@
+spec:
+  inputs:
+    release:
+      default: "no"
+      description: Release pipeline
+      options: [ "yes", "no" ]
+
+---
+
 variables:
   GIT_SSL_NO_VERIFY: "1"
 
   # Commit of ghc/ci-images repository from which to pull Docker images
-  DOCKER_REV: efc1ab81236eb37e20cb287ec77aebb6c6341098
+  DOCKER_REV: be4ac2cd18f38e63b263e2a27c76a7c279385796
 
   # Sequential version number of all cached things.
   # Bump to invalidate GitLab CI cache.
@@ -22,8 +31,13 @@ variables:
 
   GIT_SUBMODULE_STRATEGY: "normal"
 
+  # GitLab recommends using https:, not ssh:, to clone submodules. See #25528.
+  GIT_SUBMODULE_FORCE_HTTPS: 1
+
   # Makes ci.sh isolate CABAL_DIR
   HERMETIC: "YES"
+
+  RELEASE_JOB: $[[ inputs.release ]]
 
   # Reduce XZ compression level for regular jobs (it is bumped to 9 for releases
   # and nightly jobs). In my experiments I've got the following bindist size in
@@ -101,10 +115,11 @@ workflow:
 # which versions of GHC to allow bootstrap with
 .bootstrap_matrix : &bootstrap_matrix
   matrix:
-    - GHC_VERSION: 9.8.1
-      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12-ghc9_8:$DOCKER_REV"
+    # If you update this version, be sure to also update 'MinBootGhcVersion' in configure.ac
     - GHC_VERSION: 9.10.1
       DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12-ghc9_10:$DOCKER_REV"
+    - GHC_VERSION: 9.12.2
+      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12-ghc9_12:$DOCKER_REV"
 
 # Allow linters to fail on draft MRs.
 # This must be explicitly transcluded in lint jobs which
@@ -289,7 +304,7 @@ lint-author:
     - *drafts-can-fail-lint
 
 lint-ci-config:
-  image: nixos/nix:2.14.1
+  image: nixos/nix:2.25.2
   extends: .lint
   # We don't need history/submodules in this job
   variables:
@@ -299,10 +314,16 @@ lint-ci-config:
     - echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
     # Note [Nix-in-Docker]
     # ~~~~~~~~~~~~~~~~~~~~
-    # FIXME: This is a workaround for a Nix-in-Docker issue. See
+    # The nixos/nix default config is max-jobs=1 and cores=$(logical
+    # cores num) which doesn't play nice with our $CPUS convention. We
+    # fix it before invoking any nix build to avoid oversubscribing
+    # while allowing a reasonable degree of parallelism.
+    # FIXME: Disabling build-users-group=nixbld is a workaround for a Nix-in-Docker issue. See
     # https://gitlab.haskell.org/ghc/head.hackage/-/issues/38#note_560487 for
     # discussion.
-    - nix-shell -p gnused --run "sed -i -e 's/nixbld//' /etc/nix/nix.conf"
+    - echo "cores = $CPUS" >> /etc/nix/nix.conf
+    - echo "max-jobs = $CPUS" >> /etc/nix/nix.conf
+    - nix run nixpkgs#gnused -- -i -e 's/ nixbld//' /etc/nix/nix.conf
   script:
     - nix run .gitlab/generate-ci#generate-jobs
     # 1 if .gitlab/generate_jobs changed the output of the generated config
@@ -358,7 +379,7 @@ lint-submods-branch:
     - .gitlab/ci.sh setup
   after_script:
     - .gitlab/ci.sh save_cache
-    - cat ci-timings
+    - cat ci_timings.txt
   variables:
     GHC_FLAGS: -Werror
   cache:
@@ -410,7 +431,7 @@ hadrian-ghc-in-ghci:
     - echo ":q" | HADRIAN_ARGS=-j$CORES hadrian/ghci -j$CORES | tail -n2 | grep "Ok,"
   after_script:
     - .gitlab/ci.sh save_cache
-    - cat ci-timings
+    - cat ci_timings.txt
   cache:
     key: hadrian-ghci-$CACHE_REV
     paths:
@@ -435,7 +456,7 @@ hadrian-multi:
     # workaround for docker permissions
     - sudo chown ghc:ghc -R .
   variables:
-    GHC_FLAGS: "-Werror=-Wno-error=incomplete-record-selectors -Wwarn=deprecations"
+    GHC_FLAGS: "-Werror=-Wno-error=incomplete-record-selectors -Wwarn=deprecations -Wwarn=unused-imports"
        # -Wno-error=incomplete-record-selectors is present because -Wall now
        # includes -Wincomplete-record-selectors, and hadrian-multi has many, many
        # warnings about incomplete record selectors.  A better fix would be to
@@ -632,6 +653,8 @@ hackage-doc-tarball:
 
 source-tarball:
   stage: full-build
+  needs:
+    - hadrian-ghc-in-ghci
   tags:
     - x86_64-linux
   image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:$DOCKER_REV"
@@ -653,6 +676,8 @@ source-tarball:
 
 generate-hadrian-bootstrap-sources:
   stage: full-build
+  needs:
+    - hadrian-ghc-in-ghci
   tags:
     - x86_64-linux
   image: "$DOCKER_IMAGE"
@@ -896,6 +921,10 @@ test-primops-label:
   extends: .test-primops-validate-template
   rules:
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-primops.*/'
+      # We do not use *.full-ci here since that would imply running in nightly
+      # where we do not have the normal validate jobs. We have the -nightly job
+      # below to handle this case.
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*full-ci.*/'
 
 test-primops-nightly:
   extends: .test-primops
@@ -913,6 +942,7 @@ test-primops-nightly:
 
 test-primops-release:
   extends: .test-primops
+  allow_failure: true
   rules:
     - if: '$RELEASE_JOB == "yes"'
 
@@ -1043,6 +1073,48 @@ abi-test:
     - *full-ci
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-abi.*/'
 
+############################################################
+# ghc-wasm-meta integration testing
+############################################################
+
+.ghc-wasm-meta:
+  stage: testing
+  variables:
+    UPSTREAM_GHC_PIPELINE_ID: $CI_PIPELINE_ID
+    UPSTREAM_GHC_PROJECT_ID: $CI_PROJECT_ID
+  rules:
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-wasm.*/'
+  trigger:
+    project: haskell-wasm/ghc-wasm-meta
+    branch: master
+    strategy: depend
+
+ghc-wasm-meta-gmp:
+  extends: .ghc-wasm-meta
+  needs:
+    - job: x86_64-linux-alpine3_22-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+      artifacts: false
+  variables:
+    UPSTREAM_GHC_FLAVOUR: gmp
+    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_22-wasm-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+
+ghc-wasm-meta-native:
+  extends: .ghc-wasm-meta
+  needs:
+    - job: x86_64-linux-alpine3_22-wasm-int_native-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+      artifacts: false
+  variables:
+    UPSTREAM_GHC_FLAVOUR: native
+    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_22-wasm-int_native-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+
+ghc-wasm-meta-unreg:
+  extends: .ghc-wasm-meta
+  needs:
+    - job: x86_64-linux-alpine3_22-wasm-unreg-cross_wasm32-wasi-release+host_fully_static+text_simdutf
+      artifacts: false
+  variables:
+    UPSTREAM_GHC_FLAVOUR: unreg
+    UPSTREAM_GHC_JOB_NAME: x86_64-linux-alpine3_22-wasm-unreg-cross_wasm32-wasi-release+host_fully_static+text_simdutf
 
 ############################################################
 # Documentation deployment via GitLab Pages
@@ -1107,7 +1179,7 @@ project-version:
 
 .ghcup-metadata:
   stage: deploy
-  image: nixos/nix:2.14.1
+  image: nixos/nix:2.25.2
   dependencies: null
   tags:
     - x86_64-linux
@@ -1117,7 +1189,9 @@ project-version:
   before_script:
     - echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
     # FIXME: See Note [Nix-in-Docker]
-    - nix-shell -p gnused --run "sed -i -e 's/nixbld//' /etc/nix/nix.conf"
+    - echo "cores = $CPUS" >> /etc/nix/nix.conf
+    - echo "max-jobs = $CPUS" >> /etc/nix/nix.conf
+    - nix run nixpkgs#gnused -- -i -e 's/ nixbld//' /etc/nix/nix.conf
     - nix-channel --update
     - cat version.sh
     # Calculate the project version
@@ -1140,7 +1214,7 @@ ghcup-metadata-nightly:
   needs:
     - job: nightly-x86_64-linux-fedora33-release
       artifacts: false
-    - job: nightly-x86_64-linux-centos7-validate
+    - job: nightly-x86_64-linux-ubuntu24_04-validate
       artifacts: false
     - job: nightly-x86_64-linux-ubuntu22_04-validate
       artifacts: false
@@ -1156,15 +1230,15 @@ ghcup-metadata-nightly:
       artifacts: false
     - job: nightly-x86_64-windows-validate
       artifacts: false
-    - job: nightly-x86_64-linux-alpine3_12-validate
-      artifacts: false
-    - job: nightly-x86_64-linux-alpine3_20-validate
+    - job: nightly-x86_64-linux-alpine3_22-validate
       artifacts: false
     - job: nightly-x86_64-linux-deb9-validate
       artifacts: false
     - job: nightly-i386-linux-deb10-validate
       artifacts: false
     - job: nightly-i386-linux-deb12-validate
+      artifacts: false
+    - job: nightly-i386-linux-alpine3_22-validate
       artifacts: false
     - job: nightly-x86_64-linux-deb10-validate
       artifacts: false
@@ -1176,13 +1250,13 @@ ghcup-metadata-nightly:
       artifacts: false
     - job: nightly-aarch64-linux-deb12-validate
       artifacts: false
-    - job: nightly-aarch64-linux-alpine3_18-validate
+    - job: nightly-aarch64-linux-alpine3_22-validate
       artifacts: false
     - job: source-tarball
       artifacts: false
     - job: project-version
   script:
-    - nix shell --extra-experimental-features nix-command -f .gitlab/rel_eng -c ghcup-metadata --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
+    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
   rules:
     - if: $NIGHTLY
 
@@ -1220,7 +1294,8 @@ ghcup-metadata-release:
   # No explicit needs for release pipeline as we assume we need everything and everything will pass.
   extends: .ghcup-metadata
   script:
-    - nix shell --extra-experimental-features nix-command -f .gitlab/rel_eng -c ghcup-metadata --release-mode --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
+    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --release-mode --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" --fragment
+    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --release-mode --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
   rules:
     - if: '$RELEASE_JOB == "yes"'
 

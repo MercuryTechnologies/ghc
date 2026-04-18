@@ -1,9 +1,10 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE StandaloneKindSignatures #-}
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeFamilyDependencies #-}
 
 -- | Describes the provenance of types as they flow through the type-checker.
 -- The datatypes here are mainly used for error message generation.
@@ -15,19 +16,22 @@ module GHC.Tc.Types.Origin (
 
   -- * SkolemInfo
   SkolemInfo(..), SkolemInfoAnon(..), mkSkolemInfo, getSkolemInfo, pprSigSkolInfo, pprSkolInfo,
-  unkSkol, unkSkolAnon, mkClsInstSkol,
+  unkSkol, unkSkolAnon,
 
   -- * CtOrigin
   CtOrigin(..), exprCtOrigin, lexprCtOrigin, matchesCtOrigin, grhssCtOrigin,
   isVisibleOrigin, toInvisibleOrigin,
-  pprCtOrigin, isGivenOrigin, isWantedWantedFunDepOrigin,
+  pprCtOrigin, pprCtOriginBriefly,
+  isGivenOrigin, isWantedWantedFunDepOrigin,
   isWantedSuperclassOrigin,
   ClsInstOrQC(..), NakedScFlag(..), NonLinearPatternReason(..),
+  HsImplicitLiftSplice(..),
+  StandaloneDeriv,
 
   TypedThing(..), TyVarBndrs(..),
 
   -- * CallStack
-  isPushCallStackOrigin, callStackOriginFS,
+  isPushCallStackOrigin_maybe,
 
   -- * FixedRuntimeRep origin
   FixedRuntimeRepOrigin(..),
@@ -37,7 +41,7 @@ module GHC.Tc.Types.Origin (
   mkFRRUnboxedTuple, mkFRRUnboxedSum,
 
   -- ** FixedRuntimeRep origin for rep-poly 'Id's
-  RepPolyId(..), Polarity(..), Position(..),
+  RepPolyId(..), Polarity(..), Position(..), mkArgPos,
 
   -- ** Arrow command FixedRuntimeRep origin
   FRRArrowContext(..), pprFRRArrowContext,
@@ -58,7 +62,6 @@ import GHC.Hs
 import GHC.Core.DataCon
 import GHC.Core.ConLike
 import GHC.Core.TyCon
-import GHC.Core.Class
 import GHC.Core.InstEnv
 import GHC.Core.PatSyn
 import GHC.Core.Multiplicity ( scaledThing )
@@ -77,13 +80,14 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Stack
 import GHC.Utils.Monad
-import GHC.Utils.Misc( HasDebugCallStack )
+import GHC.Utils.Misc( HasDebugCallStack, nTimes )
 import GHC.Types.Unique
 import GHC.Types.Unique.Supply
 
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import qualified Data.Kind as Hs
+import Data.List.NonEmpty (NonEmpty (..))
 
 {- *********************************************************************
 *                                                                      *
@@ -129,8 +133,6 @@ data UserTypeCtxt
   | PatSigCtxt          -- Type sig in pattern
                         --   eg  f (x::t) = ...
                         --   or  (x::t, y) = e
-  | RuleSigCtxt FastString Name    -- LHS of a RULE forall
-                        --    RULE "foo" forall (x :: a -> a). f (Just x) = ...
   | ForSigCtxt Name     -- Foreign import or export signature
   | DefaultDeclCtxt     -- Class or types in a default declaration
   | InstDeclCtxt Bool   -- An instance declaration
@@ -153,6 +155,9 @@ data UserTypeCtxt
                         --      data <S> => T a = MkT a
   | DerivClauseCtxt     -- A 'deriving' clause
   | TyVarBndrKindCtxt Name  -- The kind of a type variable being bound
+  | RuleBndrTypeCtxt Name   -- The type of a term variable being bound in a RULE
+                            -- or SPECIALISE pragma
+                            --    RULE "foo" forall (x :: a -> a). f (Just x) = ...
   | DataKindCtxt Name   -- The kind of a data/newtype (instance)
   | TySynKindCtxt Name  -- The kind of the RHS of a type synonym
   | TyFamResKindCtxt Name   -- The result kind of a type family
@@ -194,11 +199,10 @@ redundantConstraintsSpan _ = noSrcSpan
 
 
 pprUserTypeCtxt :: UserTypeCtxt -> SDoc
-pprUserTypeCtxt (FunSigCtxt n _)  = text "the type signature for" <+> quotes (ppr n)
-pprUserTypeCtxt (InfSigCtxt n)    = text "the inferred type for" <+> quotes (ppr n)
-pprUserTypeCtxt (RuleSigCtxt _ n) = text "the type signature for" <+> quotes (ppr n)
-pprUserTypeCtxt (ExprSigCtxt _)   = text "an expression type signature"
-pprUserTypeCtxt KindSigCtxt       = text "a kind signature"
+pprUserTypeCtxt (FunSigCtxt n _)   = text "the type signature for" <+> quotes (ppr n)
+pprUserTypeCtxt (InfSigCtxt n)     = text "the inferred type for" <+> quotes (ppr n)
+pprUserTypeCtxt (ExprSigCtxt _)    = text "an expression type signature"
+pprUserTypeCtxt KindSigCtxt        = text "a kind signature"
 pprUserTypeCtxt (StandaloneKindSigCtxt n) = text "a standalone kind signature for" <+> quotes (ppr n)
 pprUserTypeCtxt TypeAppCtxt       = text "a type argument"
 pprUserTypeCtxt (ConArgCtxt c)    = text "the type of the constructor" <+> quotes (ppr c)
@@ -217,6 +221,7 @@ pprUserTypeCtxt (DataTyCtxt tc)   = text "the context of the data type declarati
 pprUserTypeCtxt (PatSynCtxt n)    = text "the signature for pattern synonym" <+> quotes (ppr n)
 pprUserTypeCtxt (DerivClauseCtxt) = text "a `deriving' clause"
 pprUserTypeCtxt (TyVarBndrKindCtxt n) = text "the kind annotation on the type variable" <+> quotes (ppr n)
+pprUserTypeCtxt (RuleBndrTypeCtxt n)  = text "the type signature for" <+> quotes (ppr n)
 pprUserTypeCtxt (DataKindCtxt n)  = text "the kind annotation on the declaration for" <+> quotes (ppr n)
 pprUserTypeCtxt (TySynKindCtxt n) = text "the kind annotation on the declaration for" <+> quotes (ppr n)
 pprUserTypeCtxt (TyFamResKindCtxt n) = text "the result kind for" <+> quotes (ppr n)
@@ -286,7 +291,14 @@ data SkolemInfoAnon
        ClsInstOrQC      -- Whether class instance or quantified constraint
        PatersonSize     -- Head has the given PatersonSize
 
+  | MethSkol Name Bool  -- Bound by the type of class method op
+                        -- True  <=> it's a vanilla default method
+                        -- False <=> it's a user-written, or generic-default, method
+                        -- See (TRC5) in Note [Tracking redundant constraints]
+                        --            in GHC.Tc.Solver.Solve
+
   | FamInstSkol         -- Bound at a family instance decl
+
   | PatSkol             -- An existential type variable bound by a pattern for
       ConLike           -- a data constructor with an existential type.
       HsMatchContextRn
@@ -298,6 +310,7 @@ data SkolemInfoAnon
   | IPSkol [HsIPName]   -- Binding site of an implicit parameter
 
   | RuleSkol RuleName   -- The LHS of a RULE
+  | SpecESkol Name      -- A SPECIALISE pragma
 
   | InferSkol [(Name,TcType)]
                         -- We have inferred a type for these (mutually recursive)
@@ -345,9 +358,6 @@ mkSkolemInfo sk_anon = do
 getSkolemInfo :: SkolemInfo -> SkolemInfoAnon
 getSkolemInfo (SkolemInfo _ skol_anon) = skol_anon
 
-mkClsInstSkol :: Class -> [Type] -> SkolemInfoAnon
-mkClsInstSkol cls tys = InstSkol IsClsInst (pSizeClassPred cls tys)
-
 instance Outputable SkolemInfo where
   ppr (SkolemInfo _ sk_info ) = ppr sk_info
 
@@ -364,11 +374,14 @@ pprSkolInfo (IPSkol ips)      = text "the implicit-parameter binding" <> plural 
 pprSkolInfo (DerivSkol pred)  = text "the deriving clause for" <+> quotes (ppr pred)
 pprSkolInfo (InstSkol IsClsInst sz) = vcat [ text "the instance declaration"
                                            , whenPprDebug (braces (ppr sz)) ]
-pprSkolInfo (InstSkol (IsQC {}) sz) = vcat [ text "a quantified context"
+pprSkolInfo (InstSkol (IsQC {}) sz) = vcat [ text "a quantified constraint"
                                            , whenPprDebug (braces (ppr sz)) ]
+pprSkolInfo (MethSkol name d) = text "the" <+> ppWhen d (text "default")
+                                           <+> text "method declaration for" <+> ppr name
 pprSkolInfo FamInstSkol       = text "a family instance declaration"
 pprSkolInfo BracketSkol       = text "a Template Haskell bracket"
 pprSkolInfo (RuleSkol name)   = text "the RULE" <+> pprRuleName name
+pprSkolInfo (SpecESkol name)  = text "a SPECIALISE pragma for" <+> quotes (ppr name)
 pprSkolInfo (PatSkol cl mc)   = sep [ pprPatSkolInfo cl
                                     , text "in" <+> pprMatchContext mc ]
 pprSkolInfo (InferSkol ids)   = hang (text "the inferred type" <> plural ids <+> text "of")
@@ -509,11 +522,11 @@ data CtOrigin
 
   ----------- Below here, all are Origins for Wanted constraints ------------
 
-  | OccurrenceOf Name              -- Occurrence of an overloaded identifier
-  | OccurrenceOfRecSel RdrName     -- Occurrence of a record selector
-  | AppOrigin                      -- An application of some kind
+  | OccurrenceOf Name          -- ^ Occurrence of an overloaded identifier
+  | OccurrenceOfRecSel RdrName -- ^ Occurrence of a record selector
+  | AppOrigin                  -- ^ An application of some kind
 
-  | SpecPragOrigin UserTypeCtxt    -- Specialisation pragma for
+  | SpecPragOrigin UserTypeCtxt    -- ^ Specialisation pragma for
                                    -- function or instance
 
 
@@ -561,9 +574,9 @@ data CtOrigin
       ClsInstOrQC   -- Whether class instance or quantified constraint
       NakedScFlag
 
-  | DerivClauseOrigin   -- Typechecking a deriving clause (as opposed to
-                        -- standalone deriving).
-  | DerivOriginDC DataCon Int Bool
+  | DerivOrigin StandaloneDeriv
+      -- Typechecking a `deriving` clause, or a standalone `deriving` declaration
+  | DerivOriginDC DataCon Int StandaloneDeriv
       -- Checking constraints arising from this data con and field index. The
       -- Bool argument in DerivOriginDC and DerivOriginCoerce is True if
       -- standalong deriving (with a wildcard constraint) is being used. This
@@ -571,14 +584,10 @@ data CtOrigin
       -- the argument is True, then don't recommend "use standalone deriving",
       -- but rather "fill in the wildcard constraint yourself").
       -- See Note [Inferring the instance context] in GHC.Tc.Deriv.Infer
-  | DerivOriginCoerce Id Type Type Bool
-                        -- DerivOriginCoerce id ty1 ty2: Trying to coerce class method `id` from
-                        -- `ty1` to `ty2`.
-  | StandAloneDerivOrigin -- Typechecking stand-alone deriving. Useful for
-                          -- constraints coming from a wildcard constraint,
-                          -- e.g., deriving instance _ => Eq (Foo a)
-                          -- See Note [Inferring the instance context]
-                          -- in GHC.Tc.Deriv.Infer
+  | DerivOriginCoerce Id Type Type StandaloneDeriv
+      -- DerivOriginCoerce id ty1 ty2: Trying to coerce class method `id` from
+      -- `ty1` to `ty2`.
+
   | DefaultOrigin       -- Typechecking a default decl
   | DoOrigin            -- Arising from a do expression
   | DoPatOrigin (LPat GhcRn) -- Arising from a failable pattern in
@@ -626,10 +635,10 @@ data CtOrigin
   | OmittedFieldOrigin (Maybe FieldLabel)
   | UsageEnvironmentOf Name
 
+  -- | See Detail (7) of Note [Type equality cycles] in GHC.Tc.Solver.Equality
   | CycleBreakerOrigin
       CtOrigin   -- origin of the original constraint
 
-      -- See Detail (7) of Note [Type equality cycles] in GHC.Tc.Solver.Equality
   | FRROrigin
       FixedRuntimeRepOrigin
 
@@ -643,6 +652,7 @@ data CtOrigin
       Type   -- the instance-sig type
       Type   -- the instantiated type of the method
   | AmbiguityCheckOrigin UserTypeCtxt
+  | ImplicitLiftOrigin HsImplicitLiftSplice
 
 data NonLinearPatternReason
   = LazyPatternReason
@@ -651,13 +661,22 @@ data NonLinearPatternReason
   | ViewPatternReason
   | OtherPatternReason
 
+type StandaloneDeriv = Bool
+  -- False <=> a `deriving` clause on a data/newtype declaration
+  --           e.g.  data T a = MkT a deriving( Eq )
+  -- True <=> a standalone `deriving` clause with a wildcard constraint
+  --          e.g   deriving instance _ => Eq (T a)
+  -- See Note [Inferring the instance context]
+  -- in GHC.Tc.Deriv.Infer
+
 -- | The number of superclass selections needed to get this Given.
 -- If @d :: C ty@   has @ScDepth=2@, then the evidence @d@ will look
 -- like @sc_sel (sc_sel dg)@, where @dg@ is a Given.
 type ScDepth = Int
 
-data ClsInstOrQC = IsClsInst
-                 | IsQC CtOrigin
+data ClsInstOrQC
+  = IsClsInst
+  | IsQC PredType CtOrigin  -- The PredType is the forall-constraint we are trying to solve
 
 data NakedScFlag = NakedSc | NotNakedSc
       --   The NakedScFlag affects only GHC.Tc.Solver.InertSet.prohibitedSuperClassSolve
@@ -707,17 +726,13 @@ isWantedSuperclassOrigin _                           = False
 instance Outputable CtOrigin where
   ppr = pprCtOrigin
 
-ctoHerald :: SDoc
-ctoHerald = text "arising from"
-
 -- | Extract a suitable CtOrigin from a HsExpr
 lexprCtOrigin :: LHsExpr GhcRn -> CtOrigin
 lexprCtOrigin (L _ e) = exprCtOrigin e
 
 exprCtOrigin :: HsExpr GhcRn -> CtOrigin
-exprCtOrigin (HsVar _ (L _ name)) = OccurrenceOf name
+exprCtOrigin (HsVar _ (L _ (WithUserRdr _ name))) = OccurrenceOf name
 exprCtOrigin (HsGetField _ _ (L _ f)) = GetFieldOrigin (field_label $ unLoc $ dfoLabel f)
-exprCtOrigin (HsUnboundVar {})    = Shouldn'tHappenOrigin "unbound variable"
 exprCtOrigin (HsOverLabel _ l)  = OverLabelOrigin l
 exprCtOrigin (ExplicitList {})    = ListOrigin
 exprCtOrigin (HsIPVar _ ip)       = IPOccOrigin ip
@@ -751,6 +766,7 @@ exprCtOrigin (HsUntypedSplice {})  = Shouldn'tHappenOrigin "TH untyped splice"
 exprCtOrigin (HsProc {})         = Shouldn'tHappenOrigin "proc"
 exprCtOrigin (HsStatic {})       = Shouldn'tHappenOrigin "static expression"
 exprCtOrigin (HsEmbTy {})        = Shouldn'tHappenOrigin "type expression"
+exprCtOrigin (HsHole _)          = Shouldn'tHappenOrigin "hole expression"
 exprCtOrigin (HsForAll {})       = Shouldn'tHappenOrigin "forall telescope"    -- See Note [Types in terms]
 exprCtOrigin (HsQual {})         = Shouldn'tHappenOrigin "constraint context"  -- See Note [Types in terms]
 exprCtOrigin (HsFunArr {})       = Shouldn'tHappenOrigin "function arrow"      -- See Note [Types in terms]
@@ -775,12 +791,15 @@ grhssCtOrigin :: GRHSs GhcRn (LHsExpr GhcRn) -> CtOrigin
 grhssCtOrigin (GRHSs { grhssGRHSs = lgrhss }) = lGRHSCtOrigin lgrhss
 
 -- | Extract a suitable CtOrigin from a list of guarded RHSs
-lGRHSCtOrigin :: [LGRHS GhcRn (LHsExpr GhcRn)] -> CtOrigin
-lGRHSCtOrigin [L _ (GRHS _ _ (L _ e))] = exprCtOrigin e
+lGRHSCtOrigin :: NonEmpty (LGRHS GhcRn (LHsExpr GhcRn)) -> CtOrigin
+lGRHSCtOrigin (L _ (GRHS _ _ (L _ e)) :| []) = exprCtOrigin e
 lGRHSCtOrigin _ = Shouldn'tHappenOrigin "multi-way GRHS"
 
+ctoHerald :: SDoc
+ctoHerald = text "arising from"
+
 pprCtOrigin :: CtOrigin -> SDoc
--- "arising from ..."
+
 pprCtOrigin (GivenOrigin sk)
   = ctoHerald <+> ppr sk
 
@@ -789,8 +808,9 @@ pprCtOrigin (GivenSCOrigin sk d blk)
          , whenPprDebug (braces (text "given-sc:" <+> ppr d <> comma <> ppr blk)) ]
 
 pprCtOrigin (SpecPragOrigin ctxt)
-  = case ctxt of
-       FunSigCtxt n _ -> text "for" <+> quotes (ppr n)
+  = ctoHerald <+>
+    case ctxt of
+       FunSigCtxt n _ -> text "a SPECIALISE pragma for" <+> quotes (ppr n)
        SpecInstCtxt   -> text "a SPECIALISE INSTANCE pragma"
        _              -> text "a SPECIALISE pragma"  -- Never happens I think
 
@@ -812,7 +832,7 @@ pprCtOrigin (InjTFOrigin1 pred1 orig1 loc1 pred2 orig2 loc2)
                , hang (quotes (ppr pred2)) 2 (pprCtOrigin orig2 <+> text "at" <+> ppr loc2) ])
 
 pprCtOrigin AssocFamPatOrigin
-  = text "when matching a family LHS with its class instance head"
+  = ctoHerald <+> text "matching a family LHS with its class instance head"
 
 pprCtOrigin (TypeEqOrigin { uo_actual = t1, uo_expected =  t2, uo_visible = vis })
   = hang (ctoHerald <+> text "a type equality" <> whenPprDebug (brackets (ppr vis)))
@@ -856,13 +876,13 @@ pprCtOrigin (ProvCtxtOrigin PSB{ psb_id = (L _ name) })
        2 (text "the signature of" <+> quotes (ppr name))
 
 pprCtOrigin (InstProvidedOrigin mod cls_inst)
-  = vcat [ text "arising when attempting to show that"
+  = vcat [ ctoHerald <+> text "attempting to show that"
          , ppr cls_inst
          , text "is provided by" <+> quotes (ppr mod)]
 
 pprCtOrigin (ImpedanceMatching x)
-  = vcat [ text "arising when matching required constraints"
-         , text "in a group involving" <+> quotes (ppr x)]
+  = vcat [ ctoHerald <+> text "matching required constraints"
+         , text "in a binding group involving" <+> quotes (ppr x)]
 
 pprCtOrigin (CycleBreakerOrigin orig)
   = pprCtOrigin orig
@@ -887,85 +907,91 @@ pprCtOrigin (ScOrigin IsClsInst nkd)
   = vcat [ ctoHerald <+> text "the superclasses of an instance declaration"
          , whenPprDebug (braces (text "sc-origin:" <> ppr nkd)) ]
 
-pprCtOrigin (ScOrigin (IsQC orig) nkd)
-  = vcat [ ctoHerald <+> text "the head of a quantified constraint"
-         , whenPprDebug (braces (text "sc-origin:" <> ppr nkd))
-         , pprCtOrigin orig ]
+pprCtOrigin (ScOrigin (IsQC pred orig) nkd)
+  = vcat [ whenPprDebug (text "IsQC" <> braces (text "sc-origin:" <> ppr nkd) <+> ppr pred)
+         , hang (text "arising (via a quantified constraint) from")
+              2 (pprCtOriginBriefly orig) ]
+           -- Print `orig` briefly with pprCtOriginBriefly.  We'll print it more
+           -- voluminously later: see GHC.Tc.Errors.Ppr.pprQCOriginExtra
 
 pprCtOrigin (NonLinearPatternOrigin reason pat)
   = hang (ctoHerald <+> text "a non-linear pattern" <+> quotes (ppr pat))
        2 (pprNonLinearPatternReason reason)
 
 pprCtOrigin simple_origin
-  = ctoHerald <+> pprCtO simple_origin
+  = ctoHerald <+> pprCtOriginBriefly simple_origin
 
--- | Short one-liners
-pprCtO :: HasDebugCallStack => CtOrigin -> SDoc
-pprCtO (OccurrenceOf name)   = hsep [text "a use of", quotes (ppr name)]
-pprCtO (OccurrenceOfRecSel name) = hsep [text "a use of", quotes (ppr name)]
-pprCtO AppOrigin             = text "an application"
-pprCtO (IPOccOrigin name)    = hsep [text "a use of implicit parameter", quotes (ppr name)]
-pprCtO (OverLabelOrigin l)   = hsep [text "the overloaded label"
+-- | Print CtOrigin briefly, with a one-liner
+pprCtOriginBriefly :: CtOrigin -> SDoc
+pprCtOriginBriefly = ppr_br  -- ppr_br is a local function with a short name!
+
+ppr_br :: CtOrigin -> SDoc
+ppr_br (OccurrenceOf name)   = hsep [text "a use of", quotes (ppr name)]
+ppr_br (OccurrenceOfRecSel name) = hsep [text "a use of", quotes (ppr name)]
+ppr_br AppOrigin             = text "an application"
+ppr_br (IPOccOrigin name)    = hsep [text "a use of implicit parameter", quotes (ppr name)]
+ppr_br (OverLabelOrigin l)   = hsep [text "the overloaded label"
                                     ,quotes (char '#' <> ppr l)]
-pprCtO RecordUpdOrigin       = text "a record update"
-pprCtO ExprSigOrigin         = text "an expression type signature"
-pprCtO PatSigOrigin          = text "a pattern type signature"
-pprCtO PatOrigin             = text "a pattern"
-pprCtO ViewPatOrigin         = text "a view pattern"
-pprCtO (LiteralOrigin lit)   = hsep [text "the literal", quotes (ppr lit)]
-pprCtO (ArithSeqOrigin seq)  = hsep [text "the arithmetic sequence", quotes (ppr seq)]
-pprCtO SectionOrigin         = text "an operator section"
-pprCtO (GetFieldOrigin f)    = hsep [text "selecting the field", quotes (ppr f)]
-pprCtO AssocFamPatOrigin     = text "the LHS of a family instance"
-pprCtO TupleOrigin           = text "a tuple"
-pprCtO NegateOrigin          = text "a use of syntactic negation"
-pprCtO (ScOrigin IsClsInst _) = text "the superclasses of an instance declaration"
-pprCtO (ScOrigin (IsQC {}) _) = text "the head of a quantified constraint"
-pprCtO DerivClauseOrigin     = text "the 'deriving' clause of a data type declaration"
-pprCtO StandAloneDerivOrigin = text "a 'deriving' declaration"
-pprCtO DefaultOrigin         = text "a 'default' declaration"
-pprCtO DoOrigin              = text "a do statement"
-pprCtO MCompOrigin           = text "a statement in a monad comprehension"
-pprCtO ProcOrigin            = text "a proc expression"
-pprCtO ArrowCmdOrigin        = text "an arrow command"
-pprCtO AnnOrigin             = text "an annotation"
-pprCtO (ExprHoleOrigin Nothing)    = text "an expression hole"
-pprCtO (ExprHoleOrigin (Just occ)) = text "a use of" <+> quotes (ppr occ)
-pprCtO (TypeHoleOrigin occ)  = text "a use of wildcard" <+> quotes (ppr occ)
-pprCtO PatCheckOrigin        = text "a pattern-match completeness check"
-pprCtO ListOrigin            = text "an overloaded list"
-pprCtO IfThenElseOrigin      = text "an if-then-else expression"
-pprCtO StaticOrigin          = text "a static form"
-pprCtO (UsageEnvironmentOf x) = hsep [text "multiplicity of", quotes (ppr x)]
-pprCtO (OmittedFieldOrigin Nothing) = text "an omitted anonymous field"
-pprCtO (OmittedFieldOrigin (Just fl)) = hsep [text "omitted field" <+> quotes (ppr fl)]
-pprCtO BracketOrigin         = text "a quotation bracket"
+ppr_br RecordUpdOrigin       = text "a record update"
+ppr_br ExprSigOrigin         = text "an expression type signature"
+ppr_br PatSigOrigin          = text "a pattern type signature"
+ppr_br PatOrigin             = text "a pattern"
+ppr_br ViewPatOrigin         = text "a view pattern"
+ppr_br (LiteralOrigin lit)   = hsep [text "the literal", quotes (ppr lit)]
+ppr_br (ArithSeqOrigin seq)  = hsep [text "the arithmetic sequence", quotes (ppr seq)]
+ppr_br SectionOrigin         = text "an operator section"
+ppr_br (GetFieldOrigin f)    = hsep [text "selecting the field", quotes (ppr f)]
+ppr_br AssocFamPatOrigin     = text "the LHS of a family instance"
+ppr_br TupleOrigin           = text "a tuple"
+ppr_br NegateOrigin          = text "a use of syntactic negation"
+ppr_br (ScOrigin IsClsInst _) = text "the superclasses of an instance declaration"
+ppr_br (ScOrigin (IsQC {}) _) = text "the head of a quantified constraint"
+ppr_br (DerivOrigin standalone)
+  | standalone               = text "a 'deriving' declaration"
+  | otherwise                = text "the 'deriving' clause of a data type declaration"
+ppr_br DefaultOrigin         = text "a 'default' declaration"
+ppr_br DoOrigin              = text "a do statement"
+ppr_br MCompOrigin           = text "a statement in a monad comprehension"
+ppr_br ProcOrigin            = text "a proc expression"
+ppr_br ArrowCmdOrigin        = text "an arrow command"
+ppr_br AnnOrigin             = text "an annotation"
+ppr_br (ExprHoleOrigin Nothing)    = text "an expression hole"
+ppr_br (ExprHoleOrigin (Just occ)) = text "a use of" <+> quotes (ppr occ)
+ppr_br (TypeHoleOrigin occ)  = text "a use of wildcard" <+> quotes (ppr occ)
+ppr_br PatCheckOrigin        = text "a pattern-match completeness check"
+ppr_br ListOrigin            = text "an overloaded list"
+ppr_br IfThenElseOrigin      = text "an if-then-else expression"
+ppr_br StaticOrigin          = text "a static form"
+ppr_br (UsageEnvironmentOf x) = hsep [text "multiplicity of", quotes (ppr x)]
+ppr_br (OmittedFieldOrigin Nothing) = text "an omitted anonymous field"
+ppr_br (OmittedFieldOrigin (Just fl)) = hsep [text "omitted field" <+> quotes (ppr fl)]
+ppr_br BracketOrigin            = text "a quotation bracket"
+ppr_br (ImplicitLiftOrigin isp) = text "an implicit lift of" <+> quotes (ppr (implicit_lift_lid isp))
 
 -- These ones are handled by pprCtOrigin, but we nevertheless sometimes
--- get here via callStackOriginFS, when doing ambiguity checks
--- A bit silly, but no great harm
-pprCtO (GivenOrigin {})             = text "a given constraint"
-pprCtO (GivenSCOrigin {})           = text "the superclass of a given constraint"
-pprCtO (SpecPragOrigin {})          = text "a SPECIALISE pragma"
-pprCtO (FunDepOrigin1 {})           = text "a functional dependency"
-pprCtO (FunDepOrigin2 {})           = text "a functional dependency"
-pprCtO (InjTFOrigin1 {})            = text "an injective type family"
-pprCtO (TypeEqOrigin {})            = text "a type equality"
-pprCtO (KindEqOrigin {})            = text "a kind equality"
-pprCtO (DerivOriginDC {})           = text "a deriving clause"
-pprCtO (DerivOriginCoerce {})       = text "a derived method"
-pprCtO (DoPatOrigin {})             = text "a do statement"
-pprCtO (MCompPatOrigin {})          = text "a monad comprehension pattern"
-pprCtO (Shouldn'tHappenOrigin note) = text note
-pprCtO (ProvCtxtOrigin {})          = text "a provided constraint"
-pprCtO (InstProvidedOrigin {})      = text "a provided constraint"
-pprCtO (CycleBreakerOrigin orig)    = pprCtO orig
-pprCtO (FRROrigin {})               = text "a representation-polymorphism check"
-pprCtO (WantedSuperclassOrigin {})  = text "a superclass constraint"
-pprCtO (InstanceSigOrigin {})       = text "a type signature in an instance"
-pprCtO (AmbiguityCheckOrigin {})    = text "a type ambiguity check"
-pprCtO (ImpedanceMatching {})       = text "combining required constraints"
-pprCtO (NonLinearPatternOrigin _ pat) = hsep [text "a non-linear pattern" <+> quotes (ppr pat)]
+-- we call pprCtOriginBriefly directly (e.g. in callStackOriginFS)
+ppr_br (GivenOrigin {})             = text "a given constraint"
+ppr_br (GivenSCOrigin {})           = text "the superclass of a given constraint"
+ppr_br (SpecPragOrigin {})          = text "a SPECIALISE pragma"
+ppr_br (FunDepOrigin1 {})           = text "a functional dependency"
+ppr_br (FunDepOrigin2 {})           = text "a functional dependency"
+ppr_br (InjTFOrigin1 {})            = text "an injective type family"
+ppr_br (TypeEqOrigin {})            = text "a type equality"
+ppr_br (KindEqOrigin {})            = text "a kind equality"
+ppr_br (DerivOriginDC {})           = text "a deriving clause"
+ppr_br (DerivOriginCoerce m _ _ _)  = text "the coercion of derived method" <+> quotes (ppr m)
+ppr_br (DoPatOrigin {})             = text "a do statement"
+ppr_br (MCompPatOrigin {})          = text "a monad comprehension pattern"
+ppr_br (Shouldn'tHappenOrigin note) = text note
+ppr_br (ProvCtxtOrigin {})          = text "a provided constraint"
+ppr_br (InstProvidedOrigin {})      = text "a provided constraint"
+ppr_br (CycleBreakerOrigin orig)    = ppr_br orig
+ppr_br (FRROrigin {})               = text "a representation-polymorphism check"
+ppr_br (WantedSuperclassOrigin {})  = text "a superclass constraint"
+ppr_br (InstanceSigOrigin {})       = text "a type signature in an instance"
+ppr_br (AmbiguityCheckOrigin {})    = text "a type ambiguity check"
+ppr_br (ImpedanceMatching {})       = text "combining required constraints"
+ppr_br (NonLinearPatternOrigin _ pat) = hsep [text "a non-linear pattern" <+> quotes (ppr pat)]
 
 pprNonLinearPatternReason :: HasDebugCallStack => NonLinearPatternReason -> SDoc
 pprNonLinearPatternReason LazyPatternReason = parens (text "non-variable lazy pattern aren't linear")
@@ -983,18 +1009,22 @@ pprNonLinearPatternReason OtherPatternReason = empty
 *                                                                      *
 ********************************************************************* -}
 
-isPushCallStackOrigin :: CtOrigin -> Bool
--- Do we want to solve this IP constraint directly (return False)
--- or push the call site (return True)
--- See Note [Overview of implicit CallStacks] in GHc.Tc.Types.Evidence
-isPushCallStackOrigin (IPOccOrigin {}) = False
-isPushCallStackOrigin _                = True
-
-
-callStackOriginFS :: CtOrigin -> FastString
--- This is the string that appears in the CallStack
-callStackOriginFS (OccurrenceOf fun) = occNameFS (getOccName fun)
-callStackOriginFS orig               = mkFastString (showSDocUnsafe (pprCtO orig))
+isPushCallStackOrigin_maybe :: CtOrigin -> Maybe FastString
+-- Do we want to solve this IP constraint normally (return Nothing)
+-- or push the call site (returning the name of the function being called)
+-- See Note [Overview of implicit CallStacks] esp (CS1) in GHC.Tc.Types.Evidence
+isPushCallStackOrigin_maybe (GivenOrigin {})   = Nothing
+isPushCallStackOrigin_maybe (GivenSCOrigin {}) = Nothing
+isPushCallStackOrigin_maybe (IPOccOrigin {})   = Nothing
+isPushCallStackOrigin_maybe (OccurrenceOf fun) = Just (occNameFS (getOccName fun))
+isPushCallStackOrigin_maybe orig               = Just orig_fs
+  -- This fall-through case is important to deal with call stacks
+  --      that arise from rebindable syntax (#19919)
+  -- Here the "name of the function being called" is approximated as
+  --      the result of prettty-printing the CtOrigin; a bit messy,
+  --      but we can perhaps improve it in the light of user feedback
+  where
+    orig_fs = mkFastString (showSDocUnsafe (pprCtOriginBriefly orig))
 
 {-
 ************************************************************************
@@ -1169,7 +1199,7 @@ data FixedRuntimeRepContext
   -- See 'FRRArrowContext' for more details.
   | FRRArrow !FRRArrowContext
 
-  -- | A representation-polymorphic check arising from a call
+  -- | A representation-polymorphism check arising from a call
   -- to 'matchExpectedFunTys' or 'matchActualFunTy'.
   --
   -- See 'ExpectedFunTyOrigin' for more details.
@@ -1177,6 +1207,13 @@ data FixedRuntimeRepContext
       !ExpectedFunTyOrigin
       !Int
         -- ^ argument position (1-indexed)
+
+  -- | A representation-polymorphism check arising from eta-expansion
+  -- performed as part of deep subsumption.
+  | forall p. FRRDeepSubsumption
+      { frrDSExpected :: Bool
+      , frrDSPosition :: Position p
+      }
 
 -- | The description of a representation-polymorphic 'Id'.
 data RepPolyId
@@ -1215,8 +1252,8 @@ pprFixedRuntimeRepContext (FRRRecordUpdate lbl _arg)
 pprFixedRuntimeRepContext (FRRBinder binder)
   = sep [ text "The binder"
         , quotes (ppr binder) ]
-pprFixedRuntimeRepContext (FRRRepPolyId nm id what)
-  = pprFRRRepPolyId id nm what
+pprFixedRuntimeRepContext (FRRRepPolyId nm id pos)
+  = text "The" <+> ppr pos <+> text "of" <+> pprRepPolyId id nm
 pprFixedRuntimeRepContext FRRPatBind
   = text "The pattern binding"
 pprFixedRuntimeRepContext FRRPatSynArg
@@ -1258,6 +1295,13 @@ pprFixedRuntimeRepContext (FRRArrow arrowContext)
   = pprFRRArrowContext arrowContext
 pprFixedRuntimeRepContext (FRRExpectedFunTy funTyOrig arg_pos)
   = pprExpectedFunTyOrigin funTyOrig arg_pos
+pprFixedRuntimeRepContext (FRRDeepSubsumption is_exp pos)
+  = hsep [ text "The", what, text "type of the"
+         , ppr (Argument pos)
+         , text "of the eta-expansion"
+         ]
+  where
+    what = if is_exp then text "expected" else text "actual"
 
 instance Outputable FixedRuntimeRepContext where
   ppr = pprFixedRuntimeRepContext
@@ -1286,34 +1330,117 @@ data ArgPos
 *                                                                      *
 ********************************************************************* -}
 
+{- Note [Positional information in representation-polymorphism errors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider an invalid instantiation of the 'catch#' primop:
+
+  catch#
+    :: forall {q :: RuntimeRep} {k :: Levity} (a :: TYPE q)
+              (b :: TYPE (BoxedRep k)).
+       (State# RealWorld -> (# State# RealWorld, a #))
+       -> (b -> State# RealWorld -> (# State# RealWorld, a #))
+       -> State# RealWorld
+       -> (# State# RealWorld, a #)
+
+  boo :: forall r (a :: TYPE r). ...
+  boo = catch# @a
+
+The instantiation is invalid because we insist that the quantified RuntimeRep
+type variable 'q' be instantiated to a concrete RuntimeRep, as per
+Note [Representation-polymorphism checking built-ins] in GHC.Tc.Utils.Concrete.
+
+We report this as the following error message:
+
+  The result of the first argument of the primop ‘catch#’ does not have a fixed runtime representation.
+  Its type is: (a :: TYPE r).
+
+The positional information in this message, namely "The result of the first argument",
+is produced by using the 'Position' datatype. In this case:
+
+  pos :: Position Neg
+  pos = Result (Argument Top)
+  ppr pos = "result of the first argument"
+
+Other examples:
+
+  pos2 :: Position Neg
+  pos2 = Argument (Result (Result Top))
+  ppr pos2 = "3rd argument"
+
+  pos3 :: Position Pos
+  pos3 = Argument (Result (Argument (Result Top)))
+  ppr pos3 = "2nd argument of the 2nd argument"
+
+It's useful to keep track at the type-level whether we are in a positive or
+negative position in the type, as for primops we can usually tolerate
+representation-polymorphism in positive positions, but not in negative ones;
+for example
+
+  ($) :: forall {r} (a :: Type) (b :: TYPE r). (a -> b) -> a -> b
+
+
+This positional information is (currently) used to report representation-polymorphism
+errors in precisely the following two situations:
+
+  1. Representation-polymorphic Ids with no binding, as described in
+     Note [Representation-polymorphic Ids with no binding] in GHC.Tc.Utils.Concrete.
+
+     This uses the 'FRRRepPolyId' constructor of 'FixedRuntimeRepContext'.
+
+  2. When inserting eta-expansions for deep subsumption.
+     See Wrinkle [Representation-polymorphism checking during subtyping] in
+     Note [FunTy vs FunTy case in tc_sub_type_deep] in GHC.Tc.Utils.Unify.
+
+     This uses the 'FRRDeepSubsumption' constructor of 'FixedRuntimeRepContext'.
+-}
+
+-- | Are we in a positive (covariant) or negative (contravariant) position?
+--
+-- See Note [Positional information in representation-polymorphism errors].
 data Polarity = Pos | Neg
 
+-- | Flip the 'Polarity': turn positive into negative and vice-versa.
 type FlipPolarity :: Polarity -> Polarity
-type family FlipPolarity p where
+type family FlipPolarity p = r | r -> p where
   FlipPolarity Pos = Neg
   FlipPolarity Neg = Pos
 
 -- | A position in which a type variable appears in a type;
 -- in particular, whether it appears in a positive or a negative position.
+--
+-- See Note [Positional information in representation-polymorphism errors].
 type Position :: Polarity -> Hs.Type
 data Position p where
-  -- | In the @i@-th argument of a function arrow
-  Argument :: Int -> Position (FlipPolarity p) -> Position p
+  -- | In the argument of a function arrow
+  Argument :: Position p -> Position (FlipPolarity p)
   -- | In the result of a function arrow
   Result   :: Position p -> Position p
   -- | At the top level of a type
   Top      :: Position Pos
+deriving stock instance Show (Position p)
+instance Outputable (Position p) where
+  ppr = go 1
+    where
+      go :: Int -> Position q -> SDoc
+      go i (Argument (Result pos)) = go (i+1) (Argument pos)
+      go i (Argument pos) = speakNth i <+> text "argument" <+> aux 1 pos
+      go i (Result (Result pos)) = go i (Result pos)
+      go i (Result pos) = text "result" <+> aux i pos
+      go _ Top = text "top-level"
 
-pprFRRRepPolyId :: RepPolyId -> Name -> Position Neg -> SDoc
-pprFRRRepPolyId id nm (Argument i pos) =
-  text "The" <+> what <+> speakNth i <+> text "argument of" <+> pprRepPolyId id nm
+      aux :: Int -> Position q -> SDoc
+      aux i pos = case pos of { Top -> empty; _ -> text "of the" <+> go i pos }
+
+-- | @'mkArgPos' i p@ makes the 'Position' @p@ relative to the @ith@ argument.
+--
+-- Example: @ppr (mkArgPos 3 (Result Top)) == "in the result of the 3rd argument"@.
+mkArgPos :: Int -> Position p -> Position (FlipPolarity p)
+mkArgPos i = go
   where
-    what = case pos of
-      Top       -> empty
-      Result {} -> text "return type of the"
-      _         -> text "nested return type inside the"
-pprFRRRepPolyId id nm (Result {}) =
-  text "The result of" <+> pprRepPolyId id nm
+    go :: Position p -> Position (FlipPolarity p)
+    go Top = Argument $ nTimes (i-1) Result Top
+    go (Result p) = Result $ go p
+    go (Argument p) = Argument $ go p
 
 pprRepPolyId :: RepPolyId -> Name -> SDoc
 pprRepPolyId id nm = id_desc <+> quotes (ppr nm)
@@ -1525,7 +1652,7 @@ data InstanceWhat  -- How did we solve this constraint?
                          -- See GHC.Tc.Solver.InertSet Note [Solved dictionaries]
 
   | BuiltinTypeableInstance TyCon   -- Built-in solver for Typeable (T t1 .. tn)
-                         -- See Note [Well-staged instance evidence]
+                         -- See Note [Well-levelled instance evidence]
 
   | BuiltinInstance      -- Built-in solver for (C t1 .. tn) where C is
                          --   KnownNat, .. etc (classes with no top-level evidence)

@@ -11,7 +11,7 @@ module GHC.CmmToLlvm
    )
 where
 
-import GHC.Prelude hiding ( head )
+import GHC.Prelude
 
 import GHC.Llvm
 import GHC.CmmToLlvm.Base
@@ -39,8 +39,7 @@ import GHC.Utils.Logger
 import qualified GHC.Data.Stream as Stream
 
 import Control.Monad ( when, forM_ )
-import Data.List.NonEmpty ( head )
-import Data.Maybe ( fromMaybe, catMaybes )
+import Data.Maybe ( fromMaybe, catMaybes, isNothing )
 import System.IO
 
 -- -----------------------------------------------------------------------------
@@ -72,11 +71,13 @@ llvmCodeGen logger cfg h dus cmm_stream
            "up to" <+> text (llvmVersionStr supportedLlvmVersionUpperBound) <+> "(non inclusive) is supported." <+>
            "System LLVM version: " <> text (llvmVersionStr ver) $$
            "We will try though..."
-         let isS390X = platformArch (llvmCgPlatform cfg)  == ArchS390X
-         let major_ver = head . llvmVersionNE $ ver
-         when (isS390X && major_ver < 10 && doWarn) $ putMsg logger $
-           "Warning: For s390x the GHC calling convention is only supported since LLVM version 10." <+>
-           "You are using LLVM version: " <> text (llvmVersionStr ver)
+
+       when (isNothing mb_ver) $ do
+         let doWarn = llvmCgDoWarn cfg
+         when doWarn $ putMsg logger $
+           "Failed to detect LLVM version!" $$
+           "Make sure LLVM is installed correctly." $$
+           "We will try though..."
 
        -- HACK: the Nothing case here is potentially wrong here but we
        -- currently don't use the LLVM version to guide code generation
@@ -221,7 +222,12 @@ cmmMetaLlvmPrelude = do
           case platformArch platform of
             ArchX86_64 | llvmCgAvxEnabled cfg -> [mkStackAlignmentMeta 32]
             _                                 -> []
-  module_flags_metas <- mkModuleFlagsMeta stack_alignment_metas
+  let codel_model_metas =
+          case platformArch platform of
+            -- FIXME: We should not rely on LLVM
+            ArchLoongArch64 -> [mkCodeModelMeta CMMedium]
+            _                                 -> []
+  module_flags_metas <- mkModuleFlagsMeta (stack_alignment_metas ++ codel_model_metas)
   let metas = tbaa_metas ++ module_flags_metas
   cfg <- getConfig
   renderLlvm (ppLlvmMetas cfg metas)
@@ -244,6 +250,15 @@ mkStackAlignmentMeta :: Integer -> ModuleFlag
 mkStackAlignmentMeta alignment =
     ModuleFlag MFBError "override-stack-alignment" (MetaLit $ LMIntLit alignment i32)
 
+-- LLVM's @LLVM::CodeModel::Model@ enumeration
+data CodeModel = CMMedium
+
+-- Pass -mcmodel=medium option to LLVM on LoongArch64
+mkCodeModelMeta :: CodeModel -> ModuleFlag
+mkCodeModelMeta codemodel =
+    ModuleFlag MFBError "Code Model" (MetaLit $ LMIntLit n i32)
+  where
+    n = case codemodel of CMMedium -> 3 -- as of LLVM 8
 
 -- -----------------------------------------------------------------------------
 -- | Marks variables as used where necessary

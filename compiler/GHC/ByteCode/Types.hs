@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP                        #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE TypeApplications           #-}
@@ -18,10 +19,15 @@ module GHC.ByteCode.Types
   , UnlinkedBCO(..), BCOPtr(..), BCONPtr(..)
   , ItblEnv, ItblPtr(..)
   , AddrEnv, AddrPtr(..)
-  , CgBreakInfo(..)
-  , ModBreaks (..), BreakIndex, emptyModBreaks
-  , CCostCentre
-  , FlatBag, sizeFlatBag, fromSizedSeq, elemsFlatBag
+  , FlatBag, sizeFlatBag, fromSmallArray, elemsFlatBag
+
+  -- * Mod Breaks
+  , ModBreaks (..), BreakpointId(..), BreakTickIndex
+
+  -- * Internal Mod Breaks
+  , InternalModBreaks(..), CgBreakInfo(..), seqInternalModBreaks
+  -- ** Internal breakpoint identifier
+  , InternalBreakpointId(..), BreakInfoIndex
   ) where
 
 import GHC.Prelude
@@ -33,23 +39,19 @@ import GHC.Types.Name.Env
 import GHC.Utils.Outputable
 import GHC.Builtin.PrimOps
 import GHC.Types.SptEntry
-import GHC.Types.SrcLoc
-import GHCi.BreakArray
+import GHC.HsToCore.Breakpoints
+import GHC.ByteCode.Breakpoints
+import GHCi.Message
 import GHCi.RemoteTypes
 import GHCi.FFI
 import Control.DeepSeq
 import GHCi.ResolvedBCO ( BCOByteArray(..), mkBCOByteArray )
 
 import Foreign
-import Data.Array
 import Data.ByteString (ByteString)
-import Data.IntMap (IntMap)
-import qualified Data.IntMap as IntMap
 import qualified GHC.Exts.Heap as Heap
-import GHC.Stack.CCS
 import GHC.Cmm.Expr ( GlobalRegSet, emptyRegSet, regSetToList )
-import GHC.Iface.Syntax
-import Language.Haskell.Syntax.Module.Name (ModuleName)
+import GHC.Unit.Module
 
 -- -----------------------------------------------------------------------------
 -- Compiled Byte Code
@@ -58,26 +60,28 @@ data CompiledByteCode = CompiledByteCode
   { bc_bcos   :: FlatBag UnlinkedBCO
     -- ^ Bunch of interpretable bindings
 
-  , bc_itbls  :: ItblEnv
+  , bc_itbls  :: [(Name, ConInfoTable)]
     -- ^ Mapping from DataCons to their info tables
 
-  , bc_ffis   :: [FFIInfo]
-    -- ^ ffi blocks we allocated
-
-  , bc_strs   :: AddrEnv
+  , bc_strs   :: [(Name, ByteString)]
     -- ^ top-level strings (heap allocated)
 
-  , bc_breaks :: Maybe ModBreaks
-    -- ^ breakpoint info (Nothing if breakpoints are disabled)
+  , bc_breaks :: Maybe InternalModBreaks
+    -- ^ All breakpoint information (no information if breakpoints are disabled).
+    --
+    -- This information is used when loading a bytecode object: we will
+    -- construct the arrays to be used at runtime to trigger breakpoints at load time
+    -- from it (in 'allocateBreakArrays' and 'allocateCCS' in 'GHC.ByteCode.Loader').
 
   , bc_spt_entries :: ![SptEntry]
     -- ^ Static pointer table entries which should be loaded along with the
     -- BCOs. See Note [Grand plan for static forms] in
     -- "GHC.Iface.Tidy.StaticPtrTable".
   }
-                -- ToDo: we're not tracking strings that we malloc'd
-newtype FFIInfo = FFIInfo (RemotePtr C_ffi_cif)
-  deriving (Show, NFData)
+
+-- | A libffi ffi_cif function prototype.
+data FFIInfo = FFIInfo { ffiInfoArgs :: ![FFIType], ffiInfoRet :: !FFIType }
+  deriving (Show)
 
 instance Outputable CompiledByteCode where
   ppr CompiledByteCode{..} = ppr $ elemsFlatBag bc_bcos
@@ -87,10 +91,11 @@ instance Outputable CompiledByteCode where
 seqCompiledByteCode :: CompiledByteCode -> ()
 seqCompiledByteCode CompiledByteCode{..} =
   rnf bc_bcos `seq`
-  seqEltsNameEnv rnf bc_itbls `seq`
-  rnf bc_ffis `seq`
-  seqEltsNameEnv rnf bc_strs `seq`
-  rnf (fmap seqModBreaks bc_breaks)
+  rnf bc_itbls `seq`
+  rnf bc_strs `seq`
+  case bc_breaks of
+    Nothing -> ()
+    Just ibks -> seqInternalModBreaks ibks
 
 newtype ByteOff = ByteOff Int
     deriving (Enum, Eq, Show, Integral, Num, Ord, Real, Outputable)
@@ -166,6 +171,80 @@ newtype ItblPtr = ItblPtr (RemotePtr Heap.StgInfoTable)
 newtype AddrPtr = AddrPtr (RemotePtr ())
   deriving (NFData)
 
+{-
+--------------------------------------------------------------------------------
+-- * Byte Code Objects (BCOs)
+--------------------------------------------------------------------------------
+
+Note [Case continuation BCOs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A stack with a BCO stack frame at the top looks like:
+
+                                      (an StgBCO)
+         |       ...        |      +---> +---------[1]--+
+         +------------------+      |     | info_tbl_ptr | ------+
+         |    OTHER FRAME   |      |     +--------------+       |
+         +------------------+      |     | StgArrBytes* | <--- the byte code
+         |       ...        |      |     +--------------+       |
+         +------------------+      |     |     ...      |       |
+         |       fvs1       |      |                            |
+         +------------------+      |                            |
+         |       ...        |      |        (StgInfoTable)      |
+         +------------------+      |           +----------+ <---+
+         |      args1       |      |           |    ...   |
+         +------------------+      |           +----------+
+         |   some StgBCO*   | -----+           | type=BCO |
+         +------------------+                  +----------+
+      Sp | stg_apply_interp | -----+           |   ...    |
+         +------------------+      |
+                                   |
+                                   |   (StgInfoTable)
+                                   +----> +--------------+
+                                          |     ...      |
+                                          +--------------+
+                                          | type=RET_BCO |
+                                          +--------------+
+                                          |     ...      |
+
+
+In the case of bytecode objects found on the heap (e.g. thunks and functions),
+the bytecode may refer to free variables recorded in the BCO closure itself.
+By contrast, in /case continuation/ BCOs the code may additionally refer to free
+variables in their stack frame. These are references by way of statically known
+stack offsets (tracked using `BCEnv` in `StgToByteCode`).
+
+For instance, consider the function:
+
+    f x y = case y of ... -> g x
+
+Here the RHS of the alternative refers to `x`, which will be recorded in the
+continuation stack frame of the `case`.
+
+Even less obvious is that case continuation BCOs may also refer to free
+variables in *parent* stack frames. For instance,
+
+    f x y = case y of
+      ... -> case g x of
+        ... -> x
+
+Here, the RHS of the first alternative still refers to the `x` in the stack
+frame of the `case`. Additionally, the RHS of the second alternative also
+refers to `x` but it must traverse to its case's *parent* stack frame to find `x`.
+
+However, in /case continuation/ BCOs, the code may additionally refer to free
+variables that are outside of that BCO's stack frame -- some free variables of a
+case continuation BCO may only be found in the stack frame of a parent BCO.
+
+Yet, references to these out-of-frame variables are also done in terms of stack
+offsets. Thus, they rely on the position of /another frame/ to be fixed. (See
+Note [PUSH_L underflow] for more information about references to previous
+frames and nested BCOs)
+
+This makes case continuation BCOs special: unlike normal BCOs, case cont BCO
+frames cannot be moved on the stack independently from their parent BCOs.
+-}
+
 data UnlinkedBCO
    = UnlinkedBCO {
         unlinkedBCOName   :: !Name,
@@ -185,8 +264,8 @@ data BCOPtr
   = BCOPtrName   !Name
   | BCOPtrPrimOp !PrimOp
   | BCOPtrBCO    !UnlinkedBCO
-  | BCOPtrBreakArray (ForeignRef BreakArray)
-    -- ^ a pointer to a breakpoint's module's BreakArray in GHCi's memory
+  | BCOPtrBreakArray !Module
+    -- ^ Converted to the actual 'BreakArray' remote pointer at link-time
 
 instance NFData BCOPtr where
   rnf (BCOPtrBCO bco) = rnf bco
@@ -199,31 +278,18 @@ data BCONPtr
   -- | A reference to a top-level string literal; see
   -- Note [Generating code for top-level string literal bindings] in GHC.StgToByteCode.
   | BCONPtrAddr  !Name
-  -- | Only used internally in the assembler in an intermediate representation;
-  -- should never appear in a fully-assembled UnlinkedBCO.
+  -- | A top-level string literal.
   -- Also see Note [Allocating string literals] in GHC.ByteCode.Asm.
   | BCONPtrStr   !ByteString
+  -- | Same as 'BCONPtrStr' but with benefits of 'FastString' interning logic.
+  | BCONPtrFS    !FastString
+  -- | A libffi ffi_cif function prototype.
+  | BCONPtrFFIInfo !FFIInfo
+  -- | A 'CostCentre' remote pointer array's respective 'BreakpointId'
+  | BCONPtrCostCentre !InternalBreakpointId
 
 instance NFData BCONPtr where
   rnf x = x `seq` ()
-
--- | Information about a breakpoint that we know at code-generation time
--- In order to be used, this needs to be hydrated relative to the current HscEnv by
--- 'hydrateCgBreakInfo'. Everything here can be fully forced and that's critical for
--- preventing space leaks (see #22530)
-data CgBreakInfo
-   = CgBreakInfo
-   { cgb_tyvars :: ![IfaceTvBndr] -- ^ Type variables in scope at the breakpoint
-   , cgb_vars   :: ![Maybe (IfaceIdBndr, Word)]
-   , cgb_resty  :: !IfaceType
-   }
--- See Note [Syncing breakpoint info] in GHC.Runtime.Eval
-
-seqCgBreakInfo :: CgBreakInfo -> ()
-seqCgBreakInfo CgBreakInfo{..} =
-    rnf cgb_tyvars `seq`
-    rnf cgb_vars `seq`
-    rnf cgb_resty
 
 instance Outputable UnlinkedBCO where
    ppr (UnlinkedBCO nm _arity _insns _bitmap lits ptrs)
@@ -231,68 +297,3 @@ instance Outputable UnlinkedBCO where
              ppr (sizeFlatBag lits), text "lits",
              ppr (sizeFlatBag ptrs), text "ptrs" ]
 
-instance Outputable CgBreakInfo where
-   ppr info = text "CgBreakInfo" <+>
-              parens (ppr (cgb_vars info) <+>
-                      ppr (cgb_resty info))
-
--- -----------------------------------------------------------------------------
--- Breakpoints
-
--- | Breakpoint index
-type BreakIndex = Int
-
--- | C CostCentre type
-data CCostCentre
-
--- | All the information about the breakpoints for a module
-data ModBreaks
-   = ModBreaks
-   { modBreaks_flags :: ForeignRef BreakArray
-        -- ^ The array of flags, one per breakpoint,
-        -- indicating which breakpoints are enabled.
-   , modBreaks_locs :: !(Array BreakIndex SrcSpan)
-        -- ^ An array giving the source span of each breakpoint.
-   , modBreaks_vars :: !(Array BreakIndex [OccName])
-        -- ^ An array giving the names of the free variables at each breakpoint.
-   , modBreaks_decls :: !(Array BreakIndex [String])
-        -- ^ An array giving the names of the declarations enclosing each breakpoint.
-        -- See Note [Field modBreaks_decls]
-   , modBreaks_ccs :: !(Array BreakIndex (RemotePtr CostCentre))
-        -- ^ Array pointing to cost centre for each breakpoint
-   , modBreaks_breakInfo :: IntMap CgBreakInfo
-        -- ^ info about each breakpoint from the bytecode generator
-   , modBreaks_module :: RemotePtr ModuleName
-   }
-
-seqModBreaks :: ModBreaks -> ()
-seqModBreaks ModBreaks{..} =
-  rnf modBreaks_flags `seq`
-  rnf modBreaks_locs `seq`
-  rnf modBreaks_vars `seq`
-  rnf modBreaks_decls `seq`
-  rnf modBreaks_ccs `seq`
-  rnf (fmap seqCgBreakInfo modBreaks_breakInfo) `seq`
-  rnf modBreaks_module
-
--- | Construct an empty ModBreaks
-emptyModBreaks :: ModBreaks
-emptyModBreaks = ModBreaks
-   { modBreaks_flags = error "ModBreaks.modBreaks_array not initialised"
-         -- ToDo: can we avoid this?
-   , modBreaks_locs  = array (0,-1) []
-   , modBreaks_vars  = array (0,-1) []
-   , modBreaks_decls = array (0,-1) []
-   , modBreaks_ccs = array (0,-1) []
-   , modBreaks_breakInfo = IntMap.empty
-   , modBreaks_module = toRemotePtr nullPtr
-   }
-
-{-
-Note [Field modBreaks_decls]
-~~~~~~~~~~~~~~~~~~~~~~
-A value of eg ["foo", "bar", "baz"] in a `modBreaks_decls` field means:
-The breakpoint is in the function called "baz" that is declared in a `let`
-or `where` clause of a declaration called "bar", which itself is declared
-in a `let` or `where` clause of the top-level function called "foo".
--}

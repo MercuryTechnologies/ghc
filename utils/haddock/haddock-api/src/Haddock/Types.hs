@@ -52,7 +52,6 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import GHC
-import qualified GHC.Data.Strict as Strict
 import GHC.Data.BooleanFormula (BooleanFormula)
 import GHC.Driver.Session (Language)
 import qualified GHC.LanguageExtensions as LangExt
@@ -61,7 +60,7 @@ import GHC.Types.Fixity (Fixity (..))
 import GHC.Types.Name (stableNameCmp)
 import GHC.Types.Name.Occurrence
 import GHC.Types.Name.Reader (RdrName (..))
-import GHC.Types.SrcLoc (BufPos (..), BufSpan (..), srcSpanToRealSrcSpan)
+import GHC.Types.SrcLoc (srcSpanToRealSrcSpan)
 import GHC.Types.Var (Specificity)
 import GHC.Utils.Outputable
 
@@ -88,6 +87,9 @@ data DocPaths = DocPaths
   -- ^ path to hyperlinked sources
   }
 type WarningMap = Map Name (Doc Name)
+type ExportedNames = Set.Set Name
+type Modules = Set.Set Module
+type ExportInfo = (ExportedNames, Modules)
 
 -----------------------------------------------------------------------------
 
@@ -132,6 +134,9 @@ data Interface = Interface
   -- Names from modules that are entirely re-exported don't count as visible.
   , ifaceInstances :: [ClsInst]
   -- ^ Instances exported by the module.
+  , ifaceOrphanDeps :: [Module]
+  -- ^ The list of modules to check for orphan instances if this module is
+  -- imported.
   , ifaceOrphanInstances :: [DocInstance GhcRn]
   -- ^ Orphan instances
   , ifaceRnOrphanInstances :: [DocInstance DocNameI]
@@ -406,7 +411,8 @@ data DocNameI
 
 type instance NoGhcTc DocNameI = DocNameI
 
-type instance IdP DocNameI = DocName
+type instance IdP    DocNameI = DocName
+type instance IdOccP DocNameI = DocName
 
 instance CollectPass DocNameI where
   collectXXPat _ ext = dataConCantHappen ext
@@ -697,6 +703,9 @@ data DocOption
   | -- | Render runtime reps for this module (see
     -- the GHC @-fprint-explicit-runtime-reps@ flag)
     OptPrintRuntimeRep
+  | -- | Hide the RHS of type synonyms in this module
+    -- that use unexported types.
+    OptRedactTypeSyns
   deriving (Eq, Show)
 
 -- | Option controlling how to qualify names
@@ -806,9 +815,9 @@ type instance Anno (HsType DocNameI) = SrcSpanAnnA
 type instance Anno (DataFamInstDecl DocNameI) = SrcSpanAnnA
 type instance Anno (DerivStrategy DocNameI) = EpAnn NoEpAnns
 type instance Anno (FieldOcc DocNameI) = SrcSpanAnnA
-type instance Anno (ConDeclField DocNameI) = SrcSpan
-type instance Anno (Located (ConDeclField DocNameI)) = SrcSpan
-type instance Anno [Located (ConDeclField DocNameI)] = SrcSpan
+type instance Anno (HsConDeclRecField DocNameI) = SrcSpan
+type instance Anno (Located (HsConDeclRecField DocNameI)) = SrcSpan
+type instance Anno [Located (HsConDeclRecField DocNameI)] = SrcSpan
 type instance Anno (ConDecl DocNameI) = SrcSpan
 type instance Anno (FunDep DocNameI) = SrcSpan
 type instance Anno (TyFamInstDecl DocNameI) = SrcSpanAnnA
@@ -839,10 +848,10 @@ type instance XBndrRequired DocNameI = NoExtField
 type instance XBndrInvisible DocNameI = NoExtField
 type instance XXBndrVis DocNameI = DataConCantHappen
 
-type instance XUnrestrictedArrow _ DocNameI = NoExtField
-type instance XLinearArrow _ DocNameI = NoExtField
+type instance XUnannotated _ DocNameI = NoExtField
+type instance XLinearAnn _ DocNameI = NoExtField
 type instance XExplicitMult _ DocNameI = NoExtField
-type instance XXArrow _ DocNameI = DataConCantHappen
+type instance XXMultAnnOf _ DocNameI = DataConCantHappen
 
 type instance XForAllTy DocNameI = EpAnn NoEpAnns
 type instance XQualTy DocNameI = EpAnn NoEpAnns
@@ -860,13 +869,21 @@ type instance XIParamTy DocNameI = EpAnn NoEpAnns
 type instance XKindSig DocNameI = EpAnn NoEpAnns
 type instance XSpliceTy DocNameI = DataConCantHappen
 type instance XDocTy DocNameI = EpAnn NoEpAnns
-type instance XBangTy DocNameI = EpAnn NoEpAnns
-type instance XRecTy DocNameI = EpAnn NoEpAnns
 type instance XExplicitListTy DocNameI = EpAnn NoEpAnns
 type instance XExplicitTupleTy DocNameI = EpAnn NoEpAnns
 type instance XTyLit DocNameI = EpAnn NoEpAnns
 type instance XWildCardTy DocNameI = EpAnn NoEpAnns
-type instance XXType DocNameI = HsCoreTy
+type instance XXType DocNameI = HsTypeDocNameIExt
+
+data HsTypeDocNameIExt
+  = HsCoreTy    HsCoreTy
+
+  | HsBangTy    HsSrcBang
+                (LHsType DocNameI)
+
+  | HsRecTy     [LHsConDeclRecField DocNameI]
+
+  | HsRedacted  (HsType DocNameI) -- ^ contains the kind of the redacted type
 
 type instance XNumTy DocNameI = NoExtField
 type instance XStrTy DocNameI = NoExtField
@@ -961,6 +978,9 @@ type instance XXHsSigType DocNameI = DataConCantHappen
 type instance XHsQTvs DocNameI = NoExtField
 type instance XXLHsQTyVars DocNameI = DataConCantHappen
 
+type instance XConDeclRecField DocNameI = NoExtField
+type instance XXConDeclRecField DocNameI = DataConCantHappen
+
 type instance XConDeclField DocNameI = NoExtField
 type instance XXConDeclField DocNameI = DataConCantHappen
 
@@ -986,15 +1006,6 @@ instance NFData RdrName where
   rnf (Qual mn on) = mn `deepseq` on `deepseq` ()
   rnf (Orig m on) = m `deepseq` on `deepseq` ()
   rnf (Exact n) = rnf n
-
-instance NFData FixityDirection where
-  rnf InfixL = ()
-  rnf InfixR = ()
-  rnf InfixN = ()
-
-instance NFData Fixity where
-  rnf (Fixity n dir) =
-    n `deepseq` dir `deepseq` ()
 
 instance NFData (EpAnn NameAnn) where
   rnf (EpAnn en ann cs) = en `deepseq` ann `deepseq` cs `deepseq` ()
@@ -1065,15 +1076,6 @@ instance NFData EpaCommentTok where
   rnf (EpaLineComment s) = rnf s
   rnf (EpaBlockComment s) = rnf s
 
-instance NFData a => NFData (Strict.Maybe a) where
-  rnf Strict.Nothing = ()
-  rnf (Strict.Just x) = rnf x
-
-instance NFData BufSpan where
-  rnf (BufSpan p1 p2) = p1 `deepseq` p2 `deepseq` ()
-
-instance NFData BufPos where
-  rnf (BufPos n) = rnf n
 
 instance NFData DeltaPos where
   rnf (SameLine n) = rnf n

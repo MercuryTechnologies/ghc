@@ -122,7 +122,9 @@ module Language.Haskell.TH.Lib (
     -- **** Pragmas
     ruleVar, typedRuleVar,
     valueAnnotation, typeAnnotation, moduleAnnotation,
-    pragInlD, pragSpecD, pragSpecInlD, pragSpecInstD, pragRuleD, pragAnnD,
+    pragInlD, pragSpecD, pragSpecInlD,
+    pragSpecED, pragSpecInlED,
+    pragSpecInstD, pragRuleD, pragAnnD,
     pragLineD, pragCompleteD,
 
     -- **** Pattern Synonyms
@@ -141,7 +143,7 @@ module Language.Haskell.TH.Lib (
 
    ) where
 
-import GHC.Internal.TH.Lib hiding
+import GHC.Boot.TH.Lib hiding
   ( tySynD
   , dataD
   , newtypeD
@@ -181,7 +183,7 @@ import GHC.Internal.TH.Lib hiding
   , Role
   , InjectivityAnn
   )
-import qualified GHC.Internal.TH.Lib as Internal
+import qualified GHC.Boot.TH.Lib as Internal
 import Language.Haskell.TH.Syntax
 
 import Control.Applicative (Applicative(..))
@@ -393,3 +395,64 @@ mdoE = Internal.mdoE Nothing
 
 conP :: Quote m => Name -> [m Pat] -> m Pat
 conP n xs = Internal.conP n [] xs
+
+
+--------------------------------------------------------------------------------
+-- * Constraint predicates (deprecated)
+
+{-# DEPRECATED classP "As of template-haskell-2.10, constraint predicates (Pred) are just types (Type), in keeping with ConstraintKinds. Please use 'conT' and 'appT'." #-}
+classP :: Quote m => Name -> [m Type] -> m Pred
+classP cla tys
+  = do
+      tysl <- sequenceA tys
+      pure (foldl AppT (ConT cla) tysl)
+
+{-# DEPRECATED equalP "As of template-haskell-2.10, constraint predicates (Pred) are just types (Type), in keeping with ConstraintKinds. Please see 'equalityT'." #-}
+equalP :: Quote m => m Type -> m Type -> m Pred
+equalP tleft tright
+  = do
+      tleft1  <- tleft
+      tright1 <- tright
+      eqT <- equalityT
+      pure (foldl AppT eqT [tleft1, tright1])
+
+--------------------------------------------------------------------------------
+-- * Strictness queries (deprecated)
+{-# DEPRECATED isStrict
+    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
+     "Example usage: 'bang noSourceUnpackedness sourceStrict'"] #-}
+{-# DEPRECATED notStrict
+    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
+     "Example usage: 'bang noSourceUnpackedness noSourceStrictness'"] #-}
+{-# DEPRECATED unpacked
+    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
+     "Example usage: 'bang sourceUnpack sourceStrict'"] #-}
+isStrict, notStrict, unpacked :: Quote m => m Strict
+isStrict = bang noSourceUnpackedness sourceStrict
+notStrict = bang noSourceUnpackedness noSourceStrictness
+unpacked = bang sourceUnpack sourceStrict
+
+{-# DEPRECATED strictType
+               "As of @template-haskell-2.11.0.0@, 'StrictType' has been replaced by 'BangType'. Please use 'bangType' instead." #-}
+strictType :: Quote m => m Strict -> m Type -> m StrictType
+strictType = bangType
+
+{-# DEPRECATED varStrictType
+               "As of @template-haskell-2.11.0.0@, 'VarStrictType' has been replaced by 'VarBangType'. Please use 'varBangType' instead." #-}
+varStrictType :: Quote m => Name -> m StrictType -> m VarStrictType
+varStrictType = varBangType
+
+--------------------------------------------------------------------------------
+-- * Specialisation pragmas (backwards compatibility)
+
+pragSpecD :: Quote m => Name -> m Type -> Phases -> m Dec
+pragSpecD n ty phases
+  = do
+      ty1    <- ty
+      pure $ PragmaD $ SpecialiseP n ty1 Nothing phases
+
+pragSpecInlD :: Quote m => Name -> m Type -> Inline -> Phases -> m Dec
+pragSpecInlD n ty inline phases
+  = do
+      ty1    <- ty
+      pure $ PragmaD $ SpecialiseP n ty1 (Just inline) phases

@@ -16,6 +16,7 @@
  *
  * --------------------------------------------------------------------------*/
 
+#include "rts/Config.h"
 #include "rts/PosixSource.h"
 #include "Rts.h"
 
@@ -40,12 +41,16 @@ Capability MainCapability;
 uint32_t n_capabilities = 0;
 uint32_t enabled_capabilities = 0;
 
+// The size of the `capabilities` array initialized at RTS startup. Referenced
+// by GHC.Internal.Conc.Sync
+uint32_t max_n_capabilities = MAX_N_CAPABILITIES;
+
 // The array of Capabilities.  It's important that when we need
 // to allocate more Capabilities we don't have to move the existing
 // Capabilities, because there may be pointers to them in use
 // (e.g. threads in waitForCapability(), see #8209), so this is
 // an array of Capability* rather than an array of Capability.
-Capability *capabilities[MAX_N_CAPABILITIES];
+Capability **capabilities;
 
 // Holds the Capability which last became free.  This is used so that
 // an in-call has a chance of quickly finding a free Capability.
@@ -344,8 +349,6 @@ initCapability (Capability *cap, uint32_t i)
  * ------------------------------------------------------------------------- */
 void initCapabilities (void)
 {
-    uint32_t i;
-
     /* Declare a couple capability sets representing the process and
        clock domain. Each capability will get added to these capsets. */
     traceCapsetCreate(CAPSET_OSPROCESS_DEFAULT, CapsetTypeOsProcess);
@@ -354,7 +357,7 @@ void initCapabilities (void)
     // Initialise NUMA
     if (!RtsFlags.GcFlags.numa) {
         n_numa_nodes = 1;
-        for (i = 0; i < MAX_NUMA_NODES; i++) {
+        for (uint32_t i = 0; i < MAX_NUMA_NODES; i++) {
             numa_map[i] = 0;
         }
     } else if (RtsFlags.DebugFlags.numa) {
@@ -388,11 +391,29 @@ void initCapabilities (void)
     }
 #endif
 
-    if (RtsFlags.ParFlags.nCapabilities > MAX_N_CAPABILITIES) {
-        errorBelch("warning: this GHC runtime system only supports up to %d capabilities",
-                   MAX_N_CAPABILITIES);
-        RtsFlags.ParFlags.nCapabilities = MAX_N_CAPABILITIES;
+    /*
+     * Note [Capabilities array sizing]
+     * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     * Determine the size of the capabilities array as the maximum of:
+     *   * the static lower bound, `MAX_N_CAPABILITIES`
+     *   * the logical core count
+     *   * the users's choice of `+RTS -N`
+     * This will serve as the upper bound on the capability count for the rest
+     * of execution. Calls to `setNumCapabilities` exceeding this bound will
+     * issue a warning and otherwise have no effect.
+     *
+     * See #25560.
+     */
+    uint32_t core_count = getNumberOfProcessors();
+    if (core_count > max_n_capabilities) {
+        max_n_capabilities = core_count;
     }
+
+    if (RtsFlags.ParFlags.nCapabilities > max_n_capabilities) {
+        max_n_capabilities = RtsFlags.ParFlags.nCapabilities;
+    }
+
+    capabilities = stgMallocBytes(sizeof(Capability) * max_n_capabilities, "initCapabilities");
 
     n_capabilities = 0;
     moreCapabilities(0, RtsFlags.ParFlags.nCapabilities);
@@ -401,6 +422,7 @@ void initCapabilities (void)
 #else /* !THREADED_RTS */
 
     n_capabilities = 1;
+    capabilities = stgMallocBytes(sizeof(Capability), "initCapabilities");
     capabilities[0] = &MainCapability;
 
     initCapability(&MainCapability, 0);
@@ -412,7 +434,7 @@ void initCapabilities (void)
     // There are no free capabilities to begin with.  We will start
     // a worker Task to each Capability, which will quickly put the
     // Capability on the free list when it finds nothing to do.
-    for (i = 0; i < n_numa_nodes; i++) {
+    for (uint32_t i = 0; i < n_numa_nodes; i++) {
         last_free_capability[i] = getCapability(0);
     }
 }

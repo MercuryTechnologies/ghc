@@ -7,7 +7,7 @@
 
 module GHC.HsToCore.Errors.Ppr where
 
-import GHC.Core.Predicate (isEvVar)
+import GHC.Core.Predicate (isEvId)
 import GHC.Core.Type
 import GHC.Driver.Flags
 import GHC.Hs
@@ -27,7 +27,7 @@ import GHC.HsToCore.Pmc.Ppr
 instance Diagnostic DsMessage where
   type DiagnosticOpts DsMessage = NoDiagnosticOpts
   diagnosticMessage opts = \case
-    DsUnknownMessage (UnknownDiagnostic f m)
+    DsUnknownMessage (UnknownDiagnostic f _ m)
       -> diagnosticMessage (f opts) m
     DsEmptyEnumeration
       -> mkSimpleDecorated $ text "Enumeration is empty"
@@ -83,12 +83,46 @@ instance Diagnostic DsMessage where
                StrictBinds       -> "strict bindings"
          in mkSimpleDecorated $
               hang (text "Top-level" <+> text desc <+> text "aren't allowed:") 2 (ppr bind)
-    DsUselessSpecialiseForClassMethodSelector poly_id
-      -> mkSimpleDecorated $
-           text "Ignoring useless SPECIALISE pragma for class selector:" <+> quotes (ppr poly_id)
-    DsUselessSpecialiseForNoInlineFunction poly_id
-      -> mkSimpleDecorated $
-          text "Ignoring useless SPECIALISE pragma for NOINLINE function:" <+> quotes (ppr poly_id)
+    DsUselessSpecialisePragma poly_nm is_dfun rea ->
+      mkSimpleDecorated $
+        vcat [ what <+> pragma <+> text "pragma" <> why
+             , additional ]
+      where
+        quoted_nm = quotes (ppr poly_nm)
+        what
+          | uselessSpecialisePragmaKeepAnyway rea
+          = text "Dubious"
+          | otherwise
+          = text "Ignoring useless"
+        pragma = if is_dfun
+                 then text "SPECIALISE instance"
+                 else text "SPECIALISE"
+        why = case rea of
+          UselessSpecialiseForClassMethodSelector ->
+            text " for class selector:" <+> quoted_nm
+          UselessSpecialiseForNoInlineFunction ->
+            text " for NOINLINE function:" <+> quoted_nm
+          UselessSpecialiseNoSpecialisation ->
+            -- Omit the Name for a DFunId, as it will be internal and not
+            -- very illuminating to users who don't know what a DFunId is.
+            (if is_dfun then empty else text " for" <+> quoted_nm) <> dot
+
+        additional
+          | uselessSpecialisePragmaKeepAnyway rea
+          = -- No specialisation happening, but the pragma may still be useful.
+            -- For example (#25389):
+            --
+            --   data G a where { G1 :: G Int, G2 :: G Bool }
+            --   f :: G a -> a
+            --   f G1 = <branch1>; f G2 = <branch2>
+            --   {-# SPECIALISE f :: G Int -> Int #-}
+            --     -- In $sf, we get rid of dead code in <branch2>
+            vcat
+              [ text "The pragma does not specialise away any class dictionaries,"
+              , text "and neither is there any value specialisation."
+              ]
+          | otherwise
+          = empty
     DsOrphanRule rule
       -> mkSimpleDecorated $ text "Orphan rule:" <+> ppr rule
     DsRuleLhsTooComplicated orig_lhs lhs2
@@ -109,11 +143,11 @@ instance Diagnostic DsMessage where
                        , text "is not bound in RULE lhs"])
                 2 (vcat [ text "Orig bndrs:" <+> ppr orig_bndrs
                         , text "Orig lhs:" <+> ppr orig_lhs
-                        , text "optimised lhs:" <+> ppr lhs2 ])
+                        , text "Optimised lhs:" <+> ppr lhs2 ])
 
            pp_bndr b
             | isTyVar b = text "type variable" <+> quotes (ppr b)
-            | isEvVar b = text "constraint"    <+> quotes (ppr (varType b))
+            | isEvId  b = text "constraint"    <+> quotes (ppr (varType b))
             | otherwise = text "variable"      <+> quotes (ppr b)
     DsLazyPatCantBindVarsOfUnliftedType unlifted_bndrs
       -> mkSimpleDecorated $
@@ -165,6 +199,8 @@ instance Diagnostic DsMessage where
                -> mkMsg "Splices within declaration brackets" empty
              ThNonLinearDataCon
                -> mkMsg "Non-linear fields in data constructors" empty
+             ThDataConVisibleForall
+               -> mkMsg "Visible forall in data constructors" empty
          where
            mkMsg what doc =
              mkSimpleDecorated $
@@ -224,8 +260,7 @@ instance Diagnostic DsMessage where
     DsNonExhaustivePatterns _ (ExhaustivityCheckType mb_flag) _ _ _
       -> maybe WarningWithoutFlag WarningWithFlag mb_flag
     DsTopLevelBindsNotAllowed{}                 -> ErrorWithoutFlag
-    DsUselessSpecialiseForClassMethodSelector{} -> WarningWithoutFlag
-    DsUselessSpecialiseForNoInlineFunction{}    -> WarningWithoutFlag
+    DsUselessSpecialisePragma{}                 -> WarningWithFlag Opt_WarnUselessSpecialisations
     DsOrphanRule{}                              -> WarningWithFlag Opt_WarnOrphans
     DsRuleLhsTooComplicated{}                   -> WarningWithoutFlag
     DsRuleIgnoredDueToConstructor{}             -> WarningWithoutFlag
@@ -260,8 +295,7 @@ instance Diagnostic DsMessage where
     DsMaxPmCheckModelsReached{}                 -> [SuggestIncreaseMaxPmCheckModels]
     DsNonExhaustivePatterns{}                   -> noHints
     DsTopLevelBindsNotAllowed{}                 -> noHints
-    DsUselessSpecialiseForClassMethodSelector{} -> noHints
-    DsUselessSpecialiseForNoInlineFunction{}    -> noHints
+    DsUselessSpecialisePragma{}                 -> noHints
     DsOrphanRule{}                              -> noHints
     DsRuleLhsTooComplicated{}                   -> noHints
     DsRuleIgnoredDueToConstructor{}             -> noHints
@@ -278,7 +312,7 @@ instance Diagnostic DsMessage where
     DsAnotherRuleMightFireFirst _ bad_rule _    -> [SuggestAddPhaseToCompetingRule bad_rule]
     DsIncompleteRecordSelector{}                -> noHints
 
-  diagnosticCode = constructorCode
+  diagnosticCode = constructorCode @GHC
 
 {-
 Note [Suggest NegativeLiterals]

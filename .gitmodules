@@ -104,7 +104,7 @@
 	url = https://gitlab.haskell.org/ghc/libffi-tarballs.git
 	ignore = untracked
 [submodule "gmp-tarballs"]
-	path = libraries/ghc-bignum/gmp/gmp-tarballs
+	path = libraries/ghc-internal/gmp/gmp-tarballs
 	url = https://gitlab.haskell.org/ghc/gmp-tarballs.git
 [submodule "libraries/exceptions"]
 	path = libraries/exceptions
@@ -118,3 +118,9 @@
 [submodule "libraries/file-io"]
 	path = libraries/file-io
 	url = https://gitlab.haskell.org/ghc/packages/file-io.git
+[submodule "libraries/template-haskell-lift"]
+	path = libraries/template-haskell-lift
+	url = https://gitlab.haskell.org/ghc/template-haskell-lift.git
+[submodule "libraries/template-haskell-quasiquoter"]
+	path = libraries/template-haskell-quasiquoter
+	url = https://gitlab.haskell.org/ghc/template-haskell-quasiquoter.git

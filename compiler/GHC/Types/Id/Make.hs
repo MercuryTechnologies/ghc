@@ -20,7 +20,7 @@ module GHC.Types.Id.Make (
 
         mkFCallId,
 
-        unwrapNewTypeBody, wrapFamInstBody,
+        wrapNewTypeBody, unwrapNewTypeBody, wrapFamInstBody,
         DataConBoxer(..), vanillaDataConBoxer,
         mkDataConRep, mkDataConWorkId,
         DataConBangOpts (..), BangOpts (..),
@@ -54,6 +54,7 @@ import GHC.Core.Type
 import GHC.Core.Multiplicity
 import GHC.Core.TyCo.Rep
 import GHC.Core.FamInstEnv
+import GHC.Core.Predicate( isUnaryClass )
 import GHC.Core.Coercion
 import GHC.Core.Reduction
 import GHC.Core.Make
@@ -475,12 +476,12 @@ Therefore there is no loss of generality if we make all selectors unrestricted.
 mkDictSelId :: Name          -- Name of one of the *value* selectors
                              -- (dictionary superclass or method)
             -> Class -> Id
+-- Important: see Note [ClassOp/DFun selection] in GHC.Tc.TyCl.Instance
 mkDictSelId name clas
   = mkGlobalId (ClassOpId clas terminating) name sel_ty info
   where
     tycon          = classTyCon clas
     sel_names      = map idName (classAllSelIds clas)
-    new_tycon      = isNewTyCon tycon
     [data_con]     = tyConDataCons tycon
     tyvars         = dataConUserTyVarBinders data_con
     n_ty_args      = length tyvars
@@ -489,7 +490,7 @@ mkDictSelId name clas
 
     pred_ty = mkClassPred clas (mkTyVarTys (binderVars tyvars))
     res_ty  = scaledThing (getNth arg_tys val_index)
-    sel_ty  = mkInvisForAllTys tyvars $
+    sel_ty  = mkForAllTys tyvars $
               mkFunctionType ManyTy pred_ty res_ty
              -- See Note [Type classes and linear types]
 
@@ -502,23 +503,9 @@ mkDictSelId name clas
                 `setDmdSigInfo` strict_sig
                 `setCprSigInfo` topCprSig
 
-    info | new_tycon
-         = base_info `setInlinePragInfo` alwaysInlinePragma
-                     `setUnfoldingInfo`  mkInlineUnfoldingWithArity defaultSimpleOpts
-                                           StableSystemSrc 1
-                                           (mkDictSelRhs clas val_index)
-                   -- See Note [Single-method classes] in GHC.Tc.TyCl.Instance
-                   -- for why alwaysInlinePragma
-
-         | otherwise
-         = base_info `setRuleInfo` mkRuleInfo [rule]
-                     `setInlinePragInfo` neverInlinePragma
-                     `setUnfoldingInfo`  mkInlineUnfoldingWithArity defaultSimpleOpts
-                                           StableSystemSrc 1
-                                           (mkDictSelRhs clas val_index)
-                   -- Add a magic BuiltinRule, but no unfolding
-                   -- so that the rule is always available to fire.
-                   -- See Note [ClassOp/DFun selection] in GHC.Tc.TyCl.Instance
+    info = base_info `setRuleInfo` mkRuleInfo [rule]
+           -- No unfolding for a dictionary selector; the RULE does the work,
+           -- See Note [ClassOp/DFun selection] in GHC.Tc.TyCl.Instance
 
     -- This is the built-in rule that goes
     --      op (dfT d1 d2) --->  opT d1 d2
@@ -531,11 +518,10 @@ mkDictSelId name clas
         -- The strictness signature is of the form U(AAAVAAAA) -> T
         -- where the V depends on which item we are selecting
         -- It's worth giving one, so that absence info etc is generated
-        -- even if the selector isn't inlined
+        -- even if the selector isn't inlined, which of course it isn't!
 
     strict_sig = mkClosedDmdSig [arg_dmd] topDiv
-    arg_dmd | new_tycon = evalDmd
-            | otherwise = C_1N :* mkProd Unboxed dict_field_dmds
+    arg_dmd = C_1N :* mkProd Unboxed dict_field_dmds
             where
               -- The evalDmd below is just a placeholder and will be replaced in
               -- GHC.Types.Demand.dmdTransformDictSel
@@ -545,24 +531,29 @@ mkDictSelId name clas
 mkDictSelRhs :: Class
              -> Int         -- 0-indexed selector among (superclasses ++ methods)
              -> CoreExpr
+-- See Note [ClassOp/DFun selection] in GHC.Tc.TyCl.Instance
 mkDictSelRhs clas val_index
   = mkLams tyvars (Lam dict_id rhs_body)
   where
-    tycon          = classTyCon clas
-    new_tycon      = isNewTyCon tycon
-    [data_con]     = tyConDataCons tycon
-    tyvars         = dataConUnivTyVars data_con
-    arg_tys        = dataConRepArgTys data_con  -- Includes the dictionary superclasses
+    tycon      = classTyCon clas
+    [data_con] = tyConDataCons tycon
+    tyvars     = dataConUnivTyVars data_con
+    arg_tys    = dataConRepArgTys data_con  -- Includes the dictionary superclasses
 
-    the_arg_id     = getNth arg_ids val_index
-    pred           = mkClassPred clas (mkTyVarTys tyvars)
-    dict_id        = mkTemplateLocal 1 pred
-    arg_ids        = mkTemplateLocalsNum 2 (map scaledThing arg_tys)
+    the_arg_id = getNth arg_ids val_index
+    pred       = mkClassPred clas (mkTyVarTys tyvars)
+    dict_id    = mkTemplateLocal 1 pred
+    arg_ids    = mkTemplateLocalsNum 2 (map scaledThing arg_tys)
 
-    rhs_body | new_tycon = unwrapNewTypeBody tycon (mkTyVarTys tyvars)
-                                                   (Var dict_id)
-             | otherwise = mkSingleAltCase (Var dict_id) dict_id (DataAlt data_con)
-                                           arg_ids (varToCoreExpr the_arg_id)
+    rhs_body | isUnaryClass clas   -- Just having one sel_id isn't enough!
+                                   -- E.g.  class (a ~# b) => a ~ b where {}
+             , let sel_ids = classAllSelIds clas
+             = assertPpr (val_index == 0)      (ppr clas) $
+               assertPpr (length sel_ids == 1) (ppr clas) $
+               Var (head sel_ids) `mkTyApps` mkTyVarTys tyvars `App` Var dict_id
+             | otherwise
+             = mkSingleAltCase (Var dict_id) dict_id (DataAlt data_con)
+                               arg_ids (varToCoreExpr the_arg_id)
                                 -- varToCoreExpr needed for equality superclass selectors
                                 --   sel a b d = case x of { MkC _ (g:a~b) _ -> CO g }
 
@@ -572,9 +563,11 @@ dictSelRule :: Int -> Arity -> RuleFun
 -- from it
 --       sel_i t1..tk (D t1..tk op1 ... opm) = opi
 --
-dictSelRule val_index n_ty_args _ id_unf _ args
+-- See Note [ClassOp/DFun selection] in GHC.Tc.TyCl.Instance
+dictSelRule val_index n_ty_args _ in_scope_env _ args
   | (dict_arg : _) <- drop n_ty_args args
-  , Just (_, floats, _, _, con_args) <- exprIsConApp_maybe id_unf dict_arg
+  , Just (_, floats, _, _, con_args)
+             <- exprIsConApp_maybe in_scope_env dict_arg
   = Just (wrapFloats floats $ getNth con_args val_index)
   | otherwise
   = Nothing
@@ -589,9 +582,8 @@ dictSelRule val_index n_ty_args _ id_unf _ args
 
 mkDataConWorkId :: Name -> DataCon -> Id
 mkDataConWorkId wkr_name data_con
-  | isNewTyCon tycon
-  = mkGlobalId (DataConWrapId data_con) wkr_name wkr_ty nt_work_info
-      -- See Note [Newtype workers]
+  | isNewTyCon tycon       -- See Note [Newtype workers]
+  = mkGlobalId (DataConWrapId data_con) wkr_name wkr_ty nt_info
 
   | otherwise
   = mkGlobalId (DataConWorkId data_con) wkr_name wkr_ty alg_wkr_info
@@ -630,18 +622,17 @@ mkDataConWorkId wkr_name data_con
                                             -- LFInfo stores post-unarisation arity
 
     ----------- Workers for newtypes --------------
-    nt_work_info = noCafIdInfo          -- The NoCaf-ness is set by noCafIdInfo
-                  `setArityInfo` 1      -- Arity 1
-                  `setInlinePragInfo`     dataConWrapperInlinePragma
-                  `setUnfoldingInfo`      newtype_unf
-                               -- See W1 in Note [LFInfo of DataCon workers and wrappers]
-                  `setLFInfo` (panic "mkDataConWorkId: we shouldn't look at LFInfo for newtype worker ids")
-    id_arg1      = mkScaledTemplateLocal 1 (head arg_tys)
-    res_ty_args  = mkTyCoVarTys univ_tvs
-    newtype_unf  = assertPpr (null ex_tcvs && isSingleton arg_tys)
-                             (ppr data_con)
+    nt_info  = noCafIdInfo          -- The NoCaf-ness is set by noCafIdInfo
+               `setArityInfo` 1  -- Arity 1
+               `setInlinePragInfo` dataConWrapperInlinePragma
+               `setUnfoldingInfo`  mkCompulsoryUnfolding newtype_rhs
+               `setLFInfo` (panic "mkDataConWorkId: no LFInfo for newtype worker ids")
+                           -- See W1 in Note [LFInfo of DataCon workers and wrappers]
+
+    id_arg1     = mkScaledTemplateLocal 1 (head arg_tys)
+    res_ty_args = mkTyCoVarTys univ_tvs
+    newtype_rhs =  assertPpr (null ex_tcvs && isSingleton arg_tys) (ppr data_con) $
                               -- Note [Newtype datacons]
-                   mkCompulsoryUnfolding $
                    mkLams univ_tvs $ Lam id_arg1 $
                    wrapNewTypeBody tycon res_ty_args (Var id_arg1)
 
@@ -664,18 +655,18 @@ How do we construct a /correct/ LFInfo for workers and wrappers?
 (Remember: `LFCon` means "a saturated constructor application")
 
 (1) Data constructor workers and wrappers with arity > 0 are unambiguously
-functions and should be given `LFReEntrant`, regardless of the runtime
-relevance of the arguments.
-  - For example, `Just :: a -> Maybe a` is given `LFReEntrant`,
-             and `HNil :: (a ~# '[]) -> HList a` is given `LFReEntrant` too.
+    functions and should be given `LFReEntrant`, regardless of the runtime
+    relevance of the arguments.  For example:
+       `Just :: a -> Maybe a`          is given `LFReEntrant`,
+       `HNil :: (a ~# '[]) -> HList a` is given `LFReEntrant` too.
 
 (2) A datacon /worker/ with zero arity is trivially fully saturated -- it takes
-no arguments whatsoever (not even zero-width args), so it is given `LFCon`.
+    no arguments whatsoever (not even zero-width args), so it is given `LFCon`.
 
 (3) Perhaps surprisingly, a datacon /wrapper/ can be an `LFCon`. See Wrinkle (W1) below.
-A datacon /wrapper/ with zero arity must be a fully saturated application of
-the worker to zero-width arguments only (which are dropped after unarisation),
-and therefore is also given `LFCon`.
+    A datacon /wrapper/ with zero arity must be a fully saturated application of
+    the worker to zero-width arguments only (which are dropped after unarisation),
+    and therefore is also given `LFCon`.
 
 For example, consider the following data constructors:
 
@@ -857,8 +848,8 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
              wrap_unf | isNewTyCon tycon = mkCompulsoryUnfolding wrap_rhs
                         -- See Note [Compulsory newtype unfolding]
                       | otherwise        = mkDataConUnfolding wrap_rhs
-             wrap_rhs = mkLams wrap_tvs $
-                        mkLams wrap_args $
+             wrap_rhs = mkCoreTyLams wrap_tvbs $
+                        mkCoreLams wrap_args $
                         wrapFamInstBody tycon res_ty_args $
                         wrap_body
 
@@ -871,7 +862,7 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
     (univ_tvs, ex_tvs, eq_spec, theta, orig_arg_tys, _orig_res_ty)
                  = dataConFullSig data_con
     stupid_theta = dataConStupidTheta data_con
-    wrap_tvs     = dataConUserTyVars data_con
+    wrap_tvbs    = dataConUserTyVarBinders data_con
     res_ty_args  = dataConResRepTyArgs data_con
 
     tycon        = dataConTyCon data_con       -- The representation TyCon (not family)
@@ -918,6 +909,9 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
         -- See wrinkle (W0) in Note [Type data declarations] in GHC.Rename.Module.
       = False
 
+      | isUnaryClassTyCon tycon   -- See (UCM8) in Note [Unary class magic]
+      = False                     -- in GHC.Core.TyCon
+
       | otherwise
       = (not new_tycon
                      -- (Most) newtypes have only a worker, with the exception
@@ -928,7 +922,7 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
 
       || isFamInstTyCon tycon -- Cast result
 
-      || dataConUserTyVarsNeedWrapper data_con
+      || dataConUserTyVarBindersNeedWrapper data_con
                      -- If the data type was written with GADT syntax and
                      -- orders the type variables differently from what the
                      -- worker expects, it needs a data con wrapper to reorder
@@ -1144,18 +1138,18 @@ dataConSrcToImplBang
    -> HsImplBang
 
 dataConSrcToImplBang bang_opts fam_envs arg_ty
-                     (HsSrcBang ann (HsBang unpk NoSrcStrict))
+                     (HsSrcBang ann unpk NoSrcStrict)
   | bang_opt_strict_data bang_opts -- StrictData => strict field
   = dataConSrcToImplBang bang_opts fam_envs arg_ty
-                  (mkHsSrcBang ann unpk SrcStrict)
+                  (HsSrcBang ann unpk SrcStrict)
   | otherwise -- no StrictData => lazy field
   = HsLazy
 
-dataConSrcToImplBang _ _ _ (HsSrcBang _ (HsBang _ SrcLazy))
+dataConSrcToImplBang _ _ _ (HsSrcBang _ _ SrcLazy)
   = HsLazy
 
 dataConSrcToImplBang bang_opts fam_envs arg_ty
-                     (HsSrcBang _ (HsBang unpk_prag SrcStrict))
+                     (HsSrcBang _ unpk_prag SrcStrict)
   | isUnliftedType (scaledThing arg_ty)
     -- NB: non-newtype data constructors can't have representation-polymorphic fields
     -- so this is OK.
@@ -1470,7 +1464,7 @@ shouldUnpackArgTy bang_opts prag fam_envs arg_ty
              -- We'd get a black hole if we used dataConImplBangs
 
          ok_arg :: NameSet -> (Scaled Type, HsSrcBang) -> Bool
-         ok_arg dcs (Scaled _ ty, HsSrcBang _ (HsBang unpack_prag str_prag))
+         ok_arg dcs (Scaled _ ty, HsSrcBang _ unpack_prag str_prag)
            | strict_field str_prag
            , Just data_cons <- unpackable_type_datacons (topNormaliseType fam_envs ty)
            , should_unpack_conservative unpack_prag data_cons  -- Wrinkle (W3)
@@ -1540,39 +1534,87 @@ shouldUnpackArgTy bang_opts prag fam_envs arg_ty
 
 
 
--- Given a type already assumed to have been normalized by topNormaliseType,
--- unpackable_type_datacons ty = Just datacons
--- iff ty is of the form
---     T ty1 .. tyn
--- and T is an algebraic data type (not newtype), in which no data
--- constructors have existentials, and datacons is the list of data
--- constructors of T.
 unpackable_type_datacons :: Type -> Maybe [DataCon]
+-- Given a type already assumed to have been normalized by topNormaliseType,
+--    unpackable_type_datacons (T ty1 .. tyn) = Just datacons
+-- iff the type can be unpacked (see Note [Unpacking GADTs and existentials])
+-- and `datacons` are the data constructors of T
 unpackable_type_datacons ty
   | Just (tc, _) <- splitTyConApp_maybe ty
-  , not (isNewTyCon tc)  -- Even though `ty` has been normalised, it could still
-                         -- be a /recursive/ newtype, so we must check for that
+  , not (isNewTyCon tc)
+      -- isNewTyCon: even though `ty` has been normalised, whic includes looking
+      -- through newtypes, it could still be a /recursive/ newtype, so we must
+      -- check for that case
   , Just cons <- tyConDataCons_maybe tc
-  , not (null cons)      -- Don't upack nullary sums; no need.
-                         -- They already take zero bits
-  , all (null . dataConExTyCoVars) cons
-  = Just cons -- See Note [Unpacking GADTs and existentials]
+  , unpackable_cons cons
+  = Just cons
   | otherwise
   = Nothing
+  where
+    unpackable_cons :: [DataCon] -> Bool
+    -- True if we can unpack a value of type (T t1 .. tn),
+    -- where T is an algebraic data type with these constructors
+    -- See Note [Unpacking GADTs and existentials]
+    unpackable_cons []   -- Don't unpack nullary sums; no need.
+      = False            -- They already take zero bits; see (UC0)
+
+    unpackable_cons [con]   -- Exactly one data constructor; see (UC1)
+      = null (dataConExTyCoVars con)
+
+    unpackable_cons cons  -- More than one data constructor; see (UC2)
+      = all isVanillaDataCon cons
 
 {-
 Note [Unpacking GADTs and existentials]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-There is nothing stopping us unpacking a data type with equality
-components, like
-  data Equal a b where
-    Equal :: Equal a a
+Can we unpack a value of an algebraic data type T? For example
+   data D a = MkD {-# UNPACK #-} (T a)
+Can we unpack that (T a) field?
 
-And it'd be fine to unpack a product type with existential components
-too, but that would require a bit more plumbing, so currently we don't.
+Three cases to consider in `unpackable_cons`
 
-So for now we require: null (dataConExTyCoVars data_con)
-See #14978
+(UC0) No data constructors; a nullary sum type.  This already takes zero
+      bits so there is no point in unpacking it.
+
+(UC1) Single-constructor types (products).  We can just represent it by
+   its fields. For example, if `T` is defined as:
+      data T a = MkT a a Int
+   then we can unpack it as follows.  The worker for MkD takes three unpacked fields:
+       data D a = MkD a a Int
+       $MkD :: T a -> D a
+       $MkD (MkT a1 a2 i) = MkD a1 a2 i
+
+   We currently /can't/ do this if T has existentially-bound type variables,
+   hence:   null (dataConExTyCoVars con)   in `unpackable_cons`.
+   But see also (UC3) below.
+
+   But we /can/ do it for (some) GADTs, such as:
+      data Equal a b where { Equal :: Equal a a }
+      data Wom a where { Wom1 :: Int -> Wom Bool }
+   We will get a MkD constructor that includes some coercion arguments,
+   but that is fine.   See #14978.  We still can't accommodate existentials,
+   but these particular examples don't use existentials.
+
+(UC2) Multi-constructor types, e.g.
+        data T a = T1 a | T2 Int a
+  Here we unpack the field to an unboxed sum type, thus:
+    data D a = MkD (# a | (# Int, a #) #)
+
+  However, now we can't deal with GADTs at all, because we'd need an
+  unboxed sum whose component was a unboxed tuple, whose component(s)
+  have kind (CONSTRAINT r); and that's not well-kinded.  Hence the
+    all isVanillaDataCon
+  condition in `unpackable_cons`. See #25672.
+
+(UC3)  For single-constructor types, with some more plumbing we could
+   allow existentials. e.g.
+       data T a = forall b. MkT a (b->Int) b
+   could unpack to
+       data D a = forall b. MkD a (b->Int) b
+       $MkD :: T a -> D a
+       $MkD (MkT @b x f y) = MkD @b x f y
+   Eminently possible, but more plumbing needed.
+
 
 Note [Unpack one-wide fields]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1803,12 +1845,12 @@ mkDictFunId :: Name      -- Name to use for the dict fun;
 -- See Note [Dict funs and default methods]
 
 mkDictFunId dfun_name tvs theta clas tys
-  = mkExportedLocalId (DFunId is_nt)
+  = mkExportedLocalId (DFunId is_unary)
                       dfun_name
                       dfun_ty
   where
-    is_nt = isNewTyCon (classTyCon clas)
-    dfun_ty = TcType.tcMkDFunSigmaTy tvs theta (mkClassPred clas tys)
+    is_unary = isUnaryClass clas
+    dfun_ty  = TcType.tcMkDFunSigmaTy tvs theta (mkClassPred clas tys)
 
 {-
 ************************************************************************
@@ -1902,7 +1944,7 @@ seqId = pcRepPolyId seqName ty concs info
           Case (Var x) x openBetaTy [Alt DEFAULT [] (Var y)]
 
     concs = mkRepPolyIdConcreteTyVars
-        [ ((openBetaTy, Argument 2 Top), runtimeRep2TyVar)]
+        [ ((openBetaTy, mkArgPos 2 Top), runtimeRep2TyVar)]
 
     arity = 2
 
@@ -1961,7 +2003,7 @@ oneShotId = pcRepPolyId oneShotName ty concs info
     arity = 2
 
     concs = mkRepPolyIdConcreteTyVars
-        [((openAlphaTy, Argument 2 Top), runtimeRep1TyVar)]
+        [((openAlphaTy, mkArgPos 2 Top), runtimeRep1TyVar)]
 
 ----------------------------------------------------------------------
 {- Note [Wired-in Ids for rebindable syntax]
@@ -2006,7 +2048,7 @@ leftSectionId = pcRepPolyId leftSectionName ty concs info
     arity = 2
 
     concs = mkRepPolyIdConcreteTyVars
-            [((openAlphaTy, Argument 2 Top), runtimeRep1TyVar)]
+            [((openAlphaTy, mkArgPos 2 Top), runtimeRep1TyVar)]
 
 -- See Note [Left and right sections] in GHC.Rename.Expr
 -- See Note [Wired-in Ids for rebindable syntax]
@@ -2040,8 +2082,8 @@ rightSectionId = pcRepPolyId rightSectionName ty concs info
 
     concs =
       mkRepPolyIdConcreteTyVars
-        [ ((openAlphaTy, Argument 3 Top), runtimeRep1TyVar)
-        , ((openBetaTy , Argument 2 Top), runtimeRep2TyVar)]
+        [ ((openAlphaTy, mkArgPos 3 Top), runtimeRep1TyVar)
+        , ((openBetaTy , mkArgPos 2 Top), runtimeRep2TyVar)]
 
 --------------------------------------------------------------------------------
 
@@ -2071,7 +2113,7 @@ coerceId = pcRepPolyId coerceName ty concs info
           [Alt (DataAlt coercibleDataCon) [eq] (Cast (Var x) (mkCoVarCo eq))]
 
     concs = mkRepPolyIdConcreteTyVars
-            [((mkTyVarTy av, Argument 1 Top), rv)]
+            [((mkTyVarTy av, mkArgPos 1 Top), rv)]
 
 {-
 Note [seqId magic]

@@ -147,6 +147,8 @@ defaults
    fixity           = Nothing
    vector           = []
    deprecated_msg   = {}      -- A non-empty message indicates deprecation
+   div_like         = False   -- Second argument expected to be non zero - used for tests
+   defined_bits     = Nothing -- The number of bits the operation is defined for (if not all bits)
 
 -- Note [When do out-of-line primops go in primops.txt.pp]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -296,14 +298,18 @@ primop Int8MulOp "timesInt8#" GenPrimOp Int8# -> Int8# -> Int8#
 primop Int8QuotOp "quotInt8#" GenPrimOp Int8# -> Int8# -> Int8#
   with
     effect = CanFail
+    div_like = True
 
 primop Int8RemOp "remInt8#" GenPrimOp Int8# -> Int8# -> Int8#
   with
     effect = CanFail
+    div_like = True
+
 
 primop Int8QuotRemOp "quotRemInt8#" GenPrimOp Int8# -> Int8# -> (# Int8#, Int8# #)
   with
     effect = CanFail
+    div_like = True
 
 primop Int8SllOp "uncheckedShiftLInt8#"  GenPrimOp Int8# -> Int# -> Int8#
 primop Int8SraOp "uncheckedShiftRAInt8#" GenPrimOp Int8# -> Int# -> Int8#
@@ -342,14 +348,17 @@ primop Word8MulOp "timesWord8#" GenPrimOp Word8# -> Word8# -> Word8#
 primop Word8QuotOp "quotWord8#" GenPrimOp Word8# -> Word8# -> Word8#
   with
     effect = CanFail
+    div_like = True
 
 primop Word8RemOp "remWord8#" GenPrimOp Word8# -> Word8# -> Word8#
   with
     effect = CanFail
+    div_like = True
 
 primop Word8QuotRemOp "quotRemWord8#" GenPrimOp Word8# -> Word8# -> (# Word8#, Word8# #)
   with
     effect = CanFail
+    div_like = True
 
 primop Word8AndOp "andWord8#" GenPrimOp Word8# -> Word8# -> Word8#
    with commutable = True
@@ -400,14 +409,17 @@ primop Int16MulOp "timesInt16#" GenPrimOp Int16# -> Int16# -> Int16#
 primop Int16QuotOp "quotInt16#" GenPrimOp Int16# -> Int16# -> Int16#
   with
     effect = CanFail
+    div_like = True
 
 primop Int16RemOp "remInt16#" GenPrimOp Int16# -> Int16# -> Int16#
   with
     effect = CanFail
+    div_like = True
 
 primop Int16QuotRemOp "quotRemInt16#" GenPrimOp Int16# -> Int16# -> (# Int16#, Int16# #)
   with
     effect = CanFail
+    div_like = True
 
 primop Int16SllOp "uncheckedShiftLInt16#"  GenPrimOp Int16# -> Int# -> Int16#
 primop Int16SraOp "uncheckedShiftRAInt16#" GenPrimOp Int16# -> Int# -> Int16#
@@ -446,14 +458,17 @@ primop Word16MulOp "timesWord16#" GenPrimOp Word16# -> Word16# -> Word16#
 primop Word16QuotOp "quotWord16#" GenPrimOp Word16# -> Word16# -> Word16#
   with
     effect = CanFail
+    div_like = True
 
 primop Word16RemOp "remWord16#" GenPrimOp Word16# -> Word16# -> Word16#
   with
     effect = CanFail
+    div_like = True
 
 primop Word16QuotRemOp "quotRemWord16#" GenPrimOp Word16# -> Word16# -> (# Word16#, Word16# #)
   with
     effect = CanFail
+    div_like = True
 
 primop Word16AndOp "andWord16#" GenPrimOp Word16# -> Word16# -> Word16#
    with commutable = True
@@ -504,14 +519,17 @@ primop Int32MulOp "timesInt32#" GenPrimOp Int32# -> Int32# -> Int32#
 primop Int32QuotOp "quotInt32#" GenPrimOp Int32# -> Int32# -> Int32#
   with
     effect = CanFail
+    div_like = True
 
 primop Int32RemOp "remInt32#" GenPrimOp Int32# -> Int32# -> Int32#
   with
     effect = CanFail
+    div_like = True
 
 primop Int32QuotRemOp "quotRemInt32#" GenPrimOp Int32# -> Int32# -> (# Int32#, Int32# #)
   with
     effect = CanFail
+    div_like = True
 
 primop Int32SllOp "uncheckedShiftLInt32#"  GenPrimOp Int32# -> Int# -> Int32#
 primop Int32SraOp "uncheckedShiftRAInt32#" GenPrimOp Int32# -> Int# -> Int32#
@@ -550,14 +568,17 @@ primop Word32MulOp "timesWord32#" GenPrimOp Word32# -> Word32# -> Word32#
 primop Word32QuotOp "quotWord32#" GenPrimOp Word32# -> Word32# -> Word32#
   with
     effect = CanFail
+    div_like = True
 
 primop Word32RemOp "remWord32#" GenPrimOp Word32# -> Word32# -> Word32#
   with
     effect = CanFail
+    div_like = True
 
 primop Word32QuotRemOp "quotRemWord32#" GenPrimOp Word32# -> Word32# -> (# Word32#, Word32# #)
   with
     effect = CanFail
+    div_like = True
 
 primop Word32AndOp "andWord32#" GenPrimOp Word32# -> Word32# -> Word32#
    with commutable = True
@@ -608,10 +629,12 @@ primop Int64MulOp "timesInt64#" GenPrimOp Int64# -> Int64# -> Int64#
 primop Int64QuotOp "quotInt64#" GenPrimOp Int64# -> Int64# -> Int64#
   with
     effect = CanFail
+    div_like = True
 
 primop Int64RemOp "remInt64#" GenPrimOp Int64# -> Int64# -> Int64#
   with
     effect = CanFail
+    div_like = True
 
 primop Int64SllOp "uncheckedIShiftL64#"  GenPrimOp Int64# -> Int# -> Int64#
 primop Int64SraOp "uncheckedIShiftRA64#" GenPrimOp Int64# -> Int# -> Int64#
@@ -650,10 +673,12 @@ primop Word64MulOp "timesWord64#" GenPrimOp Word64# -> Word64# -> Word64#
 primop Word64QuotOp "quotWord64#" GenPrimOp Word64# -> Word64# -> Word64#
   with
     effect = CanFail
+    div_like = True
 
 primop Word64RemOp "remWord64#" GenPrimOp Word64# -> Word64# -> Word64#
   with
     effect = CanFail
+    div_like = True
 
 primop Word64AndOp "and64#" GenPrimOp Word64# -> Word64# -> Word64#
    with commutable = True
@@ -737,6 +762,7 @@ primop   IntQuotOp    "quotInt#"    GenPrimOp
     zero.
    }
    with effect = CanFail
+        div_like = True
 
 primop   IntRemOp    "remInt#"    GenPrimOp
    Int# -> Int# -> Int#
@@ -744,11 +770,13 @@ primop   IntRemOp    "remInt#"    GenPrimOp
     behavior is undefined if the second argument is zero.
    }
    with effect = CanFail
+        div_like = True
 
 primop   IntQuotRemOp "quotRemInt#"    GenPrimOp
    Int# -> Int# -> (# Int#, Int# #)
    {Rounds towards zero.}
    with effect = CanFail
+        div_like = True
 
 primop   IntAndOp   "andI#"   GenPrimOp    Int# -> Int# -> Int#
    {Bitwise "and".}
@@ -886,19 +914,23 @@ primop   WordMul2Op  "timesWord2#"   GenPrimOp
 
 primop   WordQuotOp   "quotWord#"   GenPrimOp   Word# -> Word# -> Word#
    with effect = CanFail
+        div_like = True
 
 primop   WordRemOp   "remWord#"   GenPrimOp   Word# -> Word# -> Word#
    with effect = CanFail
+        div_like = True
 
 primop   WordQuotRemOp "quotRemWord#" GenPrimOp
    Word# -> Word# -> (# Word#, Word# #)
    with effect = CanFail
+        div_like = True
 
 primop   WordQuotRem2Op "quotRemWord2#" GenPrimOp
    Word# -> Word# -> Word# -> (# Word#, Word# #)
          { Takes high word of dividend, then low word of dividend, then divisor.
            Requires that high word < divisor.}
    with effect = CanFail
+        div_like = True
 
 primop   WordAndOp   "and#"   GenPrimOp   Word# -> Word# -> Word#
    with commutable = True
@@ -1034,8 +1066,10 @@ primop   CtzOp     "ctz#"   GenPrimOp   Word# -> Word#
 
 primop   BSwap16Op   "byteSwap16#"   GenPrimOp   Word# -> Word#
     {Swap bytes in the lower 16 bits of a word. The higher bytes are undefined. }
+    with defined_bits = 16
 primop   BSwap32Op   "byteSwap32#"   GenPrimOp   Word# -> Word#
     {Swap bytes in the lower 32 bits of a word. The higher bytes are undefined. }
+    with defined_bits = 32
 primop   BSwap64Op   "byteSwap64#"   GenPrimOp   Word64# -> Word64#
     {Swap bytes in a 64 bits of a word.}
 primop   BSwapOp     "byteSwap#"     GenPrimOp   Word# -> Word#
@@ -1043,10 +1077,13 @@ primop   BSwapOp     "byteSwap#"     GenPrimOp   Word# -> Word#
 
 primop   BRev8Op    "bitReverse8#"   GenPrimOp   Word# -> Word#
     {Reverse the order of the bits in a 8-bit word.}
+    with defined_bits = 8
 primop   BRev16Op   "bitReverse16#"   GenPrimOp   Word# -> Word#
     {Reverse the order of the bits in a 16-bit word.}
+    with defined_bits = 16
 primop   BRev32Op   "bitReverse32#"   GenPrimOp   Word# -> Word#
     {Reverse the order of the bits in a 32-bit word.}
+    with defined_bits = 32
 primop   BRev64Op   "bitReverse64#"   GenPrimOp   Word64# -> Word64#
     {Reverse the order of the bits in a 64-bit word.}
 primop   BRevOp     "bitReverse#"     GenPrimOp   Word# -> Word#
@@ -1095,10 +1132,18 @@ primop   DoubleLeOp "<=##"   Compare   Double# -> Double# -> Int#
 
 primop   DoubleMinOp   "minDouble#"      GenPrimOp
    Double# -> Double# -> Double#
+   {Return the minimum of the arguments.
+   When the arguments are numerically equal (e.g. @0.0##@ and @-0.0##@)
+   or one of the arguments is not-a-number (NaN),
+   it is unspecified which one is returned.}
    with commutable = True
 
 primop   DoubleMaxOp   "maxDouble#"      GenPrimOp
    Double# -> Double# -> Double#
+   {Return the maximum of the arguments.
+   When the arguments are numerically equal (e.g. @0.0##@ and @-0.0##@)
+   or one of the arguments is not-a-number (NaN),
+   it is unspecified which one is returned.}
    with commutable = True
 
 primop   DoubleAddOp   "+##"   GenPrimOp
@@ -1269,10 +1314,18 @@ primop   FloatLeOp  "leFloat#"   Compare   Float# -> Float# -> Int#
 
 primop   FloatMinOp   "minFloat#"      GenPrimOp
    Float# -> Float# -> Float#
+   {Return the minimum of the arguments.
+   When the arguments are numerically equal (e.g. @0.0#@ and @-0.0#@)
+   or one of the arguments is not-a-number (NaN),
+   it is unspecified which one is returned.}
    with commutable = True
 
 primop   FloatMaxOp   "maxFloat#"      GenPrimOp
    Float# -> Float# -> Float#
+   {Return the maximum of the arguments.
+   When the arguments are numerically equal (e.g. @0.0#@ and @-0.0#@)
+   or one of the arguments is not-a-number (NaN),
+   it is unspecified which one is returned.}
    with commutable = True
 
 primop   FloatAddOp   "plusFloat#"      GenPrimOp
@@ -3186,43 +3239,6 @@ primop  IsEmptyMVarOp "isEmptyMVar#" GenPrimOp
 
 
 ------------------------------------------------------------------------
-section "Synchronized I/O Ports"
-        {Operations on 'IOPort#'s. }
-------------------------------------------------------------------------
-
-primtype IOPort# s a
-        { A shared I/O port is almost the same as an 'MVar#'.
-        The main difference is that IOPort has no deadlock detection or
-        deadlock breaking code that forcibly releases the lock. }
-
-primop  NewIOPortOp "newIOPort#"  GenPrimOp
-   State# s -> (# State# s, IOPort# s a_levpoly #)
-   {Create new 'IOPort#'; initially empty.}
-   with
-   out_of_line = True
-   effect = ReadWriteEffect
-
-primop  ReadIOPortOp "readIOPort#" GenPrimOp
-   IOPort# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
-   {If 'IOPort#' is empty, block until it becomes full.
-   Then remove and return its contents, and set it empty.
-   Throws an 'IOPortException' if another thread is already
-   waiting to read this 'IOPort#'.}
-   with
-   out_of_line      = True
-   effect = ReadWriteEffect
-
-primop  WriteIOPortOp "writeIOPort#" GenPrimOp
-   IOPort# s a_levpoly -> a_levpoly -> State# s -> (# State# s, Int# #)
-   {If 'IOPort#' is full, immediately return with integer 0,
-    throwing an 'IOPortException'.
-    Otherwise, store value arg as 'IOPort#''s new contents,
-    and return with integer 1. }
-   with
-   out_of_line      = True
-   effect = ReadWriteEffect
-
-------------------------------------------------------------------------
 section "Delay/wait operations"
 ------------------------------------------------------------------------
 
@@ -3666,7 +3682,6 @@ primop  ReallyUnsafePtrEqualityOp "reallyUnsafePtrEquality#" GenPrimOp
 --   sameMutVar# :: MutVar# s a -> MutVar# s a -> Int#
 --   sameTVar# :: TVar# s a -> TVar# s a -> Int#
 --   sameMVar# :: MVar# s a -> MVar# s a -> Int#
---   sameIOPort# :: IOPort# s a -> IOPort# s a -> Int#
 --   eqStableName# :: StableName# a -> StableName# b -> Int#
 --
 -- These operations are all specialisations of unsafePtrEquality#.
@@ -3912,6 +3927,16 @@ primop  ClearCCSOp "clearCCS#" GenPrimOp
    out_of_line = True
 
 ------------------------------------------------------------------------
+section "Annotating call stacks"
+------------------------------------------------------------------------
+
+primop AnnotateStackOp "annotateStack#" GenPrimOp
+   b -> (State# s -> (# State# s, a_reppoly #)) -> State# s -> (# State# s, a_reppoly #)
+   { Pushes an annotation frame to the stack which can be reported by backtraces. }
+   with
+   out_of_line = True
+
+------------------------------------------------------------------------
 section "Info Table Origin"
 ------------------------------------------------------------------------
 primop WhereFromOp "whereFrom#" GenPrimOp
@@ -4018,6 +4043,15 @@ primop  SetThreadAllocationCounter "setThreadAllocationCounter#" GenPrimOp
    effect = ReadWriteEffect
    out_of_line      = True
 
+primop  SetOtherThreadAllocationCounter "setOtherThreadAllocationCounter#" GenPrimOp
+   Int64# -> ThreadId# -> State# RealWorld -> State# RealWorld
+   { Sets the allocation counter for the another thread to the given value.
+     This doesn't take allocations into the current nursery chunk into account.
+     Therefore it is only accurate if the other thread is not currently running. }
+   with
+   effect = ReadWriteEffect
+   out_of_line      = True
+
 primtype StackSnapshot#
    { Haskell representation of a @StgStack*@ that was created (cloned)
      with a function in "GHC.Stack.CloneStack". Please check the
@@ -4109,12 +4143,13 @@ primop VecPackOp "pack#" GenPrimOp
 
 primop VecUnpackOp "unpack#" GenPrimOp
    VECTOR -> VECTUPLE
-   { Unpack the elements of a vector into an unboxed tuple. #}
+   { Unpack the elements of a vector into an unboxed tuple. }
    with vector = ALL_VECTOR_TYPES
 
 primop VecInsertOp "insert#" GenPrimOp
    VECTOR -> SCALAR -> Int# -> VECTOR
-   { Insert a scalar at the given position in a vector. }
+   { Insert a scalar at the given position in a vector.
+     The position must be a compile-time constant. }
    with effect = CanFail
         vector = ALL_VECTOR_TYPES
 
@@ -4143,15 +4178,24 @@ primop VecDivOp "divide#" GenPrimOp
 
 primop VecQuotOp "quot#" GenPrimOp
    VECTOR -> VECTOR -> VECTOR
-   { Rounds towards zero element-wise. }
+   { Rounds towards zero element-wise.
+
+     Note: Most CPU ISAs do not contain any SIMD integer division instructions.
+     Do not expect high performance. }
    with effect = CanFail
         vector = INT_VECTOR_TYPES
+        div_like = True
 
 primop VecRemOp "rem#" GenPrimOp
    VECTOR -> VECTOR -> VECTOR
-   { Satisfies @('quot#' x y) 'times#' y 'plus#' ('rem#' x y) == x@. }
+   { Satisfies @('quot#' x y) 'times#' y 'plus#' ('rem#' x y) == x@.
+
+     Note: Most CPU ISAs do not contain any SIMD integer division instructions.
+     Do not expect high performance. }
    with effect = CanFail
         vector = INT_VECTOR_TYPES
+        div_like = True
+
 
 primop VecNegOp "negate#" GenPrimOp
    VECTOR -> VECTOR
@@ -4160,40 +4204,43 @@ primop VecNegOp "negate#" GenPrimOp
 
 primop VecIndexByteArrayOp "indexArray#" GenPrimOp
    ByteArray# -> Int# -> VECTOR
-   { Read a vector from specified index of immutable array. }
+   { Read a vector from the specified index of an immutable array.
+     The index is counted in units of SIMD vectors (not scalar elements). }
    with effect = CanFail
         vector = ALL_VECTOR_TYPES
 
 primop VecReadByteArrayOp "readArray#" GenPrimOp
    MutableByteArray# s -> Int# -> State# s -> (# State# s, VECTOR #)
-   { Read a vector from specified index of mutable array. }
+   { Read a vector from the specified index of a mutable array.
+     The index is counted in units of SIMD vectors (not scalar elements). }
    with effect = ReadWriteEffect
         can_fail_warning = YesWarnCanFail
         vector = ALL_VECTOR_TYPES
 
 primop VecWriteByteArrayOp "writeArray#" GenPrimOp
    MutableByteArray# s -> Int# -> VECTOR -> State# s -> State# s
-   { Write a vector to specified index of mutable array. }
+   { Write a vector to the specified index of a mutable array.
+     The index is counted in units of SIMD vectors (not scalar elements). }
    with effect = ReadWriteEffect
         can_fail_warning = YesWarnCanFail
         vector = ALL_VECTOR_TYPES
 
 primop VecIndexOffAddrOp "indexOffAddr#" GenPrimOp
    Addr# -> Int# -> VECTOR
-   { Reads vector; offset in bytes. }
+   { Reads vector; offset in units of SIMD vectors (not scalar elements). }
    with effect = CanFail
         vector = ALL_VECTOR_TYPES
 
 primop VecReadOffAddrOp "readOffAddr#" GenPrimOp
    Addr# -> Int# -> State# s -> (# State# s, VECTOR #)
-   { Reads vector; offset in bytes. }
+   { Reads vector; offset in units of SIMD vectors (not scalar elements). }
    with effect = ReadWriteEffect
         can_fail_warning = YesWarnCanFail
         vector = ALL_VECTOR_TYPES
 
 primop VecWriteOffAddrOp "writeOffAddr#" GenPrimOp
    Addr# -> Int# -> VECTOR -> State# s -> State# s
-   { Write vector; offset in bytes. }
+   { Write vector; offset in units of SIMD vectors (not scalar elements). }
    with effect = ReadWriteEffect
         can_fail_warning = YesWarnCanFail
         vector = ALL_VECTOR_TYPES
@@ -4263,7 +4310,7 @@ primop   VecFNMSub   "fnmsub#" GenPrimOp
 primop VecShuffleOp "shuffle#" GenPrimOp
   VECTOR -> VECTOR -> INTVECTUPLE -> VECTOR
   {Shuffle elements of the concatenation of the input two vectors
-  into the result vector.}
+  into the result vector. The indices must be compile-time constants.}
    with vector = ALL_VECTOR_TYPES
 
 primop VecMinOp "min#" GenPrimOp

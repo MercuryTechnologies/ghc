@@ -1,7 +1,5 @@
 
 {-# LANGUAGE DeriveFunctor #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 {-# LANGUAGE NamedFieldPuns #-}
 
 {-
@@ -51,16 +49,14 @@ import GHC.Tc.Utils.Env
 
 import GHC.Core
 import GHC.Core.Unfold
--- import GHC.Core.Unfold.Make
 import GHC.Core.FVs
 import GHC.Core.Tidy
 import GHC.Core.Seq         ( seqBinds )
 import GHC.Core.Opt.Arity   ( exprArity, typeArity, exprBotStrictness_maybe )
 import GHC.Core.InstEnv
 import GHC.Core.Type
-import GHC.Core.DataCon
 import GHC.Core.TyCon
-import GHC.Core.Class
+import GHC.Core.TyCo.Tidy
 import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
 
 import GHC.Iface.Tidy.StaticPtrTable
@@ -72,16 +68,15 @@ import GHC.Utils.Panic
 import GHC.Utils.Logger as Logger
 import qualified GHC.Utils.Error as Err
 
-import GHC.Types.DefaultEnv ( emptyDefaultEnv )
 import GHC.Types.ForeignStubs
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Var
 import GHC.Types.Id
-import GHC.Types.Id.Make ( mkDictSelRhs )
 import GHC.Types.Id.Info
 import GHC.Types.Demand  ( isDeadEndAppSig, isNopSig, nopSig, isDeadEndSig )
 import GHC.Types.Basic
+import GHC.Types.TyThing( implicitTyConThings )
 import GHC.Types.Name hiding (varName)
 import GHC.Types.Name.Set
 import GHC.Types.Name.Cache
@@ -178,7 +173,8 @@ mkBootModDetailsTc logger
                   tcg_insts            = insts,
                   tcg_fam_insts        = fam_insts,
                   tcg_complete_matches = complete_matches,
-                  tcg_mod              = this_mod
+                  tcg_mod              = this_mod,
+                  tcg_default_exports  = default_exports
                 }
   = -- This timing isn't terribly useful since the result isn't forced, but
     -- the message is useful to locating oneself in the compilation process.
@@ -186,7 +182,7 @@ mkBootModDetailsTc logger
                    (text "CoreTidy"<+>brackets (ppr this_mod))
                    (const ()) $
     return (ModDetails { md_types            = type_env'
-                       , md_defaults         = emptyDefaultEnv
+                       , md_defaults         = default_exports
                        , md_insts            = insts'
                        , md_fam_insts        = fam_insts
                        , md_rules            = []
@@ -407,16 +403,12 @@ tidyProgram opts (ModGuts { mg_module           = mod
                           , mg_deps             = deps
                           , mg_foreign          = foreign_stubs
                           , mg_foreign_files    = foreign_files
-                          , mg_hpc_info         = hpc_info
                           , mg_modBreaks        = modBreaks
                           , mg_boot_exports     = boot_exports
                           }) = do
 
-  let implicit_binds = concatMap getImplicitBinds tcs
-      all_binds = implicit_binds ++ binds
-
-  (unfold_env, tidy_occ_env) <- chooseExternalIds opts mod all_binds imp_rules
-  let (trimmed_binds, trimmed_rules) = findExternalRules opts all_binds imp_rules unfold_env
+  (unfold_env, tidy_occ_env) <- chooseExternalIds opts mod tcs binds imp_rules
+  let (trimmed_binds, trimmed_rules) = findExternalRules opts binds imp_rules unfold_env
 
   (tidy_env, tidy_binds) <- tidyTopBinds unfold_env boot_exports tidy_occ_env trimmed_binds
 
@@ -479,8 +471,10 @@ tidyProgram opts (ModGuts { mg_module           = mod
                  , cg_ccs           = S.toList local_ccs
                  , cg_foreign       = all_foreign_stubs
                  , cg_foreign_files = foreign_files
-                 , cg_dep_pkgs      = dep_direct_pkgs deps
-                 , cg_hpc_info      = hpc_info
+                 -- TODO: Check whether we need to account for levels here.
+                 -- It seems that this field just gets used to write a comment
+                 -- in C codegen, so it's value doesn't affect an important result.
+                 , cg_dep_pkgs      = S.map snd (dep_direct_pkgs deps)
                  , cg_modBreaks     = modBreaks
                  , cg_spt_entries   = spt_entries
                  }
@@ -591,83 +585,7 @@ of exceptions, and finally I gave up the battle:
     modest cost in interface file growth, which is limited to the
     bits reqd to describe those data constructors.
 
-************************************************************************
-*                                                                      *
-        Implicit bindings
-*                                                                      *
-************************************************************************
-
-Note [Injecting implicit bindings]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We inject the implicit bindings right at the end, in GHC.Core.Tidy.
-Some of these bindings, notably record selectors, are not
-constructed in an optimised form.  E.g. record selector for
-        data T = MkT { x :: {-# UNPACK #-} !Int }
-Then the unfolding looks like
-        x = \t. case t of MkT x1 -> let x = I# x1 in x
-This generates bad code unless it's first simplified a bit.  That is
-why GHC.Core.Unfold.mkImplicitUnfolding uses simpleOptExpr to do a bit of
-optimisation first.  (Only matters when the selector is used curried;
-eg map x ys.)  See #2070.
-
-[Oct 09: in fact, record selectors are no longer implicit Ids at all,
-because we really do want to optimise them properly. They are treated
-much like any other Id.  But doing "light" optimisation on an implicit
-Id still makes sense.]
-
-At one time I tried injecting the implicit bindings *early*, at the
-beginning of SimplCore.  But that gave rise to real difficulty,
-because GlobalIds are supposed to have *fixed* IdInfo, but the
-simplifier and other core-to-core passes mess with IdInfo all the
-time.  The straw that broke the camels back was when a class selector
-got the wrong arity -- ie the simplifier gave it arity 2, whereas
-importing modules were expecting it to have arity 1 (#2844).
-It's much safer just to inject them right at the end, after tidying.
-
-Oh: two other reasons for injecting them late:
-
-  - If implicit Ids are already in the bindings when we start tidying,
-    we'd have to be careful not to treat them as external Ids (in
-    the sense of chooseExternalIds); else the Ids mentioned in *their*
-    RHSs will be treated as external and you get an interface file
-    saying      a18 = <blah>
-    but nothing referring to a18 (because the implicit Id is the
-    one that does, and implicit Ids don't appear in interface files).
-
-  - More seriously, the tidied type-envt will include the implicit
-    Id replete with a18 in its unfolding; but we won't take account
-    of a18 when computing a fingerprint for the class; result chaos.
-
-There is one sort of implicit binding that is injected still later,
-namely those for data constructor workers. Reason (I think): it's
-really just a code generation trick.... binding itself makes no sense.
-See Note [Data constructor workers] in "GHC.CoreToStg.Prep".
 -}
-
-getImplicitBinds :: TyCon -> [CoreBind]
-getImplicitBinds tc = cls_binds ++ getTyConImplicitBinds tc
-  where
-    cls_binds = maybe [] getClassImplicitBinds (tyConClass_maybe tc)
-
-getTyConImplicitBinds :: TyCon -> [CoreBind]
-getTyConImplicitBinds tc
-  | isDataTyCon tc = [ NonRec wrap_id rhs
-                     | dc <- tyConDataCons tc
-                     , let wrap_id = dataConWrapId dc
-                         -- For data cons with no wrapper, this wrap_id
-                         -- is in fact a DataConWorkId, and hence
-                         -- dataConWrapUnfolding_maybe returns Nothing
-                     , Just rhs <- [dataConWrapUnfolding_maybe wrap_id] ]
-
-  | otherwise      = []
-    -- The 'otherwise' includes family TyCons of course, but also (less obviously)
-    --  * Newtypes: see Note [Compulsory newtype unfolding] in GHC.Types.Id.Make
-    --  * type data: we don't want any code for type-only stuff (#24620)
-
-getClassImplicitBinds :: Class -> [CoreBind]
-getClassImplicitBinds cls
-  = [ NonRec op (mkDictSelRhs cls val_index)
-    | (op, val_index) <- classAllSelIds cls `zip` [0..] ]
 
 {-
 ************************************************************************
@@ -688,12 +606,13 @@ type UnfoldEnv  = IdEnv (Name{-new name-}, Bool {-show unfolding-})
 
 chooseExternalIds :: TidyOpts
                   -> Module
+                  -> [TyCon]
                   -> [CoreBind]
                   -> [CoreRule]
                   -> IO (UnfoldEnv, TidyOccEnv)
                   -- Step 1 from the notes above
 
-chooseExternalIds opts mod binds imp_id_rules
+chooseExternalIds opts mod tcs binds imp_id_rules
   = do { (unfold_env1,occ_env1) <- search init_work_list emptyVarEnv init_occ_env
        ; let internal_ids = filter (not . (`elemVarEnv` unfold_env1)) binders
        ; tidy_internal internal_ids unfold_env1 occ_env1 }
@@ -724,17 +643,16 @@ chooseExternalIds opts mod binds imp_id_rules
   binders          = map fst $ flattenBinds binds
   binder_set       = mkVarSet binders
 
-  avoids   = [getOccName name | bndr <- binders,
-                                let name = idName bndr,
-                                isExternalName name ]
+  avoids   = [ getOccName name | bndr <- binders,
+                                 let name = idName bndr,
+                                 isExternalName name ]
+          ++ [ getOccName thing | tc <- tcs
+                                , thing <- implicitTyConThings tc ]
                 -- In computing our "avoids" list, we must include
                 --      all implicit Ids
                 --      all things with global names (assigned once and for
                 --                                      all by the renamer)
                 -- since their names are "taken".
-                -- The type environment is a convenient source of such things.
-                -- In particular, the set of binders doesn't include
-                -- implicit Ids at this stage.
 
         -- We also make sure to avoid any exported binders.  Consider
         --      f{-u1-} = 1     -- Local decl
@@ -955,7 +873,7 @@ dffvExpr :: CoreExpr -> DFFV ()
 dffvExpr (Var v)              = insert v
 dffvExpr (App e1 e2)          = dffvExpr e1 >> dffvExpr e2
 dffvExpr (Lam v e)            = extendScope v (dffvExpr e)
-dffvExpr (Tick (Breakpoint _ _ ids _) e) = mapM_ insert ids >> dffvExpr e
+dffvExpr (Tick (Breakpoint _ _ ids) e) = mapM_ insert ids >> dffvExpr e
 dffvExpr (Tick _other e)    = dffvExpr e
 dffvExpr (Cast e _)           = dffvExpr e
 dffvExpr (Let (NonRec x r) e) = dffvBind (x,r) >> extendScope x (dffvExpr e)
@@ -1315,7 +1233,9 @@ tidyTopPair unfold_env boot_exports rhs_tidy_env (bndr, rhs)
     (bndr1, rhs1)
 
   where
-    Just (name',show_unfold) = lookupVarEnv unfold_env bndr
+    (name',show_unfold) = case lookupVarEnv unfold_env bndr of
+                            Just stuff -> stuff
+                            Nothing    -> pprPanic "tidyTopPair" (ppr bndr)
     !cbv_bndr = tidyCbvInfoTop boot_exports bndr rhs
     bndr1    = mkGlobalId details name' ty' idinfo'
     details  = idDetails cbv_bndr -- Preserve the IdDetails
@@ -1367,7 +1287,7 @@ tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
 
     sig = dmdSigInfo idinfo
     final_sig | not (isNopSig sig)
-              = warnPprTrace (_bottom_hidden sig) "tidyTopIdInfo" (ppr name) sig
+              = warnPprTrace (bottom_hidden sig) "tidyTopIdInfo" (ppr name <+> ppr sig) sig
 
               -- No demand signature, so try a
               -- cheap-and-cheerful bottom analyser
@@ -1383,7 +1303,7 @@ tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
               | otherwise
               = cpr
 
-    _bottom_hidden id_sig
+    bottom_hidden id_sig
       = case mb_bot_str of
           Nothing            -> False
           Just (arity, _, _) -> not (isDeadEndAppSig id_sig arity)
@@ -1567,4 +1487,3 @@ mustExposeTyCon no_trim_types exports tc
     exported_con con = any (`elemNameSet` exports)
                            (dataConName con : dataConFieldLabels con)
 -}
-

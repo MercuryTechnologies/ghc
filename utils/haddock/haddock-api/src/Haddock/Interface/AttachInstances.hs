@@ -31,7 +31,6 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.Ord (comparing)
 import qualified Data.Sequence as Seq
-import qualified Data.Set as Set
 import GHC
 import GHC.Builtin.Types (unrestrictedFunTyConName)
 import GHC.Core (isOrphan)
@@ -62,12 +61,8 @@ import GHC.Unit.State
 import GHC.Utils.Outputable (sep, text, (<+>))
 
 import Haddock.Convert
-import Haddock.GhcUtils (typeNames)
+import Haddock.GhcUtils (isNameHidden, isTypeHidden)
 import Haddock.Types
-
-type ExportedNames = Set.Set Name
-type Modules = Set.Set Module
-type ExportInfo = (ExportedNames, Modules)
 
 -- Also attaches fixities
 attachInstances :: ExportInfo -> [Interface] -> InstIfaceMap -> Bool -> Ghc [Interface]
@@ -78,7 +73,7 @@ attachInstances expInfo ifaces instIfaceMap isOneShot = do
   --
   -- See https://github.com/haskell/haddock/issues/469.
   env <- getSession
-  let mod_to_pkg_conf = moduleNameProvidersMap $ ue_units $ hsc_unit_env env
+  let mod_to_pkg_conf = moduleNameProvidersMap $ ue_homeUnitState $ hsc_unit_env env
       mods =
         mkModuleSet
           [ m
@@ -93,7 +88,10 @@ attachInstances expInfo ifaces instIfaceMap isOneShot = do
           , fromOrig == Just True || not (null reExp)
           ]
       mods_to_load = moduleSetElts mods
-      mods_visible = mkModuleSet $ map ifaceMod ifaces
+      -- We need to ensure orphans in modules outside of this package are included.
+      -- See https://gitlab.haskell.org/ghc/ghc/-/issues/25147
+      -- and https://gitlab.haskell.org/ghc/ghc/-/issues/26079
+      mods_visible = mkModuleSet $ concatMap (liftA2 (:) ifaceMod ifaceOrphanDeps) ifaces
 
   (_msgs, mb_index) <- do
     hsc_env <- getSession
@@ -389,16 +387,6 @@ instFam FamInst{fi_fam = n, fi_tys = ts, fi_rhs = t} =
 -- Filtering hidden instances
 --------------------------------------------------------------------------------
 
--- | A class or data type is hidden iff
---
--- * it is defined in one of the modules that are being processed
---
--- * and it is not exported by any non-hidden module
-isNameHidden :: ExportInfo -> Name -> Bool
-isNameHidden (names, modules) name =
-  nameModule name `Set.member` modules
-    && not (name `Set.member` names)
-
 -- | We say that an instance is «hidden» iff its class or any (part)
 -- of its type(s) is hidden.
 isInstanceHidden :: ExportInfo -> Name -> [Type] -> Bool
@@ -410,12 +398,3 @@ isInstanceHidden expInfo cls tyNames =
 
     instTypeHidden :: Bool
     instTypeHidden = any (isTypeHidden expInfo) tyNames
-
-isTypeHidden :: ExportInfo -> Type -> Bool
-isTypeHidden expInfo = typeHidden
-  where
-    typeHidden :: Type -> Bool
-    typeHidden t = any nameHidden $ typeNames t
-
-    nameHidden :: Name -> Bool
-    nameHidden = isNameHidden expInfo

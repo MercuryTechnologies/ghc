@@ -548,7 +548,7 @@ The available mode flags are:
 
     Print ``YES`` if GHC was compiled to use symbols with leading underscores
     in object files, ``NO`` otherwise.
-    This is usually atarget platform dependent.
+    This is usually target platform dependent.
 
 .. ghc-flag:: --print-libdir
     :shortdesc: display GHC library directory
@@ -752,7 +752,7 @@ search path (see :ref:`search-path`).
 GHC Jobserver Protocol
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The GHC Jobserver Protocol was specified in `GHC proposal #540 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0540-jsem.rst>`__.
+The GHC Jobserver Protocol was specified in `GHC Proposal #540 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0540-jsem.rst>`__.
 
 This protocol allows
 a server to dynamically invoke many instances of a client process,
@@ -835,8 +835,12 @@ pass to ``--make`` mode.
 
 Then when the compiler starts in ``--make`` mode it will compile both units ``a`` and ``b``.
 
-There is also very basic support for multiple home units in GHCi, at the moment you can start
-a GHCi session with multiple units but only the `:reload`:ghci-cmd: is supported.
+GHCi has full support for multiple home units.
+Multiple home units can be given via the `-unit @⟨filename⟩`:ghc-flag:.
+
+.. code-block:: none
+
+    ghc --interactive -unit @unitA -unit @unitB
 
 .. ghc-flag:: -unit @⟨filename⟩
     :shortdesc: Specify the options to build a specific unit.
@@ -1677,6 +1681,18 @@ Some flags only make sense for particular target platforms.
 
     (x86 only) Use the SSE3 instruction set to
     implement some floating point and bit operations
+    (whether using the :ref:`native code generator <native-code-gen>`
+    or the :ref:`LLVM backend <llvm-code-gen>`).
+
+.. ghc-flag:: -mssse3
+    :shortdesc: (x86 only) Use SSSE3 for vector operations
+    :type: dynamic
+    :category: platform-options
+
+    :since: 9.14.1
+
+    (x86 only) Use the SSSE3 instruction set to
+    implement some vector operations
     (whether using the :ref:`native code generator <native-code-gen>`
     or the :ref:`LLVM backend <llvm-code-gen>`).
 

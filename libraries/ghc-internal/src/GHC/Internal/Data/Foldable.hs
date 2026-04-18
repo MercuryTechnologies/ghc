@@ -66,7 +66,7 @@ import GHC.Internal.Arr  ( Array(..), elems, numElements,
                   foldl1Elems, foldr1Elems)
 import GHC.Internal.Base hiding ( foldr )
 import GHC.Internal.Generics
-import GHC.Tuple (Solo (..))
+import GHC.Internal.Tuple (Solo (..))
 import GHC.Internal.Num  ( Num(..) )
 
 -- $setup
@@ -709,7 +709,7 @@ instance Foldable [] where
 
 -- | @since base-4.9.0.0
 instance Foldable NonEmpty where
-  foldr f z ~(a :| as) = f a (List.foldr f z as)
+  foldr f z (a :| as) = f a (List.foldr f z as)
   foldl f z (a :| as) = List.foldl f (f z a) as
   foldl1 f (a :| as) = List.foldl f a as
 
@@ -729,9 +729,9 @@ instance Foldable NonEmpty where
   -- The default definition also works great for null and foldl'.
   -- As usual for cons lists, foldr' is basically hopeless.
 
-  foldMap f ~(a :| as) = f a `mappend` foldMap f as
-  fold ~(m :| ms) = m `mappend` fold ms
-  toList ~(a :| as) = a : as
+  foldMap f (a :| as) = f a `mappend` foldMap f as
+  fold (m :| ms) = m `mappend` fold ms
+  toList (a :| as) = a : as
 
 -- | @since base-4.7.0.0
 instance Foldable (Either a) where
@@ -1529,4 +1529,3 @@ the number of elements combined).  The `mconcat` implementations for `Text` and
 `ByteString` preallocate the required storage, and then combine all the list
 elements in a single pass.
 -}
-

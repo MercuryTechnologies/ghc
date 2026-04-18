@@ -22,32 +22,37 @@ where
 import GHC.Prelude
 
 import GHC.Core
-
-import GHC.HsToCore.Monad
 import GHC.Core.Utils
 import GHC.Core.Make
-import GHC.Types.SourceText
-import GHC.Types.Id.Make
-import GHC.Types.ForeignCall
 import GHC.Core.DataCon
-import GHC.HsToCore.Utils
-
-import GHC.Tc.Utils.TcType
 import GHC.Core.Type
 import GHC.Core.Multiplicity
 import GHC.Core.Coercion
-import GHC.Builtin.Types.Prim
 import GHC.Core.TyCon
-import GHC.Builtin.Types
+import GHC.Core.Predicate( tyCoVarsOfTypeWellScoped )
+
+import GHC.HsToCore.Monad
+import GHC.HsToCore.Utils
+
+import GHC.Types.SourceText
+import GHC.Types.Id.Make
+import GHC.Types.ForeignCall
 import GHC.Types.Basic
 import GHC.Types.Literal
+import GHC.Types.RepType (typePrimRep1)
+
+import GHC.Tc.Utils.TcType
+
+import GHC.Builtin.Types.Prim
+import GHC.Builtin.Types
 import GHC.Builtin.Names
+
 import GHC.Driver.DynFlags
+
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
 import Data.Maybe
-import GHC.Types.RepType (typePrimRep1)
 
 {-
 Desugaring of @ccall@s consists of adding some state manipulation,
@@ -143,7 +148,7 @@ unboxArg arg
     (isUnboxedTupleType arg_ty && typePrimRep1 arg_ty == VoidRep)
   = return (arg, \body -> body)
 
-  -- Recursive newtypes
+  -- Possibly-recursive newtypes
   | Just(co, _rep_ty) <- topNormaliseNewType_maybe arg_ty
   = unboxArg (mkCastDs arg co)
 
@@ -336,8 +341,10 @@ resultWrapper result_ty
   -- Data types with a single constructor, which has a single arg
   -- This includes types like Ptr and ForeignPtr
   | Just (tycon, tycon_arg_tys) <- maybe_tc_app
-  , Just data_con <- tyConSingleAlgDataCon_maybe tycon  -- One constructor
-  , null (dataConExTyCoVars data_con)                   -- no existentials
+  , not (isNewTyCon tycon)  -- Newtypes should have been dealt with above, but
+                            -- a recursive one might fall through here, I think
+  , Just data_con <- tyConSingleDataCon_maybe tycon  -- One constructor
+  , null (dataConExTyCoVars data_con)                -- no existentials
   , [Scaled _ unwrapped_res_ty] <- dataConInstOrigArgTys data_con tycon_arg_tys  -- One argument
   = do { (maybe_ty, wrapper) <- resultWrapper unwrapped_res_ty
        ; let marshal_con e  = Var (dataConWrapId data_con)

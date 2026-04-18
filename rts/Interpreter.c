@@ -27,6 +27,24 @@ c)  When the interpreter pushes a reference inspect the closure of the object
 
 For now we use approach c). Mostly because it's easiest to implement. We also don't
 tag functions as tag inference currently doesn't rely on those being properly tagged.
+
+
+Note [Subwords in the interpreter]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+To retain our sanity while dealing with little and big endian we strive to:
+* Store subwords as zero extended words to the stack in host byte order.
+* Read full words from the stack and truncated to actual width after.
+This ensures we generally don't have to worry about litte vs big endian.
+
+There are two exceptions:
+* When allocating a constructor we use PUSH_UBX8/PUSH8 and their variants to store
+  subwords exactly at SP. This allows us to allocate a constructor with packed values
+  via memcpy from the stack to the heap after setting up the stack appropriately.
+  on the heap.
+* When we use PUSH_UBX<width> to push literals to the stack we add instructions
+  to add padding such that it will result in a full words in host byte order on the stack.
+
+See also Note [Width of parameters] for some more motivation.
 */
 
 #include "rts/PosixSource.h"
@@ -160,16 +178,105 @@ tag functions as tag inference currently doesn't rely on those being properly ta
 #define Sp_plusB(n)  ((void *)((StgWord8*)Sp + (ptrdiff_t)(n)))
 #define Sp_minusB(n) ((void *)((StgWord8*)Sp - (ptrdiff_t)(n)))
 
-#define Sp_plusW(n)  (Sp_plusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(W_)))
-#define Sp_minusW(n) (Sp_minusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(W_)))
+#define Sp_plusW(n)    ((void*)Sp_plusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(W_)))
+#define Sp_plusW64(n)  ((void*)Sp_plusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(StgWord64)))
+#define Sp_minusW(n)   ((void*)Sp_minusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(W_)))
 
 #define Sp_addB(n)   (Sp = Sp_plusB(n))
 #define Sp_subB(n)   (Sp = Sp_minusB(n))
 #define Sp_addW(n)   (Sp = Sp_plusW(n))
+#define Sp_addW64(n) (Sp = Sp_plusW64(n))
 #define Sp_subW(n)   (Sp = Sp_minusW(n))
 
-#define SpW(n)       (*(StgWord*)(Sp_plusW(n)))
-#define SpB(n)       (*(StgWord*)(Sp_plusB(n)))
+// Assumes stack location is within stack chunk bounds
+#define SpW(n)      (*(StgWord*)(Sp_plusW(n)))
+#define SpW64(n)    (*(StgWord*)(Sp_plusW64(n)))
+
+#define WITHIN_CAP_CHUNK_BOUNDS_W(n)  WITHIN_CHUNK_BOUNDS_W(n, cap->r.rCurrentTSO->stackobj)
+
+#define WITHIN_CHUNK_BOUNDS_W(n, s)  \
+    (RTS_LIKELY(((StgWord*) Sp_plusW(n)) < ((s)->stack + (s)->stack_size - sizeofW(StgUnderflowFrame))))
+
+
+#define W64_TO_WDS(n) ((n * sizeof(StgWord64) / sizeof(StgWord)))
+
+// Always safe to use - Return the value at the address
+#define ReadSpW(n)       (*((StgWord*)   SafeSpWP(n)))
+//Argument is offset in multiples of word64
+#define ReadSpW64(n)     (*((StgWord64*) SafeSpWP(W64_TO_WDS(n))))
+// Perhaps confusingly this still reads a full word, merely the offset is in bytes.
+#define ReadSpB(n)       (*((StgWord*)   SafeSpBP(n)))
+
+/* Note [PUSH_L underflow]
+   ~~~~~~~~~~~~~~~~~~~~~~~
+BCOs can be nested, resulting in nested BCO stack frames where the inner most
+stack frame can refer to variables stored on earlier stack frames via the
+PUSH_L instruction.
+
+|---------|
+|  BCO_1  | -<-┐
+|---------|    |
+ .........     |
+|---------|    | PUSH_L <n>
+|  BCO_N  | ->-┘
+|---------|
+
+Here BCO_N is syntactically nested within the code for BCO_1 and will result
+in code that references the prior stack frame of BCO_1 for some of its local
+variables. If a stack overflow happens between the creation of the stack frame
+for BCO_1 and BCO_N the RTS might move BCO_N to a new stack chunk while leaving
+BCO_1 in place, invalidating a simple offset based reference to the outer stack
+frames.
+Therefore `SafeSpW` first performs a bounds check to ensure that accesses onto
+the stack will succeed. If the target address would not be a valid location for
+the current stack chunk then `slow_sp` function is called, which dereferences
+the underflow frame to adjust the offset before performing the lookup.
+
+               ┌->--x   |  CHK_1  |
+|  CHK_2  |    |    |   |---------|
+|---------|    |    └-> |  BCO_1  |
+| UD_FLOW | -- x        |---------|
+|---------|    |
+| ......  |    |
+|---------|    | PUSH_L <n>
+|  BCO_ N | ->-┘
+|---------|
+
+To keep things simpler all accesses to the stack which might go beyond the stack
+chunk go through one of the ReadSP* or SafeSP* macros.
+When writing to the stack there is no need for checks, we ensured we have space
+in the current chunk ahead of time. So there we use SpW and it's variants which
+omit the stack bounds check.
+
+See ticket #25750
+
+*/
+
+// Returns a pointer to the stack location.
+#define SafeSpWP(n)      \
+  ( ((WITHIN_CAP_CHUNK_BOUNDS_W(n)) ? Sp_plusW(n) : slow_spw(Sp, cap->r.rCurrentTSO->stackobj, n)))
+#define SafeSpBP(off_w)      \
+  ( (WITHIN_CAP_CHUNK_BOUNDS_W((1+(off_w))/sizeof(StgWord))) ? \
+        Sp_plusB(off_w) : \
+        (void*)((ptrdiff_t)((ptrdiff_t)(off_w) % (ptrdiff_t)sizeof(StgWord)) + (StgWord8*)slow_spw(Sp, cap->r.rCurrentTSO->stackobj, (off_w)/sizeof(StgWord))) \
+    )
+
+
+
+/* Note [Interpreter subword primops]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In general the interpreter stack is host-platform word aligned.
+We keep with this convention when evaluating primops for simplicity.
+
+This means:
+
+* All arguments are pushed extended to word size.
+* Results are written to the stack extended to word size.
+
+The only exception are constructor allocations where we push unaligned subwords
+on the stack which are cleaned up by the PACK instruction afterwards.
+
+*/
 
 STATIC_INLINE StgPtr
 allocate_NONUPD (Capability *cap, int n_words)
@@ -177,27 +284,123 @@ allocate_NONUPD (Capability *cap, int n_words)
     return allocate(cap, stg_max(sizeofW(StgHeader)+MIN_PAYLOAD_SIZE, n_words));
 }
 
-int rts_stop_next_breakpoint = 0;
+STATIC_INLINE int
+is_ret_bco_frame(const StgPtr frame_head) {
+  return ( (W_)frame_head == (W_)&stg_ret_t_info
+        || (W_)frame_head == (W_)&stg_ret_v_info
+        || (W_)frame_head == (W_)&stg_ret_p_info
+        || (W_)frame_head == (W_)&stg_ret_n_info
+        || (W_)frame_head == (W_)&stg_ret_f_info
+        || (W_)frame_head == (W_)&stg_ret_d_info
+        || (W_)frame_head == (W_)&stg_ret_l_info
+      );
+}
+
 int rts_stop_on_exception = 0;
+
+/* ---------------------------------------------------------------------------
+ * Enabling and disabling global single step mode
+ * ------------------------------------------------------------------------ */
+
+/* A global toggle for single-step mode.
+ * Unlike `TSO_STOP_NEXT_BREAKPOINT`, which sets single-step mode per-thread,
+ * `rts_stop_next_breakpoint` globally enables single-step mode. If enabled, we
+ * will stop at the immediate next breakpoint regardless of what thread it is in. */
+int rts_stop_next_breakpoint = 0;
+
+void rts_enableStopNextBreakpointAll(void)
+{
+  rts_stop_next_breakpoint = 1;
+}
+
+void rts_disableStopNextBreakpointAll(void)
+{
+  rts_stop_next_breakpoint = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Enabling and disabling per-thread single step mode
+ * ------------------------------------------------------------------------ */
+
+void rts_enableStopNextBreakpoint(StgTSO* tso)
+{
+    tso->flags |= TSO_STOP_NEXT_BREAKPOINT;
+}
+
+void rts_disableStopNextBreakpoint(StgTSO* tso)
+{
+    tso->flags &= ~TSO_STOP_NEXT_BREAKPOINT;
+}
+
+/* ---------------------------------------------------------------------------
+ * Enabling and disabling per-thread step-out mode
+ * ------------------------------------------------------------------------ */
+
+void rts_enableStopAfterReturn(StgTSO* tso)
+{
+  tso->flags |= TSO_STOP_AFTER_RETURN;
+}
+
+void rts_disableStopAfterReturn(StgTSO* tso)
+{
+  tso->flags &= ~TSO_STOP_AFTER_RETURN;
+}
+
+/*
+Note [Debugger: Step-out]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+When the per-thread debugger step-out flag is set (`TSO_STOP_AFTER_RETURN`),
+the interpreter must guarantee we stop when the current BCO returns to the
+continuation (represented by the first RET_BCO frame after the current frame on
+the stack). Those are the interpreter step-out semantics: stop after returning
+to the continuation.
+
+To achieve this, when the flag is set as the interpreter is re-entered:
+  (1) Traverse the stack until a RET_BCO frame is found or we otherwise hit the
+      bottom (STOP_FRAME).
+  (2) Look for a BRK_FUN instruction heading the BCO instructions (a
+      breakpoint, when present, is always the first instruction in a BCO)
+
+      The breakpoint can be enabled by setting the associated BreakArray at the
+      associated internal breakpoint index to 0.
+
+By simply enabling the breakpoint heading the continuation we can ensure that
+when it is returned to we will stop there without additional work -- it
+leverages the existing break point insertion process and stopping mechanisms.
+
+See Note [Debugger: Filtering step-out stops] for details on how the
+interpreter further filters the continuation we stop at to make sure we onky
+break on a continuation outside of the function from which step-out was
+initiated.
+
+A limitation of this approach is that stepping-out of a function that was
+tail-called will skip its caller since no stack frame is pushed for a tail
+call (i.e. a tail call returns directly to its caller's first non-tail caller).
+*/
+/* -------------------------------------------------------------------------- */
 
 #if defined(INTERP_STATS)
 
+#define N_CODES 128
+
 /* Hacky stats, for tuning the interpreter ... */
-int it_unknown_entries[N_CLOSURE_TYPES];
-int it_total_unknown_entries;
-int it_total_entries;
+unsigned long it_unknown_entries[N_CLOSURE_TYPES];
+unsigned long it_total_unknown_entries;
 
-int it_retto_BCO;
-int it_retto_UPDATE;
-int it_retto_other;
+unsigned long it_total_entries;
+unsigned long it_retto_BCO;
+unsigned long it_retto_UPDATE;
+unsigned long it_retto_other;
 
-int it_slides;
-int it_insns;
-int it_BCO_entries;
+unsigned long it_underflow_lookups;
 
-int it_ofreq[27];
-int it_oofreq[27][27];
-int it_lastopc;
+unsigned long it_slides;
+unsigned long it_insns;
+unsigned long it_BCO_entries;
+
+unsigned long it_ofreq[N_CODES];
+unsigned long it_oofreq[N_CODES][N_CODES];
+unsigned long it_lastopc;
 
 
 #define INTERP_TICK(n) (n)++
@@ -207,57 +410,71 @@ void interp_startup ( void )
    int i, j;
    it_retto_BCO = it_retto_UPDATE = it_retto_other = 0;
    it_total_entries = it_total_unknown_entries = 0;
+   it_underflow_lookups = 0;
    for (i = 0; i < N_CLOSURE_TYPES; i++)
       it_unknown_entries[i] = 0;
    it_slides = it_insns = it_BCO_entries = 0;
-   for (i = 0; i < 27; i++) it_ofreq[i] = 0;
-   for (i = 0; i < 27; i++)
-     for (j = 0; j < 27; j++)
+   for (i = 0; i < N_CODES; i++) it_ofreq[i] = 0;
+   for (i = 0; i < N_CODES; i++)
+     for (j = 0; j < N_CODES; j++)
         it_oofreq[i][j] = 0;
    it_lastopc = 0;
 }
 
 void interp_shutdown ( void )
 {
-   int i, j, k, o_max, i_max, j_max;
-   debugBelch("%d constrs entered -> (%d BCO, %d UPD, %d ??? )\n",
+   int i, j, k, i_max, j_max;
+   long unsigned o_max;
+   unsigned long copy_freq[N_CODES][N_CODES];
+   debugBelch("%lu constrs entered -> (%lu BCO, %lu UPD, %lu ??? )\n",
                    it_retto_BCO + it_retto_UPDATE + it_retto_other,
                    it_retto_BCO, it_retto_UPDATE, it_retto_other );
-   debugBelch("%d total entries, %d unknown entries \n",
+   debugBelch("%lu total entries, %lu unknown entries \n",
                    it_total_entries, it_total_unknown_entries);
+   debugBelch("%lu lookups past the end of the stack frame\n", it_underflow_lookups);
    for (i = 0; i < N_CLOSURE_TYPES; i++) {
      if (it_unknown_entries[i] == 0) continue;
-     debugBelch("   type %2d: unknown entries (%4.1f%%) == %d\n",
+     debugBelch("   type %2d: unknown entries (%4.1f%%) == %lu\n",
              i, 100.0 * ((double)it_unknown_entries[i]) /
                         ((double)it_total_unknown_entries),
              it_unknown_entries[i]);
    }
-   debugBelch("%d insns, %d slides, %d BCO_entries\n",
+   debugBelch("%lu insns, %lu slides, %lu BCO_entries\n",
                    it_insns, it_slides, it_BCO_entries);
-   for (i = 0; i < 27; i++)
-      debugBelch("opcode %2d got %d\n", i, it_ofreq[i] );
+   for (i = 0; i < N_CODES; i++)
+      debugBelch("opcode %2d got %lu\n", i, it_ofreq[i] );
+
+   for (i = 0; i < N_CODES; i++)
+     for (j = 0; j < N_CODES; j++)
+        copy_freq[i][j] = it_oofreq[i][j];
 
    for (k = 1; k < 20; k++) {
       o_max = 0;
       i_max = j_max = 0;
-      for (i = 0; i < 27; i++) {
-         for (j = 0; j < 27; j++) {
-            if (it_oofreq[i][j] > o_max) {
-               o_max = it_oofreq[i][j];
+      for (i = 0; i < N_CODES; i++) {
+         for (j = 0; j < N_CODES; j++) {
+            if (copy_freq[i][j] > o_max) {
+               o_max = copy_freq[i][j];
                i_max = i; j_max = j;
             }
          }
       }
 
-      debugBelch("%d:  count (%4.1f%%) %6d   is %d then %d\n",
+      debugBelch("%d:  count (%4.1f%%) %lu   is %d then %d\n",
                 k, ((double)o_max) * 100.0 / ((double)it_insns), o_max,
                    i_max, j_max );
-      it_oofreq[i_max][j_max] = 0;
+      copy_freq[i_max][j_max] = 0;
 
    }
 }
 
 #else // !INTERP_STATS
+
+void interp_startup( void ){
+}
+
+void interp_shutdown( void ){
+}
 
 #define INTERP_TICK(n) /* nothing */
 
@@ -305,6 +522,52 @@ StgClosure * copyPAP  (Capability *cap, StgPAP *oldpap)
 }
 
 #endif
+
+// See Note [PUSH_L underflow] for in which situations this
+// slow lookup is needed
+// Returns a pointer to the stack location.
+static void*
+slow_spw(void *Sp, StgStack *cur_stack, StgWord offset_words){
+  // 1. If in range, simply return ptr+offset_words pointing into the current stack chunk
+  if (WITHIN_CHUNK_BOUNDS_W(offset_words, cur_stack)) {
+    return Sp_plusW(offset_words);
+  }
+  // 2. Not in this stack chunk, so access the underflow frame.
+  else {
+    StgWord stackWords;
+    StgUnderflowFrame *frame;
+    StgStack *new_stack;
+
+    frame = (StgUnderflowFrame*)(cur_stack->stack + cur_stack->stack_size
+               - sizeofW(StgUnderflowFrame));
+
+    // 2a. Check it is an underflow frame (the top stack chunk won't have one).
+    if( frame->info == &stg_stack_underflow_frame_d_info
+       || frame->info == &stg_stack_underflow_frame_v16_info
+       || frame->info == &stg_stack_underflow_frame_v32_info
+       || frame->info == &stg_stack_underflow_frame_v64_info )
+    {
+
+      INTERP_TICK(it_underflow_lookups);
+
+      new_stack = (StgStack*)frame->next_chunk;
+
+      // How many words were on the stack
+      stackWords = (StgWord *)frame - (StgWord *) Sp;
+      ASSERT(offset_words > stackWords);
+
+      // Recursive, in the very unlikely case we have to traverse two
+      // stack chunks.
+      return slow_spw(new_stack->sp, new_stack, offset_words-stackWords);
+    }
+    // 2b. Access the element if there is no underflow frame, it must be right
+    // at the top of the stack.
+    else {
+        // Not actually in the underflow case
+        return Sp_plusW(offset_words);
+    }
+  }
+}
 
 // Compute the pointer tag for the constructor and tag the pointer;
 // see Note [Data constructor dynamic tags] in GHC.StgToCmm.Closure.
@@ -355,6 +618,74 @@ interpretBCO (Capability* cap)
              debugBelch("\n\n");
             );
 
+    /* If the "step-out" flag is set for this thread, find the *continuation*
+     * BCO on the stack and activate its breakpoint specifically. Be careful to
+     * use SafeSp macros to handle stack underflows.
+     *
+     * See Note [Debugger: Step-out]
+     */
+    if (cap->r.rCurrentTSO->flags & TSO_STOP_AFTER_RETURN) {
+
+      StgHalfWord type;
+
+      /* Store the entry Sp; traverse the stack modifying Sp (using Sp macros);
+       * restore Sp afterwards. */
+      StgPtr restoreStackPointer = Sp;
+
+      /* The first BCO on the stack is the one we are already stopped at.
+       * Skip it. In the case of returning to a case cont. BCO, there are two
+       * frames to skip before we reach the first continuation frame.
+       * */
+      int to_skip = is_ret_bco_frame((StgPtr)SpW(0)) ? 2 : 1;
+      for (int i = 0; i < to_skip; i++) {
+        Sp = SafeSpWP(stack_frame_sizeW((StgClosure *)Sp));
+      }
+
+      /* Traverse upwards until continuation BCO, or the end */
+      while ((type = get_itbl((StgClosure*)Sp)->type) != RET_BCO
+                                             && type  != STOP_FRAME) {
+        Sp = SafeSpWP(stack_frame_sizeW((StgClosure *)Sp));
+      }
+
+      ASSERT(type == RET_BCO || type == STOP_FRAME);
+      if (type == RET_BCO) {
+
+        StgBCO* bco = (StgBCO*)(SpW(1)); // BCO is first arg of a RET_BCO
+        ASSERT(get_itbl((StgClosure*)bco)->type == BCO);
+
+        StgWord16* instrs = (StgWord16*)(bco->instrs->payload);
+        int bciPtr = 0;
+        StgWord16 bci = BCO_NEXT;
+
+        /* A breakpoint instruction (BRK_FUN) can only be the first instruction
+         * in a BCO */
+        if ((bci & 0xFF) == bci_BRK_FUN) {
+
+            W_ arg1_brk_array, arg4_info_index;
+            arg1_brk_array      = BCO_GET_LARGE_ARG;
+            /* info_mod_name = */ BCO_GET_LARGE_ARG;
+            /* info_mod_id   = */ BCO_GET_LARGE_ARG;
+            arg4_info_index     = BCO_READ_NEXT_32;
+
+            StgPtr* ptrs = (StgPtr*)(&bco->ptrs->payload[0]);
+            StgArrBytes* breakPoints = (StgArrBytes *) BCO_PTR(arg1_brk_array);
+
+            // ACTIVATE the breakpoint by tick index
+            ((StgInt*)breakPoints->payload)[arg4_info_index] = 0;
+        }
+        // else: if there is no BRK instruction perhaps we should keep
+        // traversing; that said, the continuation should always have a BRK
+      }
+      else /* type == STOP_FRAME */ {
+        /* No continuation frame to further stop at: Nothing to do */
+      }
+
+      // Mark as done to not do it again
+      cap->r.rCurrentTSO->flags &= ~TSO_STOP_AFTER_RETURN;
+
+      Sp = restoreStackPointer;
+    }
+
     // ------------------------------------------------------------------------
     // Case 1:
     //
@@ -377,17 +708,36 @@ interpretBCO (Capability* cap)
     //
     //       We have a BCO application to perform.  Stack looks like:
     //
-    //          |     ....      |
-    //          +---------------+
-    //          |     arg1      |
-    //          +---------------+
-    //          |     BCO       |
-    //          +---------------+
-    //       Sp |   RET_BCO     |
-    //          +---------------+
+    //
+    //                                       (an StgBCO)
+    //                                    +---> +--------------+
+    //                                    |     | stg_BCO_info | ------+
+    //                                    |     +--------------+       |
+    //                                    |     | StgArrBytes* | <--- the byte code
+    //          |       ...        |      |     +--------------+       |
+    //          +------------------+      |     |     ...      |       |
+    //          |       fvs1       |      |                            |
+    //          +------------------+      |                            |
+    //          |       ...        |      |        (StgInfoTable)      |
+    //          +------------------+      |           +----------+ <---+
+    //          |      args1       |      |           |    ...   |
+    //          +------------------+      |           +----------+
+    //          |   some StgBCO*   | -----+           | type=BCO |
+    //          +------------------+                  +----------+
+    //       Sp | stg_apply_interp | -----+           |   ...    |
+    //          +------------------+      |
+    //                                    |
+    //                                    |   (StgInfoTable)
+    //                                    +----> +--------------+
+    //                                           |     ...      |
+    //                                           +--------------+
+    //                                           | type=RET_BCO |
+    //                                           +--------------+
+    //                                           |     ...      |
+    //
     //
     else if (SpW(0) == (W_)&stg_apply_interp_info) {
-        obj = UNTAG_CLOSURE((StgClosure *)SpW(1));
+        obj = UNTAG_CLOSURE((StgClosure *)ReadSpW(1));
         Sp_addW(2);
         goto run_BCO_fun;
     }
@@ -399,7 +749,7 @@ interpretBCO (Capability* cap)
     //       do_return_pointer, below.
     //
     else if (SpW(0) == (W_)&stg_ret_p_info) {
-      tagged_obj = (StgClosure *)SpW(1);
+      tagged_obj = (StgClosure *)ReadSpW(1);
       Sp_addW(2);
       goto do_return_pointer;
     }
@@ -415,11 +765,11 @@ interpretBCO (Capability* cap)
 
     // Evaluate the object on top of the stack.
 eval:
-    tagged_obj = (StgClosure*)SpW(0); Sp_addW(1);
+    tagged_obj = (StgClosure*)ReadSpW(0); Sp_addW(1);
 
 eval_obj:
     obj = UNTAG_CLOSURE(tagged_obj);
-    INTERP_TICK(it_total_evals);
+    INTERP_TICK(it_total_entries);
 
     IF_DEBUG(interpreter,
              debugBelch(
@@ -436,7 +786,6 @@ eval_obj:
              debugBelch("\n\n");
             );
 
-//    IF_DEBUG(sanity,checkStackChunk(Sp, cap->r.rCurrentTSO->stack+cap->r.rCurrentTSO->stack_size));
     IF_DEBUG(sanity,checkStackFrame(Sp));
 
     switch ( get_itbl(obj)->type ) {
@@ -616,7 +965,7 @@ do_return_pointer:
             info == (StgInfoTable *)&stg_restore_cccs_v32_info ||
             info == (StgInfoTable *)&stg_restore_cccs_v64_info ||
             info == (StgInfoTable *)&stg_restore_cccs_eval_info) {
-            cap->r.rCCCS = (CostCentreStack*)SpW(1);
+            cap->r.rCCCS = (CostCentreStack*)ReadSpW(1);
             Sp_addW(2);
             goto do_return_pointer;
         }
@@ -678,11 +1027,33 @@ do_return_pointer:
         // Returning to an interpreted continuation: put the object on
         // the stack, and start executing the BCO.
         INTERP_TICK(it_retto_BCO);
-        Sp_subW(1);
-        SpW(0) = (W_)tagged_obj;
-        obj = (StgClosure*)SpW(2);
+        obj = (StgClosure*)ReadSpW(1);
         ASSERT(get_itbl(obj)->type == BCO);
-        goto run_BCO_return_pointer;
+
+        // Heap check
+        if (doYouWantToGC(cap)) {
+            Sp_subW(2);
+            SpW(1) = (W_)tagged_obj;
+            SpW(0) = (W_)&stg_ret_p_info;
+            RETURN_TO_SCHEDULER(ThreadInterpret, HeapOverflow);
+        }
+        else {
+
+          // Stack checks aren't necessary at return points, the stack use
+          // is aggregated into the enclosing function entry point.
+
+          // Make sure stack is headed by a ctoi R1p frame when returning a pointer
+          ASSERT(ReadSpW(0) == (W_)&stg_ctoi_R1p_info);
+
+          // Add the return frame on top of the args
+          Sp_subW(2);
+          SpW(1) = (W_)tagged_obj;
+          SpW(0) = (W_)&stg_ret_p_info;
+        }
+
+        /* Keep the ret frame and the ctoi frame for run_BCO.
+         * See Note [Stack layout when entering run_BCO] */
+        goto run_BCO;
 
     default:
     do_return_unrecognised:
@@ -727,12 +1098,12 @@ do_return_nonpointer:
     {
         int offset;
 
-        ASSERT(    SpW(0) == (W_)&stg_ret_v_info
-                || SpW(0) == (W_)&stg_ret_n_info
-                || SpW(0) == (W_)&stg_ret_f_info
-                || SpW(0) == (W_)&stg_ret_d_info
-                || SpW(0) == (W_)&stg_ret_l_info
-                || SpW(0) == (W_)&stg_ret_t_info
+        ASSERT(    ReadSpW(0) == (W_)&stg_ret_v_info
+                || ReadSpW(0) == (W_)&stg_ret_n_info
+                || ReadSpW(0) == (W_)&stg_ret_f_info
+                || ReadSpW(0) == (W_)&stg_ret_d_info
+                || ReadSpW(0) == (W_)&stg_ret_l_info
+                || ReadSpW(0) == (W_)&stg_ret_t_info
             );
 
         IF_DEBUG(interpreter,
@@ -751,17 +1122,68 @@ do_return_nonpointer:
 
         // get the offset of the header of the next stack frame
         offset = stack_frame_sizeW((StgClosure *)Sp);
+        StgClosure* next_frame = (StgClosure*)(SafeSpWP(offset));
 
-        switch (get_itbl((StgClosure*)(Sp_plusW(offset)))->type) {
+        switch (get_itbl(next_frame)->type) {
 
         case RET_BCO:
             // Returning to an interpreted continuation: pop the return frame
             // so the returned value is at the top of the stack, and start
             // executing the BCO.
             INTERP_TICK(it_retto_BCO);
-            obj = (StgClosure*)SpW(offset+1);
+            obj = (StgClosure*)ReadSpW(offset+1);
+
             ASSERT(get_itbl(obj)->type == BCO);
-            goto run_BCO_return_nonpointer;
+
+            // Heap check
+            if (doYouWantToGC(cap)) {
+                RETURN_TO_SCHEDULER(ThreadInterpret, HeapOverflow);
+            }
+            else {
+              // Stack checks aren't necessary at return points, the stack use
+              // is aggregated into the enclosing function entry point.
+
+#if defined(PROFILING)
+              /*
+                 Restore the current cost centre stack if a tuple is being returned.
+
+                 When a "simple" unlifted value is returned, the cccs is restored with
+                 an stg_restore_cccs frame on the stack, for example:
+
+                     ...
+                     stg_ctoi_D1
+                     <CCCS>
+                     stg_restore_cccs
+
+                 But stg_restore_cccs cannot deal with tuples, which may have more
+                 things on the stack. Therefore we store the CCCS inside the
+                 stg_ctoi_t frame.
+
+                 If we have a tuple being returned, the stack looks like this:
+
+                     ...
+                     <CCCS>           <- to restore, Sp offset <next frame + 4 words>
+                     tuple_BCO
+                     tuple_info
+                     cont_BCO
+                     stg_ctoi_t       <- next frame
+                     tuple_data_1
+                     ...
+                     tuple_data_n
+                     tuple_info
+                     tuple_BCO
+                     stg_ret_t        <- Sp
+               */
+
+              if(SpW(0) == (W_)&stg_ret_t_info) {
+                  cap->r.rCCCS = (CostCentreStack*)ReadSpW(offset + 4);
+              }
+#endif
+
+              /* Keep the ret frame and the ctoi frame for run_BCO.
+               * See Note [Stack layout when entering run_BCO] */
+              goto run_BCO;
+            }
 
         default:
         {
@@ -821,7 +1243,7 @@ do_apply:
                 // Shuffle the args for this function down, and put
                 // the appropriate info table in the gap.
                 for (i = 0; i < arity; i++) {
-                    SpW((int)i-1) = SpW(i);
+                    SpW((int)i-1) = ReadSpW(i);
                     // ^^^^^ careful, i-1 might be negative, but i is unsigned
                 }
                 SpW(arity-1) = app_ptrs_itbl[n-arity-1];
@@ -860,7 +1282,7 @@ do_apply:
                     new_pap->payload[i] = pap->payload[i];
                 }
                 for (i = 0; i < m; i++) {
-                    new_pap->payload[pap->n_args + i] = (StgClosure *)SpW(i);
+                    new_pap->payload[pap->n_args + i] = (StgClosure *)ReadSpW(i);
                 }
                 // No write barrier is needed here as this is a new allocation
                 SET_HDR(new_pap,&stg_PAP_info,cap->r.rCCCS);
@@ -884,7 +1306,7 @@ do_apply:
                 // Shuffle the args for this function down, and put
                 // the appropriate info table in the gap.
                 for (i = 0; i < arity; i++) {
-                    SpW((int)i-1) = SpW(i);
+                    SpW((int)i-1) = ReadSpW(i);
                     // ^^^^^ careful, i-1 might be negative, but i is unsigned
                 }
                 SpW(arity-1) = app_ptrs_itbl[n-arity-1];
@@ -903,7 +1325,7 @@ do_apply:
                 pap->fun = obj;
                 pap->n_args = m;
                 for (i = 0; i < m; i++) {
-                    pap->payload[i] = (StgClosure *)SpW(i);
+                    pap->payload[i] = (StgClosure *)ReadSpW(i);
                 }
                 // No write barrier is needed here as this is a new allocation
                 SET_HDR(pap, &stg_PAP_info,cap->r.rCCCS);
@@ -924,111 +1346,90 @@ do_apply:
             RETURN_TO_SCHEDULER_NO_PAUSE(ThreadRunGHC, ThreadYielding);
     }
 
-    // ------------------------------------------------------------------------
-    // Ok, we now have a bco (obj), and its arguments are all on the
-    // stack.  We can start executing the byte codes.
-    //
-    // The stack is in one of two states.  First, if this BCO is a
-    // function:
-    //
-    //    |     ....      |
-    //    +---------------+
-    //    |     arg2      |
-    //    +---------------+
-    //    |     arg1      |
-    //    +---------------+
-    //
-    // Second, if this BCO is a continuation:
-    //
-    //    |     ....      |
-    //    +---------------+
-    //    |     fv2       |
-    //    +---------------+
-    //    |     fv1       |
-    //    +---------------+
-    //    |     BCO       |
-    //    +---------------+
-    //    | stg_ctoi_ret_ |
-    //    +---------------+
-    //    |    retval     |
-    //    +---------------+
-    //
-    // where retval is the value being returned to this continuation.
-    // In the event of a stack check, heap check, or context switch,
-    // we need to leave the stack in a sane state so the garbage
-    // collector can find all the pointers.
-    //
-    //  (1) BCO is a function:  the BCO's bitmap describes the
-    //      pointerhood of the arguments.
-    //
-    //  (2) BCO is a continuation: BCO's bitmap describes the
-    //      pointerhood of the free variables.
-    //
-    // Sadly we have three different kinds of stack/heap/cswitch check
-    // to do:
+/*
+Note [Stack layout when entering run_BCO]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We have a bco (obj), and its arguments are all on the stack. We can start
+executing the byte codes.
 
+The stack is in one of two states. First, if this BCO is a
+function (in run_BCO_fun or run_BCO)
 
-run_BCO_return_pointer:
-    // Heap check
-    if (doYouWantToGC(cap)) {
-        Sp_subW(1); SpW(0) = (W_)&stg_ret_p_info;
-        RETURN_TO_SCHEDULER(ThreadInterpret, HeapOverflow);
-    }
-    // Stack checks aren't necessary at return points, the stack use
-    // is aggregated into the enclosing function entry point.
+   |     ....      |
+   +---------------+
+   |     arg2      |
+   +---------------+
+   |     arg1      |
+   +---------------+
 
-    goto run_BCO;
+Second, if this BCO is a case cont., as per Note [Case continuation BCOs] (only
+in run_BCO):
 
-run_BCO_return_nonpointer:
-    // Heap check
-    if (doYouWantToGC(cap)) {
-        RETURN_TO_SCHEDULER(ThreadInterpret, HeapOverflow);
-    }
-    // Stack checks aren't necessary at return points, the stack use
-    // is aggregated into the enclosing function entry point.
+   |     ....      |
+   +---------------+
+   |     fv2       |
+   +---------------+
+   |     fv1       |
+   +---------------+
+   |     BCO       |
+   +---------------+
+   | stg_ctoi_ret_ |
+   +---------------+
+   |    retval     |
+   +---------------+
+   | stg_ret_..... |
+   +---------------+
 
-#if defined(PROFILING)
-    /*
-       Restore the current cost centre stack if a tuple is being returned.
+where retval is the value being returned to this continuation.
+In the event of a stack check, heap check, context switch,
+or breakpoint, we need to leave the stack in a sane state so
+the garbage collector can find all the pointers.
 
-       When a "simple" unlifted value is returned, the cccs is restored with
-       an stg_restore_cccs frame on the stack, for example:
+ (1) BCO is a function:  the BCO's bitmap describes the
+     pointerhood of the arguments.
 
-           ...
-           stg_ctoi_D1
-           <CCCS>
-           stg_restore_cccs
+ (2) BCO is a continuation: BCO's bitmap describes the
+     pointerhood of the free variables.
 
-       But stg_restore_cccs cannot deal with tuples, which may have more
-       things on the stack. Therefore we store the CCCS inside the
-       stg_ctoi_t frame.
+To reconstruct a valid stack state for yielding (such that when we return to
+the interpreter we end up in the same place from where we yielded), we need to
+differentiate the two cases again:
 
-       If we have a tuple being returned, the stack looks like this:
+  (1) For function BCOs, the arguments are directly on top of the stack, so it
+  suffices to add a `stg_apply_interp_info` frame header using the BCO that is
+  being applied to these arguments (i.e. the `obj` being run)
 
-           ...
-           <CCCS>           <- to restore, Sp offset <next frame + 4 words>
-           tuple_BCO
-           tuple_info
-           cont_BCO
-           stg_ctoi_t       <- next frame
-           tuple_data_1
-           ...
-           tuple_data_n
-           tuple_info
-           tuple_BCO
-           stg_ret_t        <- Sp
-     */
+  (2) For continuation BCOs, the stack is already consistent -- that's why we
+  keep the ret and ctoi frame on top of the stack when we start executing it.
 
-    if(SpW(0) == (W_)&stg_ret_t_info) {
-        cap->r.rCCCS = (CostCentreStack*)SpW(stack_frame_sizeW((StgClosure *)Sp) + 4);
-    }
-#endif
+  We couldn't reconstruct a valid stack that resumes the case continuation
+  execution just from the return and free vars values alone because we wouldn't
+  know what kind of result it was (are we returning a pointer, non pointer int,
+  a tuple? etc.); especially considering some frames have different sizes,
+  notably unboxed tuple return frames (see Note [unboxed tuple bytecodes and tuple_BCO]).
 
-    if (SpW(0) != (W_)&stg_ret_t_info) {
-      Sp_addW(1);
-    }
-    goto run_BCO;
+  For consistency, the first instructions in a case continuation BCO, right
+  after a possible BRK_FUN heading it, are two SLIDEs to remove the stg_ret_
+  and stg_ctoi_ frame headers, leaving only the return value followed by the
+  free vars. Theses slides use statically known offsets computed in StgToByteCode.hs.
+  Following the continuation BCO diagram above, SLIDING would result in:
 
+   |     ....      |
+   +---------------+
+   |     fv2       |
+   +---------------+
+   |     fv1       |
+   +---------------+
+   |    retval     |
+   +---------------+
+*/
+
+// Ok, we now have a bco (obj), and its arguments are all on the stack as
+// described by Note [Stack layout when entering run_BCO].
+// We can start executing the byte codes.
+//
+// Sadly we have three different kinds of stack/heap/cswitch check
+// to do:
 run_BCO_fun:
     IF_DEBUG(sanity,
              Sp_subW(2);
@@ -1058,6 +1459,7 @@ run_BCO_fun:
 
     // Now, actually interpret the BCO... (no returning to the
     // scheduler again until the stack is in an orderly state).
+    // See also Note [Stack layout when entering run_BCO]
 run_BCO:
     INTERP_TICK(it_BCO_entries);
     {
@@ -1087,7 +1489,7 @@ run_BCO:
                  if (0) { int i;
                  debugBelch("\n");
                  for (i = 8; i >= 0; i--) {
-                     debugBelch("%d  %p\n", i, (void *) SpW(i));
+                     debugBelch("%d  %p\n", i, (void *) ReadSpW(i));
                  }
                  debugBelch("\n");
                  }
@@ -1098,28 +1500,28 @@ run_BCO:
         INTERP_TICK(it_insns);
 
 #if defined(INTERP_STATS)
-        ASSERT( (int)instrs[bciPtr] >= 0 && (int)instrs[bciPtr] < 27 );
+        ASSERT( (int)instrs[bciPtr] >= 0 && (int)instrs[bciPtr] < N_CODES );
         it_ofreq[ (int)instrs[bciPtr] ] ++;
         it_oofreq[ it_lastopc ][ (int)instrs[bciPtr] ] ++;
         it_lastopc = (int)instrs[bciPtr];
 #endif
 
         bci = BCO_NEXT;
-    /* We use the high 8 bits for flags, only the highest of which is
-     * currently allocated */
-    ASSERT((bci & 0xFF00) == (bci & 0x8000));
+    /* We use the high 8 bits for flags. The highest of which is
+     * currently allocated to LARGE_ARGS */
+    ASSERT((bci & 0xFF00) == (bci & ( bci_FLAG_LARGE_ARGS )));
 
     switch (bci & 0xFF) {
 
-        /* check for a breakpoint on the beginning of a let binding */
+        /* check for a breakpoint on the beginning of a BCO */
         case bci_BRK_FUN:
         {
-            int arg1_brk_array, arg2_tick_mod, arg3_info_mod, arg4_tick_index, arg5_info_index;
+            W_ arg1_brk_array, arg2_info_mod_name, arg3_info_mod_id, arg4_info_index;
 #if defined(PROFILING)
-            int arg6_cc;
+            W_ arg5_cc;
 #endif
             StgArrBytes *breakPoints;
-            int returning_from_break;
+            int returning_from_break, stop_next_breakpoint;
 
             // the io action to run at a breakpoint
             StgClosure *ioAction;
@@ -1131,12 +1533,11 @@ run_BCO:
             int size_words;
 
             arg1_brk_array      = BCO_GET_LARGE_ARG;
-            arg2_tick_mod       = BCO_GET_LARGE_ARG;
-            arg3_info_mod       = BCO_GET_LARGE_ARG;
-            arg4_tick_index     = BCO_NEXT;
-            arg5_info_index     = BCO_NEXT;
+            arg2_info_mod_name  = BCO_GET_LARGE_ARG;
+            arg3_info_mod_id    = BCO_GET_LARGE_ARG;
+            arg4_info_index     = BCO_READ_NEXT_32;
 #if defined(PROFILING)
-            arg6_cc             = BCO_GET_LARGE_ARG;
+            arg5_cc             = BCO_GET_LARGE_ARG;
 #else
             BCO_GET_LARGE_ARG;
 #endif
@@ -1147,9 +1548,16 @@ run_BCO:
             returning_from_break =
                 cap->r.rCurrentTSO->flags & TSO_STOPPED_ON_BREAKPOINT;
 
+            // check whether this thread is set to stop at the immediate next
+            // breakpoint -- either by the global `rts_stop_next_breakpoint`
+            // flag, or by the local `TSO_STOP_NEXT_BREAKPOINT`
+            stop_next_breakpoint =
+              rts_stop_next_breakpoint ||
+                cap->r.rCurrentTSO->flags & TSO_STOP_NEXT_BREAKPOINT;
+
 #if defined(PROFILING)
             cap->r.rCCCS = pushCostCentre(cap->r.rCCCS,
-                                          (CostCentre*)BCO_LIT(arg6_cc));
+                                          (CostCentre*)BCO_LIT(arg5_cc));
 #endif
 
             // if we are returning from a break then skip this section
@@ -1158,49 +1566,99 @@ run_BCO:
             {
                breakPoints = (StgArrBytes *) BCO_PTR(arg1_brk_array);
 
-               // stop the current thread if either the
-               // "rts_stop_next_breakpoint" flag is true OR if the
-               // ignore count for this particular breakpoint is zero
-               StgInt ignore_count = ((StgInt*)breakPoints->payload)[arg4_tick_index];
-               if (rts_stop_next_breakpoint == false && ignore_count > 0)
+               StgPtr stack_head = (StgPtr)SpW(0);
+
+               // When the BRK_FUN is at the start of a case continuation BCO,
+               // the stack is headed by the frame returning the value at the start.
+               // See Note [Stack layout when entering run_BCO]
+               int is_case_cont_BCO = is_ret_bco_frame(stack_head);
+
+               // stop the current thread if either `stop_next_breakpoint` is
+               // true OR if the ignore count for this particular breakpoint is zero
+               StgInt ignore_count = ((StgInt*)breakPoints->payload)[arg4_info_index];
+               if (stop_next_breakpoint == false && ignore_count > 0)
                {
                   // decrement and write back ignore count
-                  ((StgInt*)breakPoints->payload)[arg4_tick_index] = --ignore_count;
+                  ((StgInt*)breakPoints->payload)[arg4_info_index] = --ignore_count;
                }
-               else if (rts_stop_next_breakpoint == true || ignore_count == 0)
+               else if (
+                  /* Doing step-in (but don't stop at case continuation BCOs,
+                   * those are only useful when stepping out) */
+                  (stop_next_breakpoint == true && !is_case_cont_BCO)
+                  /* Or breakpoint is explicitly enabled */
+                  || ignore_count == 0)
                {
                   // make sure we don't automatically stop at the
                   // next breakpoint
-                  rts_stop_next_breakpoint = false;
+                  rts_stop_next_breakpoint = 0;
+                  cap->r.rCurrentTSO->flags &= ~TSO_STOP_NEXT_BREAKPOINT;
 
-                  // allocate memory for a new AP_STACK, enough to
-                  // store the top stack frame plus an
-                  // stg_apply_interp_info pointer and a pointer to
-                  // the BCO
-                  size_words = BCO_BITMAP_SIZE(obj) + 2;
-                  new_aps = (StgAP_STACK *) allocate(cap, AP_STACK_sizeW(size_words));
-                  new_aps->size = size_words;
-                  new_aps->fun = &stg_dummy_ret_closure;
+                  /* To yield execution we need to come up with a consistent AP_STACK
+                   * to store in the :history data structure.
+                   */
+                  if (is_case_cont_BCO) {
 
-                  // fill in the payload of the AP_STACK
-                  new_aps->payload[0] = (StgClosure *)&stg_apply_interp_info;
-                  new_aps->payload[1] = (StgClosure *)obj;
+                    // If the BCO is a case cont. then the stack is headed by the
+                    // stg_ret and a stg_ctoi frames which caused this same BCO
+                    // to be run. This stack is already well-formed, so it
+                    // needs only to be copied to the AP_STACK.
+                    // See Note [Stack layout when entering run_BCO]
 
-                  // copy the contents of the top stack frame into the AP_STACK
-                  for (i = 2; i < size_words; i++)
-                  {
-                     new_aps->payload[i] = (StgClosure *)SpW(i-2);
+                    // stg_ret_*
+                    int size_returned_frame = stack_frame_sizeW((StgClosure *)Sp);
+
+                    ASSERT(obj == UNTAG_CLOSURE((StgClosure*)ReadSpW(size_returned_frame+1)));
+
+                    // stg_ctoi_*
+                    int size_cont_frame_head = stack_frame_sizeW((StgClosure*)SafeSpWP(size_returned_frame));
+
+                    // Continuation stack is already well formed,
+                    // so just copy it whole to the AP_STACK
+                    size_words = size_returned_frame
+                               + size_cont_frame_head;
+                    new_aps = (StgAP_STACK *) allocate(cap, AP_STACK_sizeW(size_words));
+                    new_aps->size = size_words;
+                    new_aps->fun = &stg_dummy_ret_closure;
+
+                    // (1) Fill in the payload of the AP_STACK:
+                    for (i = 0; i < size_words; i++) {
+                       new_aps->payload[i] = (StgClosure *)ReadSpW(i);
+                    }
+                  }
+                  else {
+
+                    // The BCO is a function, therefore the arguments are
+                    // directly on top of the stack.
+                    // To construct a valid stack chunk simply add an
+                    // stg_apply_interp and the current BCO to the stack.
+                    // See also Note [Stack layout when entering run_BCO]
+
+                    // (1) Allocate memory for a new AP_STACK, enough to store
+                    // the top stack frame plus an stg_apply_interp_info pointer
+                    // and a pointer to the BCO
+                    size_words = BCO_BITMAP_SIZE(obj) + 2;
+                    new_aps = (StgAP_STACK *) allocate(cap, AP_STACK_sizeW(size_words));
+                    new_aps->size = size_words;
+                    new_aps->fun = &stg_dummy_ret_closure;
+
+                    // (1.1) the continuation frame
+                    new_aps->payload[0] = (StgClosure *)&stg_apply_interp_info;
+                    new_aps->payload[1] = (StgClosure *)obj;
+
+                    // (1.2.1) copy the args/free vars of the top stack frame into the AP_STACK
+                    for (i = 2; i < size_words; i++) {
+                       new_aps->payload[i] = (StgClosure *)ReadSpW(i-2);
+                    }
                   }
 
                   // No write barrier is needed here as this is a new allocation
                   SET_HDR(new_aps,&stg_AP_STACK_info,cap->r.rCCCS);
 
-                  // Arrange the stack to call the breakpoint IO action, and
+                  // (2) Arrange the stack to call the breakpoint IO action, and
                   // continue execution of this BCO when the IO action returns.
                   //
-                  // ioAction :: Addr#       -- the breakpoint tick module
-                  //          -> Int#        -- the breakpoint tick index
-                  //          -> Addr#       -- the breakpoint info module
+                  // ioAction :: Addr#       -- the breakpoint info module
+                  //          -> Addr#       -- the breakpoint info module unit id
                   //          -> Int#        -- the breakpoint info index
                   //          -> Bool        -- exception?
                   //          -> HValue      -- the AP_STACK, or exception
@@ -1209,19 +1667,32 @@ run_BCO:
                   ioAction = (StgClosure *) deRefStablePtr (
                       rts_breakpoint_io_action);
 
-                  Sp_subW(15);
-                  SpW(14) = (W_)obj;
-                  SpW(13) = (W_)&stg_apply_interp_info;
-                  SpW(12) = (W_)new_aps;
-                  SpW(11) = (W_)False_closure;         // True <=> an exception
-                  SpW(10) = (W_)&stg_ap_ppv_info;
-                  SpW(9)  = (W_)arg5_info_index;
-                  SpW(8)  = (W_)&stg_ap_n_info;
-                  SpW(7)  = (W_)BCO_LIT(arg3_info_mod);
+                  // (2.1) Construct the continuation to which we'll return in
+                  // this thread after the `rts_breakpoint_io_action` returns.
+                  //
+                  // For case cont. BCOs, the continuation to re-run this BCO
+                  // is already first on the stack. For function BCOs we need
+                  // to add an `stg_apply_interp` apply to the current BCO.
+                  // See Note [Stack layout when entering run_BCO]
+                  if (!is_case_cont_BCO) {
+                    Sp_subW(2); // stg_apply_interp_info + StgBCO*
+
+                    // (2.1.2) Write the continuation frame (above the stg_ret
+                    // frame if one exists)
+                    SpW(1) = (W_)obj;
+                    SpW(0) = (W_)&stg_apply_interp_info;
+                  }
+
+                  // (2.2) The `rts_breakpoint_io_action` call
+                  Sp_subW(11);
+                  SpW(10) = (W_)new_aps;
+                  SpW(9)  = (W_)False_closure;         // True <=> an exception
+                  SpW(8)  = (W_)&stg_ap_ppv_info;
+                  SpW(7)  = (W_)arg4_info_index;
                   SpW(6)  = (W_)&stg_ap_n_info;
-                  SpW(5)  = (W_)arg4_tick_index;
+                  SpW(5)  = (W_)BCO_LIT(arg3_info_mod_id);
                   SpW(4)  = (W_)&stg_ap_n_info;
-                  SpW(3)  = (W_)BCO_LIT(arg2_tick_mod);
+                  SpW(3)  = (W_)BCO_LIT(arg2_info_mod_name);
                   SpW(2)  = (W_)&stg_ap_n_info;
                   SpW(1)  = (W_)ioAction;
                   SpW(0)  = (W_)&stg_enter_info;
@@ -1262,7 +1733,7 @@ run_BCO:
 
         case bci_PUSH_L: {
             W_ o1 = BCO_GET_LARGE_ARG;
-            SpW(-1) = SpW(o1);
+            SpW(-1) = ReadSpW(o1);
             Sp_subW(1);
             goto nextInsn;
         }
@@ -1270,8 +1741,8 @@ run_BCO:
         case bci_PUSH_LL: {
             W_ o1 = BCO_GET_LARGE_ARG;
             W_ o2 = BCO_GET_LARGE_ARG;
-            SpW(-1) = SpW(o1);
-            SpW(-2) = SpW(o2);
+            SpW(-1) = ReadSpW(o1);
+            SpW(-2) = ReadSpW(o2);
             Sp_subW(2);
             goto nextInsn;
         }
@@ -1280,9 +1751,9 @@ run_BCO:
             W_ o1 = BCO_GET_LARGE_ARG;
             W_ o2 = BCO_GET_LARGE_ARG;
             W_ o3 = BCO_GET_LARGE_ARG;
-            SpW(-1) = SpW(o1);
-            SpW(-2) = SpW(o2);
-            SpW(-3) = SpW(o3);
+            SpW(-1) = ReadSpW(o1);
+            SpW(-2) = ReadSpW(o2);
+            SpW(-3) = ReadSpW(o3);
             Sp_subW(3);
             goto nextInsn;
         }
@@ -1290,41 +1761,41 @@ run_BCO:
         case bci_PUSH8: {
             W_ off = BCO_GET_LARGE_ARG;
             Sp_subB(1);
-            *(StgWord8*)Sp = *(StgWord8*)(Sp_plusB(off+1));
+            *(StgWord8*)Sp = (StgWord8) (ReadSpB(off+1));
             goto nextInsn;
         }
 
         case bci_PUSH16: {
             W_ off = BCO_GET_LARGE_ARG;
             Sp_subB(2);
-            *(StgWord16*)Sp = *(StgWord16*)(Sp_plusB(off+2));
+            *(StgWord16*)Sp = (StgWord16) (ReadSpB(off+2));
             goto nextInsn;
         }
 
         case bci_PUSH32: {
             W_ off = BCO_GET_LARGE_ARG;
             Sp_subB(4);
-            *(StgWord32*)Sp = *(StgWord32*)(Sp_plusB(off+4));
+            *(StgWord32*)Sp = (StgWord32) (ReadSpB(off+4));
             goto nextInsn;
         }
 
         case bci_PUSH8_W: {
             W_ off = BCO_GET_LARGE_ARG;
-            *(StgWord8*)(Sp_minusW(1)) = *(StgWord8*)(Sp_plusB(off));
+            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord8) (ReadSpB(off)));
             Sp_subW(1);
             goto nextInsn;
         }
 
         case bci_PUSH16_W: {
             W_ off = BCO_GET_LARGE_ARG;
-            *(StgWord16*)(Sp_minusW(1)) = *(StgWord16*)(Sp_plusB(off));
+            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord16) (ReadSpB(off)));
             Sp_subW(1);
             goto nextInsn;
         }
 
         case bci_PUSH32_W: {
             W_ off = BCO_GET_LARGE_ARG;
-            *(StgWord32*)(Sp_minusW(1)) = *(StgWord32*)(Sp_plusB(off));
+            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord32) (ReadSpB(off)));
             Sp_subW(1);
             goto nextInsn;
         }
@@ -1338,7 +1809,7 @@ run_BCO:
             // Here we make sure references we push are tagged.
             // See Note [CBV Functions and the interpreter] in Info.hs
 
-            //Safe some memory reads if we already have a tag.
+            //Save some memory reads if we already have a tag.
             if(GET_CLOSURE_TAG(tagged_obj) == 0) {
                 StgClosure *obj = UNTAG_CLOSURE(tagged_obj);
                 switch ( get_itbl(obj)->type ) {
@@ -1598,21 +2069,21 @@ run_BCO:
         case bci_PUSH_UBX8: {
             W_ o_lit = BCO_GET_LARGE_ARG;
             Sp_subB(1);
-            *(StgWord8*)Sp = *(StgWord8*)(literals+o_lit);
+            *(StgWord8*)Sp = (StgWord8) BCO_LIT(o_lit);
             goto nextInsn;
         }
 
         case bci_PUSH_UBX16: {
             W_ o_lit = BCO_GET_LARGE_ARG;
             Sp_subB(2);
-            *(StgWord16*)Sp = *(StgWord16*)(literals+o_lit);
+            *(StgWord16*)Sp = (StgWord16) BCO_LIT(o_lit);
             goto nextInsn;
         }
 
         case bci_PUSH_UBX32: {
             W_ o_lit = BCO_GET_LARGE_ARG;
             Sp_subB(4);
-            *(StgWord32*)Sp = *(StgWord32*)(literals+o_lit);
+            *(StgWord32*)Sp = (StgWord32) BCO_LIT(o_lit);
             goto nextInsn;
         }
 
@@ -1636,7 +2107,7 @@ run_BCO:
              * a_1 ... a_n, k
              */
             while(n-- > 0) {
-                SpW(n+by) = SpW(n);
+                SpW(n+by) = ReadSpW(n);
             }
             Sp_addW(by);
             INTERP_TICK(it_slides);
@@ -1688,9 +2159,9 @@ run_BCO:
             StgHalfWord i;
             W_ stkoff = BCO_GET_LARGE_ARG;
             StgHalfWord n_payload = BCO_GET_LARGE_ARG;
-            StgAP* ap = (StgAP*)SpW(stkoff);
+            StgAP* ap = (StgAP*)ReadSpW(stkoff);
             ASSERT(ap->n_args == n_payload);
-            ap->fun = (StgClosure*)SpW(0);
+            ap->fun = (StgClosure*)ReadSpW(0);
 
             // The function should be a BCO, and its bitmap should
             // cover the payload of the AP correctly.
@@ -1698,7 +2169,7 @@ run_BCO:
                    && BCO_BITMAP_SIZE(ap->fun) == ap->n_args);
 
             for (i = 0; i < n_payload; i++) {
-                ap->payload[i] = (StgClosure*)SpW(i+1);
+                ap->payload[i] = (StgClosure*)ReadSpW(i+1);
             }
             Sp_addW(n_payload+1);
             IF_DEBUG(interpreter,
@@ -1712,9 +2183,9 @@ run_BCO:
             StgHalfWord i;
             W_ stkoff = BCO_GET_LARGE_ARG;
             StgHalfWord n_payload = BCO_GET_LARGE_ARG;
-            StgPAP* pap = (StgPAP*)SpW(stkoff);
+            StgPAP* pap = (StgPAP*)ReadSpW(stkoff);
             ASSERT(pap->n_args == n_payload);
-            pap->fun = (StgClosure*)SpW(0);
+            pap->fun = (StgClosure*)ReadSpW(0);
 
             // The function should be a BCO
             if (get_itbl(pap->fun)->type != BCO) {
@@ -1725,7 +2196,7 @@ run_BCO:
             }
 
             for (i = 0; i < n_payload; i++) {
-                pap->payload[i] = (StgClosure*)SpW(i+1);
+                pap->payload[i] = (StgClosure*)ReadSpW(i+1);
             }
             Sp_addW(n_payload+1);
             IF_DEBUG(interpreter,
@@ -1739,7 +2210,7 @@ run_BCO:
             /* Unpack N ptr words from t.o.s constructor */
             W_ i;
             W_ n_words = BCO_GET_LARGE_ARG;
-            StgClosure* con = UNTAG_CLOSURE((StgClosure*)SpW(0));
+            StgClosure* con = UNTAG_CLOSURE((StgClosure*)ReadSpW(0));
             Sp_subW(n_words);
             for (i = 0; i < n_words; i++) {
                 SpW(i) = (W_)con->payload[i];
@@ -1761,9 +2232,8 @@ run_BCO:
             // n_nptrs=1, n_ptrs=0.
             ASSERT(n_ptrs + n_nptrs == n_words || (n_nptrs == 1 && n_ptrs == 0));
             ASSERT(n_ptrs + n_nptrs > 0);
-            //ASSERT(n_words > 0); // We shouldn't ever need to allocate nullary constructors
             for (W_ i = 0; i < n_words; i++) {
-                con->payload[i] = (StgClosure*)SpW(i);
+                con->payload[i] = (StgClosure*)ReadSpW(i);
             }
             Sp_addW(n_words);
             Sp_subW(1);
@@ -1785,8 +2255,7 @@ run_BCO:
         case bci_TESTLT_P: {
             unsigned int discr  = BCO_NEXT;
             int failto = BCO_GET_LARGE_ARG;
-            ASSERT(discr <= TAG_MASK);
-            StgClosure* con = UNTAG_CLOSURE((StgClosure*)SpW(0));
+            StgClosure* con = UNTAG_CLOSURE((StgClosure*)ReadSpW(0));
             if (GET_TAG(con) >= discr) {
                 bciPtr = failto;
             }
@@ -1796,8 +2265,7 @@ run_BCO:
         case bci_TESTEQ_P: {
             unsigned int discr  = BCO_NEXT;
             int failto = BCO_GET_LARGE_ARG;
-            ASSERT(discr <= TAG_MASK);
-            StgClosure* con = UNTAG_CLOSURE((StgClosure*)SpW(0));
+            StgClosure* con = UNTAG_CLOSURE((StgClosure*)ReadSpW(0));
             if (GET_TAG(con) != discr) {
                 bciPtr = failto;
             }
@@ -1807,7 +2275,7 @@ run_BCO:
         case bci_TESTLT_I: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            I_ stackInt = (I_)SpW(0);
+            I_ stackInt = (I_)ReadSpW(0);
             if (stackInt >= (I_)BCO_LIT(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1816,7 +2284,7 @@ run_BCO:
         case bci_TESTLT_I64: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt64 stackInt = (*(StgInt64*)Sp);
+            StgInt64 stackInt = ReadSpW64(0);
             if (stackInt >= BCO_LITI64(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1825,7 +2293,7 @@ run_BCO:
         case bci_TESTLT_I32: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt32 stackInt = (*(StgInt32*)Sp);
+            StgInt32 stackInt = (StgInt32) ReadSpW(0);
             if (stackInt >= (StgInt32)BCO_LIT(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1834,7 +2302,7 @@ run_BCO:
         case bci_TESTLT_I16: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt16 stackInt = (*(StgInt16*)Sp);
+            StgInt16 stackInt = (StgInt16) ReadSpW(0);
             if (stackInt >= (StgInt16)BCO_LIT(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1843,7 +2311,7 @@ run_BCO:
         case bci_TESTLT_I8: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt8 stackInt = (*(StgInt8*)Sp);
+            StgInt8 stackInt = (StgInt8) ReadSpW(0);
             if (stackInt >= (StgInt8)BCO_LIT(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1852,7 +2320,7 @@ run_BCO:
         case bci_TESTEQ_I: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            I_ stackInt = (I_)SpW(0);
+            I_ stackInt = (I_)ReadSpW(0);
             if (stackInt != (I_)BCO_LIT(discr)) {
                 bciPtr = failto;
             }
@@ -1862,7 +2330,7 @@ run_BCO:
         case bci_TESTEQ_I64: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt64 stackInt = (*(StgInt64*)Sp);
+            StgInt64 stackInt = ReadSpW64(0);
             if (stackInt != BCO_LITI64(discr)) {
                 bciPtr = failto;
             }
@@ -1872,7 +2340,7 @@ run_BCO:
         case bci_TESTEQ_I32: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt32 stackInt = (*(StgInt32*)Sp);
+            StgInt32 stackInt = (StgInt32) ReadSpW(0);
             if (stackInt != (StgInt32)BCO_LIT(discr)) {
                 bciPtr = failto;
             }
@@ -1882,7 +2350,7 @@ run_BCO:
         case bci_TESTEQ_I16: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt16 stackInt = (*(StgInt16*)Sp);
+            StgInt16 stackInt = (StgInt16) ReadSpW(0);
             if (stackInt != (StgInt16)BCO_LIT(discr)) {
                 bciPtr = failto;
             }
@@ -1892,7 +2360,7 @@ run_BCO:
         case bci_TESTEQ_I8: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt8 stackInt = (*(StgInt8*)Sp);
+            StgInt8 stackInt = (StgInt8) ReadSpW(0);
             if (stackInt != (StgInt8)BCO_LIT(discr)) {
                 bciPtr = failto;
             }
@@ -1902,7 +2370,7 @@ run_BCO:
         case bci_TESTLT_W: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            W_ stackWord = (W_)SpW(0);
+            W_ stackWord = (W_)ReadSpW(0);
             if (stackWord >= (W_)BCO_LIT(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1911,7 +2379,7 @@ run_BCO:
         case bci_TESTLT_W64: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord64 stackWord = (*(StgWord64*)Sp);
+            StgWord64 stackWord = ReadSpW64(0);
             if (stackWord >= BCO_LITW64(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1920,7 +2388,7 @@ run_BCO:
         case bci_TESTLT_W32: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord32 stackWord = (*(StgWord32*)Sp);
+            StgWord32 stackWord = (StgWord32) ReadSpW(0);
             if (stackWord >= (StgWord32)BCO_LIT(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1929,7 +2397,7 @@ run_BCO:
         case bci_TESTLT_W16: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord16 stackWord = (*(StgWord16*)Sp);
+            StgWord16 stackWord = (StgInt16) ReadSpW(0);
             if (stackWord >= (StgWord16)BCO_LIT(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1938,7 +2406,7 @@ run_BCO:
         case bci_TESTLT_W8: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord8 stackWord = (*(StgWord8*)Sp);
+            StgWord8 stackWord = (StgInt8) ReadSpW(0);
             if (stackWord >= (StgWord8)BCO_LIT(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1947,7 +2415,7 @@ run_BCO:
         case bci_TESTEQ_W: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            W_ stackWord = (W_)SpW(0);
+            W_ stackWord = (W_)ReadSpW(0);
             if (stackWord != (W_)BCO_LIT(discr)) {
                 bciPtr = failto;
             }
@@ -1957,7 +2425,7 @@ run_BCO:
         case bci_TESTEQ_W64: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord64 stackWord = (*(StgWord64*)Sp);
+            StgWord64 stackWord = ReadSpW64(0);
             if (stackWord != BCO_LITW64(discr)) {
                 bciPtr = failto;
             }
@@ -1967,7 +2435,7 @@ run_BCO:
         case bci_TESTEQ_W32: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord32 stackWord = (*(StgWord32*)Sp);
+            StgWord32 stackWord = (StgWord32) ReadSpW(0);
             if (stackWord != (StgWord32)BCO_LIT(discr)) {
                 bciPtr = failto;
             }
@@ -1977,7 +2445,7 @@ run_BCO:
         case bci_TESTEQ_W16: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord16 stackWord = (*(StgWord16*)Sp);
+            StgWord16 stackWord = (StgWord16) ReadSpW(0);
             if (stackWord != (StgWord16)BCO_LIT(discr)) {
                 bciPtr = failto;
             }
@@ -1987,7 +2455,7 @@ run_BCO:
         case bci_TESTEQ_W8: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord8 stackWord = (*(StgWord8*)Sp);
+            StgWord8 stackWord = (StgWord8) ReadSpW(0);
             if (stackWord != (StgWord8)BCO_LIT(discr)) {
                 bciPtr = failto;
             }
@@ -2056,7 +2524,7 @@ run_BCO:
             goto eval;
 
         case bci_RETURN_P:
-            tagged_obj = (StgClosure *)SpW(0);
+            tagged_obj = (StgClosure *)ReadSpW(0);
             Sp_addW(1);
             goto do_return_pointer;
 
@@ -2087,10 +2555,14 @@ run_BCO:
             goto do_return_nonpointer;
         }
 
+        case bci_BCO_NAME:
+            bciPtr++;
+            goto nextInsn;
+
         case bci_SWIZZLE: {
             W_ stkoff = BCO_GET_LARGE_ARG;
             StgInt n = BCO_GET_LARGE_ARG;
-            (*(StgInt*)(Sp_plusW(stkoff))) += n;
+            (*(StgInt*)(SafeSpWP(stkoff))) += n;
             goto nextInsn;
         }
 
@@ -2098,6 +2570,203 @@ run_BCO:
             Sp_subW(1);
             SpW(0) = (W_)&stg_primcall_info;
             RETURN_TO_SCHEDULER_NO_PAUSE(ThreadRunGHC, ThreadYielding);
+        }
+
+// op :: ty -> ty
+#define UN_SIZED_OP(op,ty)                                          \
+    {                                                               \
+        if(sizeof(ty) == 8) {                                       \
+            ty r = op ((ty) ReadSpW64(0));                        \
+            SpW64(0) = (StgWord64) r;                               \
+        } else {                                                    \
+            ty r = op ((ty) ReadSpW(0));                          \
+            SpW(0) = (StgWord) r;                                   \
+        }                                                           \
+        goto nextInsn;                                              \
+    }
+
+// op :: ty -> ty -> ty
+#define SIZED_BIN_OP(op,ty)                                                     \
+        {                                                                       \
+            if(sizeof(ty) == 8) {                                               \
+                ty r = ((ty) ReadSpW64(0)) op ((ty) ReadSpW64(1));                  \
+                Sp_addW64(1);                                                   \
+                SpW64(0) = (StgWord64) r;                                       \
+            } else {                                                            \
+                ty r = ((ty) ReadSpW(0)) op ((ty) ReadSpW(1));                  \
+                Sp_addW(1);                                                     \
+                SpW(0) = (StgWord) r;                                           \
+            };                                                                  \
+            goto nextInsn;                                                      \
+        }
+
+// op :: ty -> Int -> ty
+#define SIZED_BIN_OP_TY_INT(op,ty)                                      \
+{                                                                       \
+    if(sizeof(ty) > sizeof(StgWord)) {                                  \
+        ty r = ((ty) ReadSpW64(0)) op ((ty) ReadSpW(2));                \
+        Sp_addW(1);                                                     \
+        SpW64(0) = (StgWord64) r;                                       \
+    } else {                                                            \
+        ty r = ((ty) ReadSpW(0)) op ((ty) ReadSpW(1));                  \
+        Sp_addW(1);                                                     \
+        SpW(0) = (StgWord) r;                                           \
+    };                                                                  \
+    goto nextInsn;                                                      \
+}
+
+// op :: ty -> ty -> Int
+#define SIZED_BIN_OP_TY_TY_INT(op,ty)                                   \
+{                                                                       \
+    if(sizeof(ty) > sizeof(StgWord)) {                                  \
+        ty r = ((ty) ReadSpW64(0)) op ((ty) ReadSpW64(1));              \
+        Sp_addW(3);                                                     \
+        SpW(0) = (StgWord) r;                                       \
+    } else {                                                            \
+        ty r = ((ty) ReadSpW(0)) op ((ty) ReadSpW(1));                  \
+        Sp_addW(1);                                                     \
+        SpW(0) = (StgWord) r;                                           \
+    };                                                                  \
+    goto nextInsn;                                                      \
+}
+
+        case bci_OP_ADD_64: SIZED_BIN_OP(+, StgInt64)
+        case bci_OP_SUB_64: SIZED_BIN_OP(-, StgInt64)
+        case bci_OP_AND_64: SIZED_BIN_OP(&, StgInt64)
+        case bci_OP_XOR_64: SIZED_BIN_OP(^, StgInt64)
+        case bci_OP_OR_64:  SIZED_BIN_OP(|, StgInt64)
+        case bci_OP_MUL_64: SIZED_BIN_OP(*, StgInt64)
+        case bci_OP_SHL_64: SIZED_BIN_OP_TY_INT(<<, StgWord64)
+        case bci_OP_LSR_64: SIZED_BIN_OP_TY_INT(>>, StgWord64)
+        case bci_OP_ASR_64: SIZED_BIN_OP_TY_INT(>>, StgInt64)
+
+        case bci_OP_NEQ_64:  SIZED_BIN_OP_TY_TY_INT(!=, StgWord64)
+        case bci_OP_EQ_64:   SIZED_BIN_OP_TY_TY_INT(==, StgWord64)
+        case bci_OP_U_GT_64: SIZED_BIN_OP_TY_TY_INT(>, StgWord64)
+        case bci_OP_U_GE_64: SIZED_BIN_OP_TY_TY_INT(>=, StgWord64)
+        case bci_OP_U_LT_64: SIZED_BIN_OP_TY_TY_INT(<, StgWord64)
+        case bci_OP_U_LE_64: SIZED_BIN_OP_TY_TY_INT(<=, StgWord64)
+
+        case bci_OP_S_GT_64: SIZED_BIN_OP_TY_TY_INT(>, StgInt64)
+        case bci_OP_S_GE_64: SIZED_BIN_OP_TY_TY_INT(>=, StgInt64)
+        case bci_OP_S_LT_64: SIZED_BIN_OP_TY_TY_INT(<, StgInt64)
+        case bci_OP_S_LE_64: SIZED_BIN_OP_TY_TY_INT(<=, StgInt64)
+
+        case bci_OP_NOT_64: UN_SIZED_OP(~, StgWord64)
+        case bci_OP_NEG_64: UN_SIZED_OP(-, StgInt64)
+
+
+        case bci_OP_ADD_32: SIZED_BIN_OP(+, StgInt32)
+        case bci_OP_SUB_32: SIZED_BIN_OP(-, StgInt32)
+        case bci_OP_AND_32: SIZED_BIN_OP(&, StgInt32)
+        case bci_OP_XOR_32: SIZED_BIN_OP(^, StgInt32)
+        case bci_OP_OR_32:  SIZED_BIN_OP(|, StgInt32)
+        case bci_OP_MUL_32: SIZED_BIN_OP(*, StgInt32)
+        case bci_OP_SHL_32: SIZED_BIN_OP_TY_INT(<<, StgWord32)
+        case bci_OP_LSR_32: SIZED_BIN_OP_TY_INT(>>, StgWord32)
+        case bci_OP_ASR_32: SIZED_BIN_OP_TY_INT(>>, StgInt32)
+
+        case bci_OP_NEQ_32:  SIZED_BIN_OP_TY_TY_INT(!=, StgWord32)
+        case bci_OP_EQ_32:   SIZED_BIN_OP_TY_TY_INT(==, StgWord32)
+        case bci_OP_U_GT_32: SIZED_BIN_OP_TY_TY_INT(>, StgWord32)
+        case bci_OP_U_GE_32: SIZED_BIN_OP_TY_TY_INT(>=, StgWord32)
+        case bci_OP_U_LT_32: SIZED_BIN_OP_TY_TY_INT(<, StgWord32)
+        case bci_OP_U_LE_32: SIZED_BIN_OP_TY_TY_INT(<=, StgWord32)
+
+        case bci_OP_S_GT_32: SIZED_BIN_OP_TY_TY_INT(>, StgInt32)
+        case bci_OP_S_GE_32: SIZED_BIN_OP_TY_TY_INT(>=, StgInt32)
+        case bci_OP_S_LT_32: SIZED_BIN_OP_TY_TY_INT(<, StgInt32)
+        case bci_OP_S_LE_32: SIZED_BIN_OP_TY_TY_INT(<=, StgInt32)
+
+        case bci_OP_NOT_32: UN_SIZED_OP(~, StgWord32)
+        case bci_OP_NEG_32: UN_SIZED_OP(-, StgInt32)
+
+
+        case bci_OP_ADD_16: SIZED_BIN_OP(+, StgInt16)
+        case bci_OP_SUB_16: SIZED_BIN_OP(-, StgInt16)
+        case bci_OP_AND_16: SIZED_BIN_OP(&, StgInt16)
+        case bci_OP_XOR_16: SIZED_BIN_OP(^, StgInt16)
+        case bci_OP_OR_16:  SIZED_BIN_OP(|, StgInt16)
+        case bci_OP_MUL_16: SIZED_BIN_OP(*, StgInt16)
+        case bci_OP_SHL_16: SIZED_BIN_OP_TY_INT(<<, StgWord16)
+        case bci_OP_LSR_16: SIZED_BIN_OP_TY_INT(>>, StgWord16)
+        case bci_OP_ASR_16: SIZED_BIN_OP_TY_INT(>>, StgInt16)
+
+        case bci_OP_NEQ_16:  SIZED_BIN_OP_TY_TY_INT(!=, StgWord16)
+        case bci_OP_EQ_16:   SIZED_BIN_OP_TY_TY_INT(==, StgWord16)
+        case bci_OP_U_GT_16: SIZED_BIN_OP_TY_TY_INT(>, StgWord16)
+        case bci_OP_U_GE_16: SIZED_BIN_OP_TY_TY_INT(>=, StgWord16)
+        case bci_OP_U_LT_16: SIZED_BIN_OP_TY_TY_INT(<, StgWord16)
+        case bci_OP_U_LE_16: SIZED_BIN_OP_TY_TY_INT(<=, StgWord16)
+
+        case bci_OP_S_GT_16: SIZED_BIN_OP(>, StgInt16)
+        case bci_OP_S_GE_16: SIZED_BIN_OP(>=, StgInt16)
+        case bci_OP_S_LT_16: SIZED_BIN_OP(<, StgInt16)
+        case bci_OP_S_LE_16: SIZED_BIN_OP(<=, StgInt16)
+
+        case bci_OP_NOT_16: UN_SIZED_OP(~, StgWord16)
+        case bci_OP_NEG_16: UN_SIZED_OP(-, StgInt16)
+
+
+        case bci_OP_ADD_08: SIZED_BIN_OP(+, StgInt8)
+        case bci_OP_SUB_08: SIZED_BIN_OP(-, StgInt8)
+        case bci_OP_AND_08: SIZED_BIN_OP(&, StgInt8)
+        case bci_OP_XOR_08: SIZED_BIN_OP(^, StgInt8)
+        case bci_OP_OR_08:  SIZED_BIN_OP(|, StgInt8)
+        case bci_OP_MUL_08: SIZED_BIN_OP(*, StgInt8)
+        case bci_OP_SHL_08: SIZED_BIN_OP_TY_INT(<<, StgWord8)
+        case bci_OP_LSR_08: SIZED_BIN_OP_TY_INT(>>, StgWord8)
+        case bci_OP_ASR_08: SIZED_BIN_OP_TY_INT(>>, StgInt8)
+
+        case bci_OP_NEQ_08:  SIZED_BIN_OP_TY_TY_INT(!=, StgWord8)
+        case bci_OP_EQ_08:   SIZED_BIN_OP_TY_TY_INT(==, StgWord8)
+        case bci_OP_U_GT_08: SIZED_BIN_OP_TY_TY_INT(>, StgWord8)
+        case bci_OP_U_GE_08: SIZED_BIN_OP_TY_TY_INT(>=, StgWord8)
+        case bci_OP_U_LT_08: SIZED_BIN_OP_TY_TY_INT(<, StgWord8)
+        case bci_OP_U_LE_08: SIZED_BIN_OP_TY_TY_INT(<=, StgWord8)
+
+        case bci_OP_S_GT_08: SIZED_BIN_OP_TY_TY_INT(>, StgInt8)
+        case bci_OP_S_GE_08: SIZED_BIN_OP_TY_TY_INT(>=, StgInt8)
+        case bci_OP_S_LT_08: SIZED_BIN_OP_TY_TY_INT(<, StgInt8)
+        case bci_OP_S_LE_08: SIZED_BIN_OP_TY_TY_INT(<=, StgInt8)
+
+        case bci_OP_NOT_08: UN_SIZED_OP(~, StgWord8)
+        case bci_OP_NEG_08: UN_SIZED_OP(-, StgInt8)
+
+        case bci_OP_INDEX_ADDR_64:
+        {
+            StgWord64* addr = (StgWord64*) SpW(0);
+            StgInt offset = (StgInt) SpW(1);
+            if(sizeof(StgPtr) == sizeof(StgWord64)) {
+                Sp_addW(1);
+            }
+            SpW64(0) = *(addr+offset);
+            goto nextInsn;
+        }
+
+        case bci_OP_INDEX_ADDR_32:
+        {
+            StgWord32* addr = (StgWord32*) SpW(0);
+            StgInt offset = (StgInt) SpW(1);
+            Sp_addW(1);
+            SpW(0) = (StgWord) *(addr+offset);
+            goto nextInsn;
+        }
+        case bci_OP_INDEX_ADDR_16:
+        {
+            StgWord16* addr = (StgWord16*) SpW(0);
+            StgInt offset = (StgInt) SpW(1);
+            Sp_addW(1);
+            SpW(0) = (StgWord) *(addr+offset);
+            goto nextInsn;
+        }
+        case bci_OP_INDEX_ADDR_08:
+        {
+            StgWord8* addr = (StgWord8*) SpW(0);
+            StgInt offset = (StgInt) SpW(1);
+            Sp_addW(1);
+            SpW(0) = (StgWord) *(addr+offset);
+            goto nextInsn;
         }
 
         case bci_CCALL: {
@@ -2179,7 +2848,7 @@ run_BCO:
             }
 
             // this is the function we're going to call
-            fn = (void(*)(void))SpW(ret_size);
+            fn = (void(*)(void))ReadSpW(ret_size);
 
             // Restore the Haskell thread's current value of errno
             errno = cap->r.rCurrentTSO->saved_errno;
@@ -2230,7 +2899,7 @@ run_BCO:
             // Re-load the pointer to the BCO from the stg_ret_p frame,
             // it might have moved during the call.  Also reload the
             // pointers to the components of the BCO.
-            obj        = (StgClosure*)SpW(1);
+            obj        = (StgClosure*)ReadSpW(1);
               // N.B. this is a BCO and therefore is by definition not tagged
             bco        = (StgBCO*)obj;
             instrs     = (StgWord16*)(bco->instrs->payload);

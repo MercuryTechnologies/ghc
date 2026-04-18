@@ -16,7 +16,6 @@
 
 module GHC.Tc.Gen.App
        ( tcApp
-       , tcInferSigma
        , tcExprPrag ) where
 
 import {-# SOURCE #-} GHC.Tc.Gen.Expr( tcPolyExpr )
@@ -33,6 +32,7 @@ import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.Concrete  ( unifyConcrete, idConcreteTvs )
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Types.ErrCtxt ( FunAppCtxtFunArg(..) )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType as TcType
 import GHC.Tc.Utils.Concrete( hasFixedRuntimeRep_syntactic )
@@ -166,26 +166,6 @@ Note [Instantiation variables are short lived]
 
 {- *********************************************************************
 *                                                                      *
-              tcInferSigma
-*                                                                      *
-********************************************************************* -}
-
-tcInferSigma :: Bool -> LHsExpr GhcRn -> TcM TcSigmaType
--- Used only to implement :type; see GHC.Tc.Module.tcRnExpr
--- True  <=> instantiate -- return a rho-type
--- False <=> don't instantiate -- return a sigma-type
-tcInferSigma inst (L loc rn_expr)
-  = addExprCtxt rn_expr $
-    setSrcSpanA loc     $
-    do { (fun@(rn_fun,fun_ctxt), rn_args) <- splitHsApps rn_expr
-       ; do_ql <- wantQuickLook rn_fun
-       ; (tc_fun, fun_sigma) <- tcInferAppHead fun
-       ; (inst_args, app_res_sigma) <- tcInstFun do_ql inst (tc_fun, fun_ctxt) fun_sigma rn_args
-       ; _ <- tcValArgs do_ql inst_args
-       ; return app_res_sigma }
-
-{- *********************************************************************
-*                                                                      *
               Typechecking n-ary applications
 *                                                                      *
 ********************************************************************* -}
@@ -218,9 +198,9 @@ using the application chain route, and we can just recurse to tcExpr.
 
 A "head" has three special cases (for which we can infer a polytype
 using tcInferAppHead_maybe); otherwise is just any old expression (for
-which we can infer a rho-type (via tcInfer).
+which we can infer a rho-type (via runInferExpr).
 
-There is no special treatment for HsUnboundVar, HsOverLit etc, because
+There is no special treatment for HsHole (HsVar ...), HsOverLit, etc, because
 we can't get a polytype from them.
 
 Left and right sections (e.g. (x +) and (+ x)) are not yet supported.
@@ -402,13 +382,22 @@ tcApp rn_expr exp_res_ty
        -- Step 2: Infer the type of `fun`, the head of the application
        ; (tc_fun, fun_sigma) <- tcInferAppHead fun
        ; let tc_head = (tc_fun, fun_ctxt)
+             -- inst_final: top-instantiate the result type of the application,
+             -- EXCEPT if we are trying to infer a sigma-type
+             inst_final = case exp_res_ty of
+                             Check {} -> True
+                             Infer (IR {ir_inst=iif}) ->
+                                case iif of
+                                  IIF_ShallowRho -> True
+                                  IIF_DeepRho    -> True
+                                  IIF_Sigma      -> False
 
        -- Step 3: Instantiate the function type (taking a quick look at args)
        ; do_ql <- wantQuickLook rn_fun
        ; (inst_args, app_res_rho)
               <- setQLInstLevel do_ql $  -- See (TCAPP1) and (TCAPP2) in
                                          -- Note [tcApp: typechecking applications]
-                 tcInstFun do_ql True tc_head fun_sigma rn_args
+                 tcInstFun do_ql inst_final tc_head fun_sigma rn_args
 
        ; case do_ql of
             NoQL -> do { traceTc "tcApp:NoQL" (ppr rn_fun $$ ppr app_res_rho)
@@ -419,6 +408,7 @@ tcApp rn_expr exp_res_ty
                                                    app_res_rho exp_res_ty
                          -- Step 4.2: typecheck the  arguments
                        ; tc_args <- tcValArgs NoQL inst_args
+
                          -- Step 4.3: wrap up
                        ; finishApp tc_head tc_args app_res_rho res_wrap }
 
@@ -426,14 +416,17 @@ tcApp rn_expr exp_res_ty
 
                          -- Step 5.1: Take a quick look at the result type
                        ; quickLookResultType app_res_rho exp_res_ty
+
                          -- Step 5.2: typecheck the arguments, and monomorphise
                          --           any un-unified instantiation variables
                        ; tc_args <- tcValArgs DoQL inst_args
-                         -- Step 5.3: typecheck the arguments
+                         -- Step 5.3: zonk to expose the polymophism hidden under
+                         --           QuickLook instantiation variables in `app_res_rho`
                        ; app_res_rho <- liftZonkM $ zonkTcType app_res_rho
+
                          -- Step 5.4: subsumption check against the expected type
                        ; res_wrap <- checkResultTy rn_expr tc_head inst_args
-                                                   app_res_rho exp_res_ty
+                                                    app_res_rho exp_res_ty
                          -- Step 5.5: wrap up
                        ; finishApp tc_head tc_args app_res_rho res_wrap } }
 
@@ -459,20 +452,21 @@ finishApp tc_head@(tc_fun,_) tc_args app_res_rho res_wrap
        ; res_expr <- if isTagToEnum tc_fun
                      then tcTagToEnum tc_head tc_args app_res_rho
                      else return (rebuildHsApps tc_head tc_args)
+       ; traceTc "End tcApp }" (ppr tc_fun)
        ; return (mkHsWrap res_wrap res_expr) }
 
+-- | Connect up the inferred type of an application with the expected type.
+-- This is usually just a unification, but with deep subsumption there is more to do.
 checkResultTy :: HsExpr GhcRn
               -> (HsExpr GhcTc, AppCtxt)  -- Head
               -> [HsExprArg p]            -- Arguments, just error messages
               -> TcRhoType  -- Inferred type of the application; zonked to
-                            --   expose foralls, but maybe not deeply instantiated
+                            --   expose foralls, but maybe not /deeply/ instantiated
               -> ExpRhoType -- Expected type; this is deeply skolemised
               -> TcM HsWrapper
--- Connect up the inferred type of the application with the expected type
--- This is usually just a unification, but with deep subsumption there is more to do
-checkResultTy _ _ _ app_res_rho (Infer inf_res)
-  = do { co <- fillInferResult app_res_rho inf_res
-       ; return (mkWpCastN co) }
+checkResultTy rn_expr _fun _inst_args app_res_rho (Infer inf_res)
+  = fillInferResult (exprCtOrigin rn_expr) app_res_rho inf_res
+    -- fillInferResult does deep instantiation if DeepSubsumption is on
 
 checkResultTy rn_expr (tc_fun, fun_ctxt) inst_args app_res_rho (Check res_ty)
 -- Unify with expected type from the context
@@ -500,8 +494,6 @@ checkResultTy rn_expr (tc_fun, fun_ctxt) inst_args app_res_rho (Check res_ty)
              -- Even though both app_res_rho and res_ty are rho-types,
              -- they may have nested polymorphism, so if deep subsumption
              -- is on we must call tcSubType.
-             -- Zonk app_res_rho first, because QL may have instantiated some
-             -- delta variables to polytypes, and tcSubType doesn't expect that
              do { wrap <- tcSubTypeDS rn_expr app_res_rho res_ty
                 ; traceTc "checkResultTy 2 }" (ppr app_res_rho $$ ppr res_ty)
                 ; return wrap } }
@@ -569,6 +561,7 @@ tcValArg _ (EValArgQL { eaql_wanted  = wanted
                       , eaql_arg_ty  = sc_arg_ty
                       , eaql_larg    = larg@(L arg_loc rn_expr)
                       , eaql_tc_fun  = tc_head
+                      , eaql_fun_ue  = head_ue
                       , eaql_args    = inst_args
                       , eaql_encl    = arg_influences_enclosing_call
                       , eaql_res_rho = app_res_rho })
@@ -578,7 +571,8 @@ tcValArg _ (EValArgQL { eaql_wanted  = wanted
 
        ; traceTc "tcEValArgQL {" (vcat [ text "app_res_rho:" <+> ppr app_res_rho
                                        , text "exp_arg_ty:" <+> ppr exp_arg_ty
-                                       , text "args:" <+> ppr inst_args ])
+                                       , text "args:" <+> ppr inst_args
+                                       , text "mult:" <+> ppr mult])
 
        ; ds_flag <- getDeepSubsumptionFlag
        ; (wrap, arg')
@@ -587,6 +581,9 @@ tcValArg _ (EValArgQL { eaql_wanted  = wanted
                do { -- Emit saved-up constraints, /under/ the tcSkolemise
                     -- See (QLA4) in Note [Quick Look at value arguments]
                     emitConstraints wanted
+                    -- Emit saved-up usages /under/ the tcScalingUsage.
+                    -- See (QLA5) in Note [Quick Look at value arguments]
+                  ; tcEmitBindingUsage head_ue
 
                     -- Unify with context if we have not already done so
                     -- See (QLA4) in Note [Quick Look at value arguments]
@@ -609,7 +606,7 @@ tcValArg _ (EValArgQL { eaql_wanted  = wanted
 
 --------------------
 wantQuickLook :: HsExpr GhcRn -> TcM QLFlag
-wantQuickLook (HsVar _ (L _ f))
+wantQuickLook (HsVar _ (L _ (WithUserRdr _ f)))
   | getUnique f `elem` quickLookKeys = return DoQL
 wantQuickLook _                      = do { impred <- xoptM LangExt.ImpredicativeTypes
                                           ; if impred then return DoQL else return NoQL }
@@ -625,18 +622,16 @@ quickLookKeys = [dollarIdKey, leftSectionKey, rightSectionKey]
 ********************************************************************* -}
 
 tcInstFun :: QLFlag
-          -> Bool   -- False <=> Instantiate only /inferred/ variables at the end
+          -> Bool   -- False <=> Instantiate only /top-level, inferred/ variables;
                     --           so may return a sigma-type
-                    -- True  <=> Instantiate all type variables at the end:
-                    --           return a rho-type
-                    -- The /only/ call site that passes in False is the one
-                    --    in tcInferSigma, which is used only to implement :type
-                    -- Otherwise we do eager instantiation; in Fig 5 of the paper
+                    -- True  <=> Instantiate /top-level, invisible/ type variables;
+                    --           always return a rho-type (but not a deep-rho type)
+                    -- Generally speaking we pass in True; in Fig 5 of the paper
                     --    |-inst returns a rho-type
           -> (HsExpr GhcTc, AppCtxt)
           -> TcSigmaType -> [HsExprArg 'TcpRn]
           -> TcM ( [HsExprArg 'TcpInst]
-                 , TcSigmaType )
+                 , TcSigmaType )   -- Does not instantiate trailing invisible foralls
 -- This crucial function implements the |-inst judgement in Fig 4, plus the
 -- modification in Fig 5, of the QL paper:
 -- "A quick look at impredicativity" (ICFP'20).
@@ -674,17 +669,13 @@ tcInstFun do_ql inst_final (tc_fun, fun_ctxt) fun_sigma rn_args
 
     fun_is_out_of_scope  -- See Note [VTA for out-of-scope functions]
       = case tc_fun of
-          HsUnboundVar {} -> True
+          HsHole _        -> True
           _               -> False
 
     inst_fun :: [HsExprArg 'TcpRn] -> ForAllTyFlag -> Bool
-    -- True <=> instantiate a tyvar with this ForAllTyFlag
+    -- True <=> instantiate a tyvar that has this ForAllTyFlag
     inst_fun [] | inst_final  = isInvisibleForAllTyFlag
                 | otherwise   = const False
-                -- Using `const False` for `:type` avoids
-                -- `forall {r1} (a :: TYPE r1) {r2} (b :: TYPE r2). a -> b`
-                -- turning into `forall a {r2} (b :: TYPE r2). a -> b`.
-                -- See #21088.
     inst_fun (EValArg {} : _) = isInvisibleForAllTyFlag
     inst_fun _                = isInferredForAllTyFlag
 
@@ -899,7 +890,7 @@ addArgCtxt ctxt (L arg_loc arg) thing_inside
        ; case ctxt of
            VACall fun arg_no _ | not in_generated_code
              -> do setSrcSpanA arg_loc                    $
-                     addErrCtxt (funAppCtxt fun arg arg_no) $
+                     addErrCtxt (FunAppCtxt (FunAppCtxtExpr fun arg) arg_no) $
                      thing_inside
 
            VAExpansion (OrigStmt (L _ stmt@(BindStmt {}))) _ loc
@@ -970,6 +961,7 @@ expr_to_type earg =
       -- only parts of it are, e.g. `vfun (Maybe Int)` or `vfun (Maybe (type Int))`.
       -- Apply a recursive T2T transformation.
       HsWC [] <$> go e
+        <* failIfErrsM   -- Suppress unhelpful errors that arise after a failed T2T
   where
     go :: LHsExpr GhcRn -> TcM (LHsType GhcRn)
     go (L _ (HsEmbTy _ t)) =
@@ -984,9 +976,9 @@ expr_to_type earg =
          ; res' <- go res
          ; return (L l (HsFunTy noExtField mult' arg' res'))}
          where
-          go_arrow :: HsArrowOf (LHsExpr GhcRn) GhcRn -> TcM (HsArrow GhcRn)
-          go_arrow (HsUnrestrictedArrow{}) = pure (HsUnrestrictedArrow noExtField)
-          go_arrow (HsLinearArrow{}) = pure (HsLinearArrow noExtField)
+          go_arrow :: HsMultAnnOf (LHsExpr GhcRn) GhcRn -> TcM (HsMultAnn GhcRn)
+          go_arrow (HsUnannotated _) = pure (HsUnannotated noExtField)
+          go_arrow (HsLinearAnn{}) = pure (HsLinearAnn noExtField)
           go_arrow (HsExplicitMult _ exp) = HsExplicitMult noExtField <$> go exp
     go (L l (HsForAll _ tele expr)) =
       do { ty <- go expr
@@ -996,9 +988,11 @@ expr_to_type earg =
          ; ty <- go expr
          ; return (L l (HsQualTy noExtField (L ann ctxt') ty)) }
     go (L l (HsVar _ lname)) =
-      -- as per #281: variables and constructors (regardless of their namespace)
-      -- are mapped directly, without modification.
-      return (L l (HsTyVar noAnn NotPromoted lname))
+      -- GHC Proposal #281, section 7.5 "T2T-Mapping":
+      --   variables and constructors (regardless of their namespace)
+      --   are mapped directly, without modification.
+      do { detect_puns lname
+         ; return (L l (HsTyVar noAnn NotPromoted lname)) }
     go (L l (HsApp _ lhs rhs)) =
       do { lhs' <- go lhs
          ; rhs' <- go rhs
@@ -1050,7 +1044,7 @@ expr_to_type earg =
       = do { t <- go (L l e)
            ; let splice_result' = HsUntypedSpliceTop finalizers t
            ; return (L l (HsSpliceTy splice_result' splice)) }
-    go (L l (HsUnboundVar _ rdr))
+    go (L l (HsHole (HoleVar (L _ rdr))))
       | isUnderscore occ = return (L l (HsWildCardTy noExtField))
       | startsWithUnderscore occ =
           -- See Note [Wildcards in the T2T translation]
@@ -1060,7 +1054,7 @@ expr_to_type earg =
                else not_in_scope }
       | otherwise = not_in_scope
       where occ = occName rdr
-            not_in_scope = failWith $ mkTcRnNotInScope rdr NotInScope
+            not_in_scope = failWith $ TcRnNotInScope NotInScope rdr
     go (L l (XExpr (ExpandedThingRn (OrigExpr orig) _))) =
       -- Use the original, user-written expression (before expansion).
       -- Example. Say we have   vfun :: forall a -> blah
@@ -1071,6 +1065,30 @@ expr_to_type earg =
       -- equivalent of fromListN, so we must use the original.
       go (L l orig)
     go e = failWith $ TcRnIllformedTypeArgument e
+
+    detect_puns :: LocatedN (WithUserRdr Name) -> TcM ()
+      -- GHC Proposal #281, section 7.5 "T2T-Mapping":
+      --   there should be no variable of the same name but from
+      --   a different namespace, or else raise an ambiguity error
+      --   (does not apply to constructors)
+    detect_puns (L l (WithUserRdr rdr _))
+      | isTermVarOrFieldNameSpace (rdrNameSpace rdr)
+      , Just promoted_rdr <- promoteRdrName rdr
+      = do { envs <- getRdrEnvs
+           ; whenIsJust (lookup_rdr envs rdr) $ \unpromoted ->
+             whenIsJust (lookup_rdr envs promoted_rdr) $ \promoted ->
+               addErrAt (locA l) $
+               TcRnIllegalPunnedVarOccInTypeArgument { illegalPunTermName = unpromoted
+                                                     , illegalPunTypeName = promoted } }
+      | otherwise = return ()
+
+    lookup_rdr :: (GlobalRdrEnv, LocalRdrEnv) -> RdrName -> Maybe ResolvedNameInfo
+    lookup_rdr (gbl_env, lcl_env) rdr
+      | Just name <- lookupLocalRdrEnv lcl_env rdr
+      = Just (ResolvedNameInfo [] rdr name)
+      | gres@(gre:_) <- lookupGRE gbl_env (LookupRdrName rdr (RelevantGREsFOS WantNormal))
+      = Just (ResolvedNameInfo gres rdr (gre_name gre))
+      | otherwise = Nothing
 
     unwrap_wc :: HsWildCardBndrs GhcRn t -> TcM t
     unwrap_wc (HsWC wcs t)
@@ -1122,7 +1140,7 @@ This conversion is in the TcM monad because
       vfun [x | x <- xs]     Can't convert list comprehension to a type
       vfun (\x -> x)         Can't convert a lambda to a type
 * It needs to check for LangExt.NamedWildCards to generate an appropriate
-  error message for HsUnboundVar.
+  error message for HsHole (HsVar ...).
      vfun _a    Not in scope: ‘_a’
                    (NamedWildCards disabled)
      vfun _a    Illegal named wildcard in a required type argument: ‘_a’
@@ -1184,20 +1202,19 @@ tc_inst_forall_arg conc_tvs (tvb, inner_ty) hs_ty
        --
        -- See [Wrinkle: VTA] in Note [Representation-polymorphism checking built-ins]
        -- in GHC.Tc.Utils.Concrete.
-       ; th_stage <- getStage
+       ; th_lvl <- getThLevel
        ; ty_arg <- case mb_conc of
            Nothing   -> return ty_arg0
            Just conc
              -- See [Wrinkle: Typed Template Haskell]
              -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-             | Brack _ (TcPending {}) <- th_stage
+             | TypedBrack {} <- th_lvl
              -> return ty_arg0
              | otherwise
              ->
              -- Example: user wrote e.g. (#,#) @(F Bool) for a type family F.
              -- Emit [W] F Bool ~ kappa[conc] and pretend the user wrote (#,#) @kappa.
-             do { mco <- unifyConcrete (occNameFS $ getOccName $ tv_nm) conc ty_arg0
-                ; return $ case mco of { MRefl -> ty_arg0; MCo co -> coercionRKind co } }
+               coercionRKind <$> unifyConcrete (occNameFS $ getOccName $ tv_nm) conc ty_arg0
 
        ; let fun_ty    = mkForAllTy tvb inner_ty
              in_scope  = mkInScopeSet (tyCoVarsOfTypes [fun_ty, ty_arg])
@@ -1332,17 +1349,18 @@ Syntax of applications in HsExpr
 Syntax of abstractions in Pat
 -----------------------------
 * Type patterns are represented in Pat roughly like this
-     data Pat = ConPat   ConLike [HsTyPat] [Pat]  -- (Con @tp1 @tp2 p1 p2)  (constructor pattern)
-              | EmbTyPat HsTyPat                  -- (type tp)              (embed a type into a pattern with `type`)
+     data Pat = ConPat   ConLike [Pat]  -- (Con @tp1 @tp2 p1 p2)  (constructor pattern)
+              | EmbTyPat HsTyPat        -- (type tp)              (embed a type into a pattern with `type`)
+              | InvisPat HsTyPat        -- (@tp)                  (invisible type pattern)
               | ...
      data HsTyPat = HsTP LHsType
   (In ConPat, the type and term arguments are actually inside HsConPatDetails.)
 
-  * Similar to HsAppType in HsExpr, the [HsTyPat] in ConPat is used just for @ty arguments
+  * Similar to HsAppType in HsExpr, InvisPat in ConPat is used for @ty arguments
   * Similar to HsEmbTy   in HsExpr, EmbTyPat lets you embed a type in a pattern
 
 * Examples:
-      \ (MkT @a  (x :: a)) -> rhs    -- ConPat (c.o. Pat) and HsConPatTyArg (c.o. HsConPatTyArg)
+      \ (MkT @a  (x :: a)) -> rhs    -- ConPat (c.o. Pat) and InvisPat (c.o. Pat)
       \ (type a) (x :: a)  -> rhs    -- EmbTyPat (c.o. Pat)
       \ a        (x :: a)  -> rhs    -- VarPat (c.o. Pat)
       \ @a       (x :: a)  -> rhs    -- InvisPat (c.o. Pat)
@@ -1473,7 +1491,7 @@ Note [VTA for out-of-scope functions]
 Suppose 'wurble' is not in scope, and we have
    (wurble @Int @Bool True 'x')
 
-Then the renamer will make (HsUnboundVar "wurble") for 'wurble',
+Then the renamer will make (HsHole (HsVar "wurble")) for 'wurble',
 and the typechecker will typecheck it with tcUnboundId, giving it
 a type 'alpha', and emitting a deferred Hole constraint, to
 be reported later.
@@ -1488,7 +1506,7 @@ tcUnboundId.  It later reports 'wurble' as out of scope, and tries to
 give its type.
 
 Fortunately in tcInstFun we still have access to the function, so we
-can check if it is a HsUnboundVar.  We use this info to simply skip
+can check if it is a HsHole.  We use this info to simply skip
 over any visible type arguments.  We'll /already/ have emitted a
 Hole constraint; failing preserves that constraint.
 
@@ -1630,6 +1648,41 @@ This turned out to be more subtle than I expected.  Wrinkles:
     (kappa = [forall a. a->a]).  Now we resume typechecking argument [], and
     we must take advantage of what we have now discovered about `kappa`,
     to typecheck   [] :: [forall a. a->a]
+
+(QLA5) In the quicklook pass, we don't scale multiplicities. Since arguments
+    aren't typechecked yet, we don't know their free variable usages
+    anyway. But, in a nested call, the head of an application chain is fully
+    typechecked.
+
+    In order for the multiplicities in the head to be properly scaled, we store
+    the head's usage environment in the eaql_fun_ue field. Then, when we do the
+    full-typechecking pass, we can emit the head's usage environment where we
+    would have typechecked the head in a naive algorithm.
+
+(QLA6) `quickLookArg` is supposed to capture the result of partially typechecking
+   the argument, so it can be resumed later.  "Capturing" should include all
+   generated type-class/equality constraints and Linear-Haskell usage info. There
+   are two calls in `quickLookArg1` that might generate such constraints:
+
+     - `tcInferAppHead_maybe`.  This can generat Linear-Haskell usage info, via
+       the call to `tcEmitBindingUsage` in `check_local_id`, which is called
+       indirectly by `tcInferAppHead_maybe`.
+
+       In contrast, `tcInferAppHead_maybe` does not generate any type-class or
+       equality constraints, because it doesn't instantiate any functions.  [But
+       see #25493 and #25494 for why this isn't quite true today.]
+
+    - `tcInstFun` generates lots of type-class and equality constraints, as it
+      instantiates the function.  But it generates no usage info, because that
+      comes only from the call to `check_local_id`, whose usage info is captured
+      in the call to `tcInferAppHead_maybe` in `quickLookArg1`.
+
+  Conclusion: in quickLookArg1:
+    - capture usage information (but not constraints)
+        for the call to `tcInferAppHead_maybe`
+    - capture constraints (but not usage information)
+        for the call to `tcInstFun`
+
 -}
 
 quickLookArg :: QLFlag -> AppCtxt
@@ -1697,7 +1750,12 @@ quickLookArg1 ctxt larg@(L _ arg) sc_arg_ty@(Scaled _ orig_arg_rho)
     do { ((rn_fun, fun_ctxt), rn_args) <- splitHsApps arg
 
        -- Step 1: get the type of the head of the argument
-       ; mb_fun_ty <- tcInferAppHead_maybe rn_fun
+       ; (fun_ue, mb_fun_ty) <- tcCollectingUsage $ tcInferAppHead_maybe rn_fun
+         -- tcCollectingUsage: the use of an Id at the head generates usage-info
+         -- See the call to `tcEmitBindingUsage` in `check_local_id`.  So we must
+         -- capture and save it in the `EValArgQL`.  See (QLA6) in
+         -- Note [Quick Look at value arguments]
+
        ; traceTc "quickLookArg {" $
          vcat [ text "arg:" <+> ppr arg
               , text "orig_arg_rho:" <+> ppr orig_arg_rho
@@ -1714,6 +1772,9 @@ quickLookArg1 ctxt larg@(L _ arg) sc_arg_ty@(Scaled _ orig_arg_rho)
        ; ((inst_args, app_res_rho), wanted)
              <- captureConstraints $
                 tcInstFun do_ql True tc_head fun_sigma rn_args
+                -- We must capture type-class and equality constraints here, but
+                -- not equality constraints.  See (QLA6) in Note [Quick Look at
+                -- value arguments]
 
        ; traceTc "quickLookArg 2" $
          vcat [ text "arg:" <+> ppr arg
@@ -1746,6 +1807,7 @@ quickLookArg1 ctxt larg@(L _ arg) sc_arg_ty@(Scaled _ orig_arg_rho)
                            , eaql_arg_ty  = sc_arg_ty
                            , eaql_larg    = larg
                            , eaql_tc_fun  = tc_head
+                           , eaql_fun_ue  = fun_ue
                            , eaql_args    = inst_args
                            , eaql_wanted  = wanted
                            , eaql_encl    = arg_influences_enclosing_call
@@ -1989,18 +2051,22 @@ qlUnify ty1 ty2
       = go_flexi1 kappa ty2
 
     go_flexi1 kappa ty2  -- ty2 is zonked
-      | -- See Note [QuickLook unification] (UQL1)
-        simpleUnifyCheck UC_QuickLook kappa ty2
-      = do { co <- unifyKind (Just (TypeThing ty2)) ty2_kind kappa_kind
-                   -- unifyKind: see (UQL2) in Note [QuickLook unification]
-                   --            and (MIV2) in Note [Monomorphise instantiation variables]
-           ; let ty2' = mkCastTy ty2 co
-           ; traceTc "qlUnify:update" $
-             ppr kappa <+> text ":=" <+> ppr ty2
-           ; liftZonkM $ writeMetaTyVar kappa ty2' }
-
-      | otherwise
-      = return ()   -- Occurs-check or forall-bound variable
+      = do { cur_lvl <- getTcLevel
+              -- See Note [Unification preconditions], (UNTOUCHABLE) wrinkles
+              -- Here we are in the TcM monad, which does not track enclosing
+              -- Given equalities; so for quick-look unification we conservatively
+              -- treat /any/ level outside this one as untouchable. Hence cur_lvl.
+           ; case simpleUnifyCheck UC_QuickLook cur_lvl kappa ty2 of
+              SUC_CanUnify ->
+                do { co <- unifyKind (Just (TypeThing ty2)) ty2_kind kappa_kind
+                           -- unifyKind: see (UQL2) in Note [QuickLook unification]
+                           --            and (MIV2) in Note [Monomorphise instantiation variables]
+                   ; let ty2' = mkCastTy ty2 co
+                   ; traceTc "qlUnify:update" $
+                     ppr kappa <+> text ":=" <+> ppr ty2
+                   ; liftZonkM $ writeMetaTyVar kappa ty2' }
+              _ -> return () -- e.g. occurs-check or forall-bound variable
+           }
       where
         kappa_kind = tyVarKind kappa
         ty2_kind   = typeKind ty2

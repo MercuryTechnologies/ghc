@@ -24,7 +24,6 @@ import GHC.StgToCmm.Layout
 import GHC.StgToCmm.Utils
 import GHC.StgToCmm.Closure
 import GHC.StgToCmm.Config
-import GHC.StgToCmm.Hpc
 import GHC.StgToCmm.Ticky
 import GHC.StgToCmm.Types (ModuleLFInfos)
 import GHC.StgToCmm.CgUtils (CgStream)
@@ -38,7 +37,6 @@ import GHC.Stg.Syntax
 
 import GHC.Types.CostCentre
 import GHC.Types.IPE
-import GHC.Types.HpcInfo
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.RepType
@@ -52,7 +50,6 @@ import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.Multiplicity
 
-import GHC.Unit.Module
 
 import GHC.Utils.Error
 import GHC.Utils.Outputable
@@ -77,13 +74,12 @@ codeGen :: Logger
         -> [TyCon]
         -> CollectedCCs                -- (Local/global) cost-centres needing declaring/registering.
         -> [CgStgTopBinding]           -- Bindings to convert
-        -> HpcInfo
         -> CgStream CmmGroup (ModuleLFInfos, DetUniqFM) -- See Note [Deterministic Uniques in the CG] on CgStream
                                        -- Output as a stream, so codegen can
                                        -- be interleaved with output
 
-codeGen logger tmpfs cfg (InfoTableProvMap denv _ _) data_tycons
-        cost_centre_info stg_binds hpc_info
+codeGen logger tmpfs cfg (InfoTableProvMap denv _ _) tycons
+        cost_centre_info stg_binds
   = do  {     -- cg: run the code generator, and yield the resulting CmmGroup
               -- Using an IORef to store the state is a bit crude, but otherwise
               -- we would need to add a state monad layer which regresses
@@ -118,22 +114,15 @@ codeGen logger tmpfs cfg (InfoTableProvMap denv _ _) data_tycons
                 yield cmm
                 return a
 
-        ; cg (mkModuleInit cost_centre_info (stgToCmmThisModule cfg) hpc_info)
+        ; cg (mkModuleInit cost_centre_info)
 
         ; mapM_ (cg . cgTopBinding logger tmpfs cfg) stg_binds
-                -- Put datatype_stuff after code_stuff, because the
+                -- Put datatype_stuff (cgTyCon) after code_stuff (cgTopBinding), because the
                 -- datatype closure table (for enumeration types) to
                 -- (say) PrelBase_True_closure, which is defined in
                 -- code_stuff
-        ; let do_tycon tycon = do
-                -- Generate a table of static closures for an
-                -- enumeration type Note that the closure pointers are
-                -- tagged.
-                 when (isEnumerationTyCon tycon) $ cg (cgEnumerationTyCon tycon)
-                 -- Emit normal info_tables, for data constructors defined in this module.
-                 mapM_ (cg . cgDataCon DefinitionSite) (tyConDataCons tycon)
 
-        ; mapM_ do_tycon data_tycons
+        ; mapM_ (cg . cgTyCon) tycons
 
         -- Emit special info tables for everything used in this module
         -- This will only do something if  `-fdistinct-info-tables` is turned on.
@@ -281,29 +270,45 @@ cgTopRhs cfg rec bndr (StgRhsClosure fvs cc upd_flag args body _typ)
 
 mkModuleInit
         :: CollectedCCs         -- cost centre info
-        -> Module
-        -> HpcInfo
         -> FCode ()
 
-mkModuleInit cost_centre_info this_mod hpc_info
-  = do  { initHpc this_mod hpc_info
-        ; initCostCentres cost_centre_info
+mkModuleInit cost_centre_info
+  = do  { initCostCentres cost_centre_info
         }
 
 
 ---------------------------------------------------------------
---      Generating static stuff for algebraic data types
+--   Generating static stuff for algebraic data types, including
+--     * entry code for each data con
+--     * info table for each data con
+--     * for enumerations, a table of all the closures
 ---------------------------------------------------------------
 
+---------------------------------------------------------------
+--      Data type constructors
+---------------------------------------------------------------
+cgTyCon :: TyCon -> FCode ()
+-- Generate static data for each algebraic data type
+cgTyCon tycon
+  | not (isBoxedDataTyCon tycon)  -- Type families, newtypes, and `type data` constructors
+  = return ()
+
+  | otherwise   -- An honest-to-goodness algebraic data type
+  = do { -- Emit normal info_tables, for data constructors defined in this module.
+         mapM_ (cgDataCon DefinitionSite) (tyConDataCons tycon)
+
+       ; when (isEnumerationTyCon tycon) $
+         cgEnumerationTyCon tycon }
 
 cgEnumerationTyCon :: TyCon -> FCode ()
+-- Generate a table of static closures for an enumeration type.
+-- Note that the closure pointers in the table are tagged.
 cgEnumerationTyCon tycon
   = do platform <- getPlatform
        emitRODataLits (mkClosureTableLabel (tyConName tycon) NoCafRefs)
              [ CmmLabelOff (mkClosureLabel (dataConName con) NoCafRefs)
                            (tagForCon platform con)
              | con <- tyConDataCons tycon]
-
 
 cgDataCon :: ConInfoTableLocation -> DataCon -> FCode ()
 -- Generate the entry code, info tables, and (for niladic constructor)

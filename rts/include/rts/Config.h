@@ -78,6 +78,10 @@ code.
 #endif
 
 #if defined(THREADED_RTS)
+/*
+ * See Note [Capabilities array sizing] in rts/Capability.c.
+ * Update the note in docs/users_guide/using-concurrent.rst when updating this.
+ */
 #define MAX_N_CAPABILITIES 256
 #else
 #define MAX_N_CAPABILITIES 1

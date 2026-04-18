@@ -62,18 +62,45 @@ disInstr ( StgBCO *bco, int pc )
 #error Cannot cope with WORD_SIZE_IN_BITS being nether 32 nor 64
 #endif
 #define BCO_GET_LARGE_ARG ((instr & bci_FLAG_LARGE_ARGS) ? BCO_READ_NEXT_WORD : BCO_NEXT)
+// For brevity
+#define BELCH_INSTR_NAME(OP_NAME) \
+   case bci_ ## OP_NAME: \
+      debugBelch("OP_NAME\n"); \
+      break
+
+#define BELCH_INSTR_NAME_ALL_SIZES(OP_NAME) \
+   case bci_ ## OP_NAME ## _64: \
+      debugBelch("#OP_NAME" "_64\n"); \
+      break; \
+   case bci_ ## OP_NAME ## _32: \
+      debugBelch("#OP_NAME" "_32\n"); \
+      break; \
+   case bci_ ## OP_NAME ## _16: \
+      debugBelch("#OP_NAME" "_16\n"); \
+      break; \
+   case bci_ ## OP_NAME ## _08: \
+      debugBelch("#OP_NAME" "_08\n"); \
+      break;
+
 
    switch (instr & 0xff) {
-      case bci_BRK_FUN:
-         debugBelch ("BRK_FUN  " );  printPtr( ptrs[instrs[pc]] );
-         debugBelch (" %d ", instrs[pc+1]); printPtr( ptrs[instrs[pc+2]] );
-         CostCentre* cc = (CostCentre*)literals[instrs[pc+5]];
+      case bci_BRK_FUN: {
+         W_ p1, info_mod, info_unit_id, info_wix, np;
+         p1           = BCO_GET_LARGE_ARG;
+         info_mod     = BCO_GET_LARGE_ARG;
+         info_unit_id = BCO_GET_LARGE_ARG;
+         info_wix     = BCO_READ_NEXT_32;
+         np           = BCO_GET_LARGE_ARG;
+         debugBelch ("BRK_FUN " );  printPtr( ptrs[p1] );
+         debugBelch(" %" FMT_Word, literals[info_mod] );
+         debugBelch(" %" FMT_Word, literals[info_unit_id] );
+         debugBelch(" %" FMT_Word, info_wix );
+         CostCentre* cc = (CostCentre*)literals[np];
          if (cc) {
            debugBelch(" %s", cc->label);
          }
          debugBelch("\n");
-         pc += 6;
-         break;
+         break; }
       case bci_SWIZZLE: {
          W_     stkoff = BCO_GET_LARGE_ARG;
          StgInt by     = BCO_GET_LARGE_ARG;
@@ -419,38 +446,54 @@ disInstr ( StgBCO *bco, int pc )
          debugBelch("TESTEQ_P  %d, fail to %d\n", instrs[pc],
                                                       instrs[pc+1]);
          pc += 2; break;
-      case bci_CASEFAIL:
-         debugBelch("CASEFAIL\n" );
-         break;
+      BELCH_INSTR_NAME(CASEFAIL);
       case bci_JMP:
          debugBelch("JMP to    %d\n", instrs[pc]);
          pc += 1; break;
 
-      case bci_ENTER:
-         debugBelch("ENTER\n");
-         break;
+      BELCH_INSTR_NAME(ENTER);
+      BELCH_INSTR_NAME(RETURN_P);
+      BELCH_INSTR_NAME(RETURN_N);
+      BELCH_INSTR_NAME(RETURN_F);
+      BELCH_INSTR_NAME(RETURN_D);
+      BELCH_INSTR_NAME(RETURN_L);
+      BELCH_INSTR_NAME(RETURN_V);
+      BELCH_INSTR_NAME(RETURN_T);
 
-      case bci_RETURN_P:
-         debugBelch("RETURN_P\n" );
+
+      case bci_BCO_NAME: {
+         const char *name = (const char*) literals[instrs[pc]];
+         debugBelch("BCO_NAME    \"%s\"\n ", name);
+         pc += 1;
          break;
-      case bci_RETURN_N:
-         debugBelch("RETURN_N\n" );
-         break;
-      case bci_RETURN_F:
-         debugBelch("RETURN_F\n" );
-         break;
-      case bci_RETURN_D:
-         debugBelch("RETURN_D\n" );
-         break;
-      case bci_RETURN_L:
-         debugBelch("RETURN_L\n" );
-         break;
-      case bci_RETURN_V:
-         debugBelch("RETURN_V\n" );
-         break;
-      case bci_RETURN_T:
-         debugBelch("RETURN_T\n ");
-         break;
+      }
+
+      BELCH_INSTR_NAME_ALL_SIZES(OP_ADD);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_SUB);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_AND);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_XOR);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_OR);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_NOT);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_NEG);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_MUL);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_SHL);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_ASR);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_LSR);
+
+      BELCH_INSTR_NAME_ALL_SIZES(OP_NEQ);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_EQ);
+
+      BELCH_INSTR_NAME_ALL_SIZES(OP_U_GT);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_U_LE);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_U_GE);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_U_LT);
+
+      BELCH_INSTR_NAME_ALL_SIZES(OP_S_GT);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_S_LE);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_S_GE);
+      BELCH_INSTR_NAME_ALL_SIZES(OP_S_LT);
+
+      BELCH_INSTR_NAME_ALL_SIZES(OP_INDEX_ADDR);
 
       default:
          barf("disInstr: unknown opcode %u", (unsigned int) instr);
@@ -464,10 +507,9 @@ void disassemble( StgBCO *bco )
    StgWord16*     instrs  = (StgWord16*)(bco->instrs->payload);
    StgMutArrPtrs* ptrs    = bco->ptrs;
    uint32_t       nbcs    = (uint32_t)(bco->instrs->bytes / sizeof(StgWord16));
-   uint32_t       pc      = 1;
+   uint32_t       pc      = 0;
 
    debugBelch("BCO\n" );
-   pc = 0;
    while (pc < nbcs) {
       debugBelch("\t%2d:  ", pc );
       pc = disInstr ( bco, pc );

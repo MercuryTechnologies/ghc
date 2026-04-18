@@ -36,6 +36,7 @@ import GHC.Utils.Panic (panic)
 
 type BufPos = Int
 data StringLexError = StringLexError LexErr BufPos
+  deriving (Show, Eq)
 
 lexString :: Int -> StringBuffer -> Either StringLexError String
 lexString = lexStringWith processChars processChars
@@ -122,19 +123,49 @@ bufferLocatedChars initialBuf len = go initialBuf
 -- -----------------------------------------------------------------------------
 -- Lexing phases
 
+-- | Collapse all string gaps in the given input.
+--
+-- Iterates through the input in `go` until we encounter a backslash. The
+-- @stringchar Alex regex only allows backslashes in two places: escape codes
+-- and string gaps.
+--
+--   * If the next character is a space, it has to be the start of a string gap
+--     AND it must end, since the @gap Alex regex will only match if it ends.
+--     Collapse the gap and continue the main iteration loop.
+--
+--   * Otherwise, this is an escape code. If it's an escape code, there are
+--     ONLY three possibilities (see the @escape Alex regex):
+--       1. The escape code is "\\"
+--       2. The escape code is "\^\"
+--       3. The escape code does not have a backslash, other than the initial
+--          backslash
+--
+--     In the first two possibilities, just skip them and continue the main
+--     iteration loop ("skip" as in "keep in the list as-is"). In the last one,
+--     we can just skip the backslash, then continue the main iteration loop.
+--     the rest of the escape code will be skipped as normal characters in the
+--     string; no need to fully parse a proper escape code.
 collapseGaps :: HasChar c => [c] -> [c]
 collapseGaps = go
   where
     go = \case
-      c1@(Char '\\') : c2@(Char c) : cs
-        | is_space c -> go $ dropGap cs
-        | otherwise  -> c1 : c2 : go cs
+      -- Match the start of a string gap + drop gap
+      -- #25784: string gaps are semantically equivalent to "\&"
+      c1@(Char '\\') : Char c : cs
+        | is_space c -> c1 : setChar '&' c1 : go (dropGap cs)
+      -- Match all possible escape characters that include a backslash
+      c1@(Char '\\') : c2@(Char '\\') : cs
+        -> c1 : c2 : go cs
+      c1@(Char '\\') : c2@(Char '^') : c3@(Char '\\') : cs
+        -> c1 : c2 : c3 : go cs
+      -- Otherwise, just keep looping
       c : cs -> c : go cs
       [] -> []
 
     dropGap = \case
       Char '\\' : cs -> cs
       _ : cs -> dropGap cs
+      -- Unreachable since gaps must end; see docstring
       [] -> panic "gap unexpectedly ended"
 
 resolveEscapes :: HasChar c => [c] -> Either (c, LexErr) [c]
@@ -261,12 +292,26 @@ lexMultilineString = lexStringWith processChars processChars
     processChars :: HasChar c => [c] -> Either (c, LexErr) [c]
     processChars =
           collapseGaps             -- Step 1
+      >>> normalizeEOL
       >>> expandLeadingTabs        -- Step 3
       >>> rmCommonWhitespacePrefix -- Step 4
       >>> collapseOnlyWsLines      -- Step 5
       >>> rmFirstNewline           -- Step 7a
       >>> rmLastNewline            -- Step 7b
       >>> resolveEscapes           -- Step 8
+
+    -- Normalize line endings to LF. The spec dictates that lines should be
+    -- split on newline characters and rejoined with ``\n``. But because we
+    -- aren't actually splitting/rejoining, we'll manually normalize here
+    normalizeEOL :: HasChar c => [c] -> [c]
+    normalizeEOL =
+      let go = \case
+            Char '\r' : c@(Char '\n') : cs -> c : go cs
+            c@(Char '\r') : cs -> setChar '\n' c : go cs
+            c@(Char '\f') : cs -> setChar '\n' c : go cs
+            c : cs -> c : go cs
+            [] -> []
+       in go
 
     -- expands all tabs, since the lexer will verify that tabs can only appear
     -- as leading indentation

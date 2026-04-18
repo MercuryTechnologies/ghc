@@ -40,8 +40,8 @@ module GHC.Types.Var (
         TyVar, TcTyVar, TypeVar, KindVar, TKVar, TyCoVar,
 
         -- * In and Out variants
-        InVar,  InCoVar,  InId,  InTyVar,
-        OutVar, OutCoVar, OutId, OutTyVar,
+        InVar,  InCoVar,  InId,  InTyVar,  InTyCoVar,
+        OutVar, OutCoVar, OutId, OutTyVar, OutTyCoVar,
 
         -- ** Taking 'Var's apart
         varName, varUnique, varType,
@@ -132,6 +132,7 @@ import GHC.Utils.Panic
 
 import GHC.Hs.Specificity ()
 import Language.Haskell.Syntax.Specificity
+import Control.DeepSeq
 
 import Data.Data
 
@@ -205,10 +206,12 @@ type TyCoVar = Id       -- Type, *or* coercion variable
 type InVar      = Var
 type InTyVar    = TyVar
 type InCoVar    = CoVar
+type InTyCoVar  = TyCoVar
 type InId       = Id
 type OutVar     = Var
 type OutTyVar   = TyVar
 type OutCoVar   = CoVar
+type OutTyCoVar = TyCoVar
 type OutId      = Id
 
 
@@ -497,6 +500,12 @@ instance Binary FunTyFlag where
       2 -> return FTF_C_T
       _ -> return FTF_C_C
 
+instance NFData FunTyFlag where
+  rnf FTF_T_T = ()
+  rnf FTF_T_C = ()
+  rnf FTF_C_T = ()
+  rnf FTF_C_C = ()
+
 mkFunTyFlag :: TypeOrConstraint -> TypeOrConstraint -> FunTyFlag
 mkFunTyFlag TypeLike       torc = visArg torc
 mkFunTyFlag ConstraintLike torc = invisArg torc
@@ -563,11 +572,11 @@ information.  In (FunTy { ft_af = af, ft_arg = t1, ft_res = t2 })
      False           True          FTF_T_C
      True            False         FTF_C_T
      True            True          FTF_C_C
-where isPredTy is defined in GHC.Core.Type, and sees if t1's
+where isPredTy is defined in GHC.Core.Predicate, and sees if t1's
 kind is Constraint.  See GHC.Core.Type.chooseFunTyFlag, and
-GHC.Core.TyCo.Rep Note [Types for coercions, predicates, and evidence]
+GHC.Core.Predicate Note [Types for coercions, predicates, and evidence]
 
-The term (Lam b e) donesn't carry an FunTyFlag; instead it uses
+The term (Lam b e) doesn't carry an FunTyFlag; instead it uses
 mkFunctionType when we want to get its types; see mkLamType.  This is
 just an engineering choice; we could cache here too if we wanted.
 
@@ -646,6 +655,7 @@ data VarBndr var argf = Bndr var argf
 -- A 'ForAllTyBinder' is the binder of a ForAllTy
 -- It's convenient to define this synonym here rather its natural
 -- home in "GHC.Core.TyCo.Rep", because it's used in GHC.Core.DataCon.hs-boot
+-- See Note [VarBndrs, ForAllTyBinders, TyConBinders, and visibility]
 --
 -- A 'TyVarBinder' is a binder with only TyVar
 type ForAllTyBinder = VarBndr TyCoVar ForAllTyFlag
@@ -730,6 +740,9 @@ instance (Binary tv, Binary vis) => Binary (VarBndr tv vis) where
   put_ bh (Bndr tv vis) = do { put_ bh tv; put_ bh vis }
 
   get bh = do { tv <- get bh; vis <- get bh; return (Bndr tv vis) }
+
+instance (NFData tv, NFData vis) => NFData (VarBndr tv vis) where
+  rnf (Bndr tv vis) = rnf tv `seq` rnf vis
 
 instance NamedThing tv => NamedThing (VarBndr tv flag) where
   getName (Bndr tv _) = getName tv
@@ -1061,7 +1074,7 @@ idInfo :: HasDebugCallStack => Id -> IdInfo
 idInfo (Id { id_info = info }) = info
 idInfo other                   = pprPanic "idInfo" (ppr other)
 
-idDetails :: Id -> IdDetails
+idDetails :: HasCallStack => Id -> IdDetails
 idDetails (Id { id_details = details }) = details
 idDetails other                         = pprPanic "idDetails" (ppr other)
 

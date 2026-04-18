@@ -1,5 +1,3 @@
-{-# OPTIONS_GHC -Wno-orphans #-} -- instance Binary IsBootInterface
-
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveTraversable #-}
@@ -60,21 +58,21 @@ module GHC.Unit.Types
    , Definite (..)
 
      -- * Wired-in units
-   , primUnitId
-   , bignumUnitId
    , ghcInternalUnitId
    , rtsUnitId
    , mainUnitId
    , thisGhcUnitId
    , interactiveUnitId
+   , interactiveGhciUnitId
+   , interactiveSessionUnitId
 
-   , primUnit
-   , bignumUnit
    , ghcInternalUnit
    , rtsUnit
    , mainUnit
    , thisGhcUnit
    , interactiveUnit
+   , interactiveGhciUnit
+   , interactiveSessionUnit
 
    , isInteractiveModule
    , wiredInUnitIds
@@ -84,8 +82,6 @@ module GHC.Unit.Types
    , GenWithIsBoot (..)
    , ModuleNameWithIsBoot
    , ModuleWithIsBoot
-   , InstalledModuleWithIsBoot
-   , notBoot
    )
 where
 
@@ -122,12 +118,6 @@ data GenModule unit = Module
    , moduleName :: !ModuleName -- ^ Module name (e.g. A.B.C)
    }
    deriving (Eq,Ord,Data,Functor)
-
-instance Data ModuleName where
-  -- don't traverse?
-  toConstr _   = abstractConstr "ModuleName"
-  gunfold _ _  = error "gunfold"
-  dataTypeOf _ = mkNoRepType "ModuleName"
 
 -- | A Module is a pair of a 'Unit' and a 'ModuleName'.
 type Module = GenModule Unit
@@ -523,6 +513,9 @@ newtype UnitId = UnitId
   }
   deriving (Data)
 
+instance NFData UnitId where
+  rnf (UnitId fs) = rnf fs `seq` ()
+
 instance Binary UnitId where
   put_ bh (UnitId fs) = put_ bh fs
   get bh = do fs <- get bh; return (UnitId fs)
@@ -598,25 +591,25 @@ Make sure you change 'GHC.Unit.State.findWiredInUnits' if you add an entry here.
 
 -}
 
-bignumUnitId, primUnitId, ghcInternalUnitId, rtsUnitId,
-  mainUnitId, thisGhcUnitId, interactiveUnitId :: UnitId
+ghcInternalUnitId, rtsUnitId,
+  mainUnitId, thisGhcUnitId, interactiveUnitId, interactiveGhciUnitId, interactiveSessionUnitId :: UnitId
 
-bignumUnit, primUnit, ghcInternalUnit, rtsUnit,
-  mainUnit, thisGhcUnit, interactiveUnit :: Unit
+ghcInternalUnit, rtsUnit,
+  mainUnit, thisGhcUnit, interactiveUnit, interactiveGhciUnit, interactiveSessionUnit :: Unit
 
-primUnitId        = UnitId (fsLit "ghc-prim")
-bignumUnitId      = UnitId (fsLit "ghc-bignum")
 ghcInternalUnitId = UnitId (fsLit "ghc-internal")
 rtsUnitId         = UnitId (fsLit "rts")
 thisGhcUnitId     = UnitId (fsLit cProjectUnitId) -- See Note [GHC's Unit Id]
 interactiveUnitId = UnitId (fsLit "interactive")
+interactiveGhciUnitId = UnitId (fsLit "interactive-ghci")
+interactiveSessionUnitId = UnitId (fsLit "interactive-session")
 
-primUnit          = RealUnit (Definite primUnitId)
-bignumUnit        = RealUnit (Definite bignumUnitId)
 ghcInternalUnit   = RealUnit (Definite ghcInternalUnitId)
 rtsUnit           = RealUnit (Definite rtsUnitId)
 thisGhcUnit       = RealUnit (Definite thisGhcUnitId)
 interactiveUnit   = RealUnit (Definite interactiveUnitId)
+interactiveGhciUnit = RealUnit (Definite interactiveGhciUnitId)
+interactiveSessionUnit = RealUnit (Definite interactiveSessionUnitId)
 
 -- | This is the package Id for the current program.  It is the default
 -- package Id if you don't specify a package name.  We don't add this prefix
@@ -629,9 +622,7 @@ isInteractiveModule mod = moduleUnit mod == interactiveUnit
 
 wiredInUnitIds :: [UnitId]
 wiredInUnitIds =
-   [ primUnitId
-   , bignumUnitId
-   , ghcInternalUnitId
+   [ ghcInternalUnitId
    , rtsUnitId
    ]
    -- NB: ghc is no longer part of the wired-in units since its unit-id, given
@@ -693,17 +684,6 @@ the WiringMap, and that's why 'wiredInUnitIds' no longer includes
 -- modules in opposition to boot interfaces. Instead, one should use
 -- 'DriverPhases.HscSource'. See Note [HscSource types].
 
-instance Binary IsBootInterface where
-  put_ bh ib = put_ bh $
-    case ib of
-      NotBoot -> False
-      IsBoot -> True
-  get bh = do
-    b <- get bh
-    return $ case b of
-      False -> NotBoot
-      True -> IsBoot
-
 -- | This data type just pairs a value 'mod' with an IsBootInterface flag. In
 -- practice, 'mod' is usually a @Module@ or @ModuleName@'.
 data GenWithIsBoot mod = GWIB
@@ -716,11 +696,12 @@ data GenWithIsBoot mod = GWIB
   -- IsBootInterface: this is assumed to perform filtering of non-boot modules,
   -- e.g. in GHC.Driver.Env.hptModulesBelow
 
+instance NFData mod => NFData (GenWithIsBoot mod) where
+  rnf (GWIB mod isBoot) = rnf mod `seq` rnf isBoot `seq` ()
+
 type ModuleNameWithIsBoot = GenWithIsBoot ModuleName
 
 type ModuleWithIsBoot = GenWithIsBoot Module
-
-type InstalledModuleWithIsBoot = GenWithIsBoot InstalledModule
 
 instance Binary a => Binary (GenWithIsBoot a) where
   put_ bh (GWIB { gwib_mod, gwib_isBoot }) = do
@@ -735,6 +716,3 @@ instance Outputable a => Outputable (GenWithIsBoot a) where
   ppr (GWIB  { gwib_mod, gwib_isBoot }) = hsep $ ppr gwib_mod : case gwib_isBoot of
     IsBoot -> [ text "{-# SOURCE #-}" ]
     NotBoot -> []
-
-notBoot :: mod -> GenWithIsBoot mod
-notBoot gwib_mod = GWIB {gwib_mod, gwib_isBoot = NotBoot}

@@ -11,7 +11,6 @@ module GHC.Tc.Errors.Hole
    , isFlexiTyVar
    , tcFilterHoleFits
    , getLocalBindings
-   , pprHoleFit
    , addHoleFitDocs
    , getHoleFitSortingAlg
    , getHoleFitDispConfig
@@ -42,14 +41,15 @@ import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.CtLoc
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Zonk.TcType
-import GHC.Core.Type
 import GHC.Core.TyCon( TyCon, isGenerativeTyCon )
 import GHC.Core.TyCo.Rep( Type(..) )
 import GHC.Core.DataCon
 import GHC.Core.Predicate( Pred(..), classifyPredType, eqRelRole )
+import GHC.Types.Basic
 import GHC.Types.Name
 import GHC.Types.Name.Reader
 import GHC.Builtin.Names ( gHC_INTERNAL_ERR, gHC_INTERNAL_UNSAFE_COERCE )
+import GHC.Builtin.Types ( tupleDataConName, unboxedSumDataConName )
 import GHC.Types.Id
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
@@ -57,7 +57,6 @@ import GHC.Types.TyThing
 import GHC.Data.Bag
 import GHC.Core.ConLike ( ConLike(..) )
 import GHC.Utils.Misc
-import GHC.Utils.Panic
 import GHC.Tc.Utils.Env (tcLookup)
 import GHC.Utils.Outputable
 import GHC.Driver.DynFlags
@@ -88,6 +87,10 @@ import qualified Data.Set as Set
 import GHC.Types.SrcLoc
 import GHC.Data.FastString (NonDetFastString(..))
 import GHC.Types.Unique.Map
+
+import GHC.Data.EnumSet (EnumSet)
+import qualified GHC.Data.EnumSet as EnumSet
+import qualified GHC.LanguageExtensions as LangExt
 
 
 {-
@@ -498,63 +501,6 @@ addHoleFitDocs fits =
      ; warnPprTrace (not $ Set.null mods) "addHoleFitDocs" warning (pure ())
      }
 
--- For pretty printing hole fits, we display the name and type of the fit,
--- with added '_' to represent any extra arguments in case of a non-zero
--- refinement level.
-pprHoleFit :: HoleFitDispConfig -> HoleFit -> SDoc
-pprHoleFit _ (RawHoleFit sd) = sd
-pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (TcHoleFit (HoleFit {..})) =
- hang display 2 provenance
- where tyApp = sep $ zipWithEqual "pprHoleFit" pprArg vars hfWrap
-         where pprArg b arg = case binderFlag b of
-                                Specified -> text "@" <> pprParendType arg
-                                  -- Do not print type application for inferred
-                                  -- variables (#16456)
-                                Inferred  -> empty
-                                Required  -> pprPanic "pprHoleFit: bad Required"
-                                                         (ppr b <+> ppr arg)
-       tyAppVars = sep $ punctuate comma $
-           zipWithEqual "pprHoleFit" (\v t -> ppr (binderVar v) <+>
-                                               text "~" <+> pprParendType t)
-           vars hfWrap
-
-       vars = unwrapTypeVars hfType
-         where
-           -- Attempts to get all the quantified type variables in a type,
-           -- e.g.
-           -- return :: forall (m :: * -> *) Monad m => (forall a . a -> m a)
-           -- into [m, a]
-           unwrapTypeVars :: Type -> [ForAllTyBinder]
-           unwrapTypeVars t = vars ++ case splitFunTy_maybe unforalled of
-                               Just (_, _, _, unfunned) -> unwrapTypeVars unfunned
-                               _ -> []
-             where (vars, unforalled) = splitForAllForAllTyBinders t
-       holeVs = sep $ map (parens . (text "_" <+> dcolon <+>) . ppr) hfMatches
-       holeDisp = if sMs then holeVs
-                  else sep $ replicate (length hfMatches) $ text "_"
-       occDisp = case hfCand of
-                   GreHFCand gre   -> pprPrefixOcc (greName gre)
-                   NameHFCand name -> pprPrefixOcc name
-                   IdHFCand id_    -> pprPrefixOcc id_
-       tyDisp = ppWhen sTy $ dcolon <+> ppr hfType
-       has = not . null
-       wrapDisp = ppWhen (has hfWrap && (sWrp || sWrpVars))
-                   $ text "with" <+> if sWrp || not sTy
-                                     then occDisp <+> tyApp
-                                     else tyAppVars
-       docs = case hfDoc of
-                Just d -> pprHsDocStrings d
-                _ -> empty
-       funcInfo = ppWhen (has hfMatches && sTy) $
-                    text "where" <+> occDisp <+> tyDisp
-       subDisp = occDisp <+> if has hfMatches then holeDisp else tyDisp
-       display =  subDisp $$ nest 2 (funcInfo $+$ docs $+$ wrapDisp)
-       provenance = ppWhen sProv $ parens $
-             case hfCand of
-                 GreHFCand gre -> pprNameProvenance gre
-                 NameHFCand name -> text "bound at" <+> ppr (getSrcLoc name)
-                 IdHFCand id_ -> text "bound at" <+> ppr (getSrcLoc id_)
-
 getLocalBindings :: TidyEnv -> CtLoc -> TcM [Id]
 getLocalBindings tidy_orig ct_loc
  = do { (env1, _) <- liftZonkM $ zonkTidyOrigin tidy_orig (ctLocOrigin ct_loc)
@@ -590,6 +536,7 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; maxVSubs <- maxValidHoleFits <$> getDynFlags
      ; sortingAlg <- getHoleFitSortingAlg
      ; dflags <- getDynFlags
+     ; let exts = extensionFlags dflags
      ; hfPlugs <- tcg_hf_plugins <$> getGblEnv
      ; let findVLimit = if sortingAlg > HFSNoSorting then Nothing else maxVSubs
            refLevel = refLevelHoleFits dflags
@@ -611,7 +558,7 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
            locals = removeBindingShadowing $
                       map IdHFCand lclBinds ++ map GreHFCand lcl
            globals = map GreHFCand gbl
-           syntax = map NameHFCand builtIns
+           syntax = map NameHFCand (builtIns exts)
            -- If the hole is a rigid type-variable, then we only check the
            -- locals, since only they can match the type (in a meaningful way).
            only_locals = any isImmutableTyVar $ getTyVar_maybe hole_ty
@@ -673,8 +620,28 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
     hole_lvl = ctLocLevel ct_loc
 
     -- BuiltInSyntax names like (:) and []
-    builtIns :: [Name]
-    builtIns = filter isBuiltInSyntax knownKeyNames
+    builtIns :: EnumSet LangExt.Extension -> [Name]
+    builtIns exts = filter isBuiltInSyntax (knownKeyNames ++ infFamNames)
+      where
+        -- Tuples and sums of are not included in knownKeyName as there are infinitely many of them.
+        -- See Note [Infinite families of known-key names] in GHC.Builtin.Names.
+        infFamNames =
+             [tupleDataConName Boxed   n | n <- [0..max_tup]]
+          ++ [tupleDataConName Unboxed n | unboxedTuples, n <- [0..max_tup]]
+          ++ [unboxedSumDataConName k  n | unboxedSums, n <- [2..max_sum], k <- [1..n]]
+
+        -- The upper limits on arity are small to avoid bloating the list with
+        -- too many names, which would incur a performance cost.
+        -- Users are unlikely to care about larger tuples/sums anyway.
+        max_tup = 7
+          -- Tuples up to (,,,,,,). Common limit, e.g. this is the highest tuple
+          -- arity that has a Functor instance.
+        max_sum = 7
+          -- Sums up to (#||||||#). Results in 27 sum constructors because there
+          -- are [1..n] data constructors at each arity.
+
+        unboxedTuples = EnumSet.member LangExt.UnboxedTuples exts
+        unboxedSums   = EnumSet.member LangExt.UnboxedSums exts
 
     -- We make a refinement type by adding a new type variable in front
     -- of the type of t h hole, going from e.g. [Integer] -> Integer

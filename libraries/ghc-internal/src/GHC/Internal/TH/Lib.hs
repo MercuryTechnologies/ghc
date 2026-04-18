@@ -22,6 +22,7 @@ module GHC.Internal.TH.Lib where
 
 import GHC.Internal.TH.Syntax hiding (Role, InjectivityAnn)
 import qualified GHC.Internal.TH.Syntax as TH
+
 #ifdef BOOTSTRAP_TH
 import Control.Applicative(liftA, Applicative(..))
 import qualified Data.Kind as Kind (Type)
@@ -30,17 +31,18 @@ import Data.List.NonEmpty ( NonEmpty(..) )
 import GHC.Exts (TYPE)
 import Prelude hiding (Applicative(..))
 #else
-import GHC.Internal.Base hiding (Type, Module, inline)
+import GHC.Internal.Base hiding (NonEmpty (..), Type, Module, inline)
 import GHC.Internal.Data.Foldable
 import GHC.Internal.Data.Functor
 import GHC.Internal.Data.Maybe
+import GHC.Internal.Data.NonEmpty (NonEmpty(..))
 import GHC.Internal.Data.Traversable (traverse, sequenceA)
 import GHC.Internal.Integer
 import GHC.Internal.List (zip)
 import GHC.Internal.Real
 import GHC.Internal.Show
 import GHC.Internal.Word
-import qualified GHC.Types as Kind (Type)
+import qualified GHC.Internal.Types as Kind (Type)
 #endif
 
 ----------------------------------------------------------
@@ -553,17 +555,30 @@ pragInlD name inline rm phases
 pragOpaqueD :: Quote m => Name -> m Dec
 pragOpaqueD name = pure $ PragmaD $ OpaqueP name
 
-pragSpecD :: Quote m => Name -> m Type -> Phases -> m Dec
-pragSpecD n ty phases
+pragSpecED :: Quote m
+           => Maybe [m (TyVarBndr ())] -> [m RuleBndr]
+           -> m Exp
+           -> Phases
+           -> m Dec
+pragSpecED ty_bndrs tm_bndrs expr phases
   = do
-      ty1    <- ty
-      pure $ PragmaD $ SpecialiseP n ty1 Nothing phases
+      ty_bndrs1    <- traverse sequenceA ty_bndrs
+      tm_bndrs1    <- sequenceA tm_bndrs
+      expr1        <- expr
+      pure $ PragmaD $ SpecialiseEP ty_bndrs1 tm_bndrs1 expr1 Nothing phases
 
-pragSpecInlD :: Quote m => Name -> m Type -> Inline -> Phases -> m Dec
-pragSpecInlD n ty inline phases
+pragSpecInlED :: Quote m
+              => Maybe [m (TyVarBndr ())] -> [m RuleBndr]
+              -> m Exp
+              -> Inline
+              -> Phases
+              -> m Dec
+pragSpecInlED ty_bndrs tm_bndrs expr inl phases
   = do
-      ty1    <- ty
-      pure $ PragmaD $ SpecialiseP n ty1 (Just inline) phases
+      ty_bndrs1    <- traverse sequenceA ty_bndrs
+      tm_bndrs1    <- sequenceA tm_bndrs
+      expr1        <- expr
+      pure $ PragmaD $ SpecialiseEP ty_bndrs1 tm_bndrs1 expr1 (Just inl) phases
 
 pragSpecInstD :: Quote m => m Type -> m Dec
 pragSpecInstD ty
@@ -839,22 +854,6 @@ implicitParamT n t
       t' <- t
       pure $ ImplicitParamT n t'
 
-{-# DEPRECATED classP "As of template-haskell-2.10, constraint predicates (Pred) are just types (Type), in keeping with ConstraintKinds. Please use 'conT' and 'appT'." #-}
-classP :: Quote m => Name -> [m Type] -> m Pred
-classP cla tys
-  = do
-      tysl <- sequenceA tys
-      pure (foldl AppT (ConT cla) tysl)
-
-{-# DEPRECATED equalP "As of template-haskell-2.10, constraint predicates (Pred) are just types (Type), in keeping with ConstraintKinds. Please see 'equalityT'." #-}
-equalP :: Quote m => m Type -> m Type -> m Pred
-equalP tleft tright
-  = do
-      tleft1  <- tleft
-      tright1 <- tright
-      eqT <- equalityT
-      pure (foldl AppT eqT [tleft1, tright1])
-
 promotedT :: Quote m => Name -> m Type
 promotedT = pure . PromotedT
 
@@ -877,20 +876,6 @@ noSourceStrictness = pure NoSourceStrictness
 sourceLazy         = pure SourceLazy
 sourceStrict       = pure SourceStrict
 
-{-# DEPRECATED isStrict
-    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
-     "Example usage: 'bang noSourceUnpackedness sourceStrict'"] #-}
-{-# DEPRECATED notStrict
-    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
-     "Example usage: 'bang noSourceUnpackedness noSourceStrictness'"] #-}
-{-# DEPRECATED unpacked
-    ["Use 'bang'. See https://gitlab.haskell.org/ghc/ghc/wikis/migration/8.0. ",
-     "Example usage: 'bang sourceUnpack sourceStrict'"] #-}
-isStrict, notStrict, unpacked :: Quote m => m Strict
-isStrict = bang noSourceUnpackedness sourceStrict
-notStrict = bang noSourceUnpackedness noSourceStrictness
-unpacked = bang sourceUnpack sourceStrict
-
 bang :: Quote m => m SourceUnpackedness -> m SourceStrictness -> m Bang
 bang u s = do u' <- u
               s' <- s
@@ -901,16 +886,6 @@ bangType = liftA2 (,)
 
 varBangType :: Quote m => Name -> m BangType -> m VarBangType
 varBangType v bt = (\(b, t) -> (v, b, t)) <$> bt
-
-{-# DEPRECATED strictType
-               "As of @template-haskell-2.11.0.0@, 'StrictType' has been replaced by 'BangType'. Please use 'bangType' instead." #-}
-strictType :: Quote m => m Strict -> m Type -> m StrictType
-strictType = bangType
-
-{-# DEPRECATED varStrictType
-               "As of @template-haskell-2.11.0.0@, 'VarStrictType' has been replaced by 'VarBangType'. Please use 'varBangType' instead." #-}
-varStrictType :: Quote m => Name -> m StrictType -> m VarStrictType
-varStrictType = varBangType
 
 -- * Type Literals
 

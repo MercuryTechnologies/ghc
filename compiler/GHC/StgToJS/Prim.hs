@@ -1155,13 +1155,11 @@ genPrim prof bound ty op = case op of
 
 ------------------------------ Unhandled primops -------------------
 
+  AnnotateStackOp                   -> unhandledPrimop op
+
   NewPromptTagOp                    -> unhandledPrimop op
   PromptOp                          -> unhandledPrimop op
   Control0Op                        -> unhandledPrimop op
-
-  NewIOPortOp                       -> unhandledPrimop op
-  ReadIOPortOp                      -> unhandledPrimop op
-  WriteIOPortOp                     -> unhandledPrimop op
 
   GetSparkOp                        -> unhandledPrimop op
   AnyToAddrOp                       -> unhandledPrimop op
@@ -1173,6 +1171,7 @@ genPrim prof bound ty op = case op of
   WhereFromOp                       -> unhandledPrimop op -- should be easily implementable with o.f.n
 
   SetThreadAllocationCounter        -> unhandledPrimop op
+  SetOtherThreadAllocationCounter   -> unhandledPrimop op
 
 ------------------------------- Vector -----------------------------------------
 -- For now, vectors are unsupported on the JS backend. Simply put, they do not

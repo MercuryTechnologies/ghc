@@ -98,7 +98,6 @@ dropHsDocTy = drop_sig_ty
 
     drop_ty (HsForAllTy x a e) = HsForAllTy x a (drop_lty e)
     drop_ty (HsQualTy x a e) = HsQualTy x a (drop_lty e)
-    drop_ty (HsBangTy x a b) = HsBangTy x a (drop_lty b)
     drop_ty (HsAppTy x a b) = HsAppTy x (drop_lty a) (drop_lty b)
     drop_ty (HsAppKindTy x a b) = HsAppKindTy x (drop_lty a) (drop_lty b)
     drop_ty (HsFunTy x w a b) = HsFunTy x w (drop_lty a) (drop_lty b)
@@ -295,17 +294,17 @@ ppCtor sDocContext dat subdocs con@ConDeclH98{con_args = con_args'} =
   -- AZ:TODO get rid of the concatMap
   concatMap (lookupCon sDocContext subdocs) [con_name con] ++ f con_args'
   where
-    f (PrefixCon _ args) = [typeSig name $ (map hsScaledThing args) ++ [resType]]
-    f (InfixCon a1 a2) = f $ PrefixCon [] [a1, a2]
+    f (PrefixCon args) = [typeSig name $ (map cdf_type args) ++ [resType]]
+    f (InfixCon a1 a2) = f $ PrefixCon [a1, a2]
     f (RecCon (L _ recs)) =
-      f (PrefixCon [] $ map (hsLinear . cd_fld_type . unLoc) recs)
+      f (PrefixCon $ map (cdrf_spec . unLoc) recs)
         ++ concat
-          [ (concatMap (lookupCon sDocContext subdocs . noLocA . unLoc . foLabel . unLoc) (cd_fld_names r))
-            ++ [out sDocContext (map (foExt . unLoc) $ cd_fld_names r) `typeSig` [resType, cd_fld_type r]]
+          [ (concatMap (lookupCon sDocContext subdocs . noLocA . unLoc . foLabel . unLoc) (cdrf_names r))
+            ++ [out sDocContext (map (foExt . unLoc) $ cdrf_names r) `typeSig` [resType, cdf_type $ cdrf_spec r]]
           | r <- map unLoc recs
           ]
 
-    funs = foldr1 (\x y -> reL $ HsFunTy noExtField (HsUnrestrictedArrow noExtField) x y)
+    funs = foldr1 (\x y -> reL $ HsFunTy noExtField (HsUnannotated noExtField) x y)
     apps = foldl1 (\x y -> reL $ HsAppTy noExtField x y)
 
     typeSig nm flds =
@@ -321,7 +320,7 @@ ppCtor sDocContext dat subdocs con@ConDeclH98{con_args = con_args'} =
       where
         tv, tvk :: HsType GhcRn
         tv = case bvar of
-          HsBndrVar _ n -> HsTyVar noAnn NotPromoted n
+          HsBndrVar _ n -> HsTyVar noAnn NotPromoted (fmap noUserRdr n)
           HsBndrWildCard _ -> HsWildCardTy noExtField
         tvk = case bkind of
           HsBndrNoKind _   -> tv
@@ -330,7 +329,7 @@ ppCtor sDocContext dat subdocs con@ConDeclH98{con_args = con_args'} =
     resType =
       apps $
         map reL $
-          (HsTyVar noAnn NotPromoted (reL (tcdName dat)))
+          (HsTyVar noAnn NotPromoted (reL (noUserRdr $ tcdName dat)))
             : map (tyVarArg . unLoc) (hsQTvExplicit $ tyClDeclTyVars dat)
 ppCtor
   sDocContext
@@ -338,7 +337,8 @@ ppCtor
   subdocs
   ( ConDeclGADT
       { con_names = names
-      , con_bndrs = L _ outer_bndrs
+      , con_outer_bndrs = L _ outer_bndrs
+      , con_inner_bndrs = inner_bndrs
       , con_mb_cxt = mcxt
       , con_g_args = args
       , con_res_ty = res_ty
@@ -348,16 +348,32 @@ ppCtor
     where
       typeSig = operator name ++ " :: " ++ outHsSigType sDocContext con_sig_ty
       name = out sDocContext $ unL <$> names
-      con_sig_ty = HsSig noExtField outer_bndrs theta_ty
+      con_sig_ty = HsSig noExtField outer_bndrs $
+                   mkForallTys inner_bndrs phi_ty
         where
-          theta_ty = case mcxt of
-            Just theta -> noLocA (HsQualTy{hst_xqual = noExtField, hst_ctxt = theta, hst_body = tau_ty})
+          phi_ty = case mcxt of
+            Just theta -> mkQualTy theta tau_ty
             Nothing -> tau_ty
           tau_ty = foldr mkFunTy res_ty $
             case args of
-              PrefixConGADT _ pos_args -> map hsScaledThing pos_args
-              RecConGADT _ (L _ flds) -> map (cd_fld_type . unL) flds
-          mkFunTy a b = noLocA (HsFunTy noExtField (HsUnrestrictedArrow noExtField) a b)
+              PrefixConGADT _ pos_args -> map cdf_type pos_args
+              RecConGADT _ (L _ flds) -> map (cdf_type . cdrf_spec . unL) flds
+
+          mkFunTy :: LHsType GhcRn -> LHsType GhcRn -> LHsType GhcRn
+          mkFunTy a b = noLocA (HsFunTy noExtField (HsUnannotated noExtField) a b)
+
+          mkQualTy :: LHsContext GhcRn -> LHsType GhcRn -> LHsType GhcRn
+          mkQualTy ctxt body =
+            noLocA (HsQualTy{ hst_xqual = noExtField
+                            , hst_ctxt = ctxt, hst_body = body})
+
+          mkForallTy :: HsForAllTelescope GhcRn -> LHsType GhcRn -> LHsType GhcRn
+          mkForallTy tele body =
+            noLocA (HsForAllTy { hst_xforall = noExtField
+                               , hst_tele = tele, hst_body = body })
+
+          mkForallTys :: [HsForAllTelescope GhcRn] -> LHsType GhcRn -> LHsType GhcRn
+          mkForallTys = flip (foldr mkForallTy)
 
 ppFixity :: SDocContext -> (Name, Fixity) -> [String]
 ppFixity sDocContext (name, fixity) = [out sDocContext ((FixitySig NoNamespaceSpecifier [noLocA name] fixity) :: FixitySig GhcRn)]

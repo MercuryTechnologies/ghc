@@ -18,7 +18,7 @@ import GHC.Generics (Generic)
 import GHC.Internal.Base
 import GHC.Internal.Show
 import GHC.Internal.Generics
-import GHC.Internal.Data.Enum
+import GHC.Internal.Enum
 #endif
 
 -- | The language extensions known to GHC.
@@ -165,6 +165,8 @@ data Extension
    | ExtendedLiterals
    | ListTuplePuns
    | MultilineStrings
+   | ExplicitLevelImports
+   | ImplicitStagePersistence
    deriving (Eq, Enum, Show, Generic, Bounded)
 -- 'Ord' and 'Bounded' are provided for GHC API users (see discussions
 -- in https://gitlab.haskell.org/ghc/ghc/merge_requests/2707 and

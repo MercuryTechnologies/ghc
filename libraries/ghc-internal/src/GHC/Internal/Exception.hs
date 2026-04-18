@@ -8,6 +8,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_HADDOCK not-home #-}
 
 -----------------------------------------------------------------------------
@@ -52,13 +53,13 @@ module GHC.Internal.Exception
     , ratioZeroDenomException
     , underflowException
       -- ** 'ErrorCall'
-    , ErrorCall(..)
+    , ErrorCall(.., ErrorCallWithLocation)
     , errorCallException
     , errorCallWithCallStackException
     , toExceptionWithBacktrace
 
       -- * Reexports
-      -- Re-export CallStack and SrcLoc from GHC.Types
+      -- Re-export CallStack and SrcLoc from GHC.Internal.Types
     , CallStack, fromCallSiteList, getCallStack, prettyCallStack
     , prettyCallStackLines
     , SrcLoc(..), prettySrcLoc
@@ -69,7 +70,8 @@ import GHC.Internal.Show
 import GHC.Internal.Stack.Types
 import GHC.Internal.IO.Unsafe
 import {-# SOURCE #-} GHC.Internal.Stack (prettyCallStackLines, prettyCallStack, prettySrcLoc, withFrozenCallStack)
-import {-# SOURCE #-} GHC.Internal.Exception.Backtrace (collectBacktraces)
+import {-# SOURCE #-} GHC.Internal.Exception.Backtrace (collectExceptionAnnotation)
+import GHC.Internal.Exception.Context (SomeExceptionAnnotation(..))
 import GHC.Internal.Exception.Type
 
 -- | Throw an exception.  Exceptions may be thrown from purely
@@ -165,8 +167,8 @@ toExceptionWithBacktrace :: (HasCallStack, Exception e)
                          => e -> IO SomeException
 toExceptionWithBacktrace e
   | backtraceDesired e = do
-      bt <- collectBacktraces
-      return (addExceptionContext bt (toException e))
+      SomeExceptionAnnotation ea <- collectExceptionAnnotation
+      return (addExceptionContext ea (toException e))
   | otherwise = return (toException e)
 
 -- | This is thrown when the user calls 'error'. The @String@ is the
@@ -178,7 +180,11 @@ data ErrorCall = ErrorCall String
              , Ord -- ^ @since base-4.7.0.0
              )
 
-{-# COMPLETE ErrorCall #-}
+{-# DEPRECATED ErrorCallWithLocation "ErrorCallWithLocation has been deprecated in favour of ErrorCall (which does not have a location). Backtraces are now handled by the backtrace exception mechanisms exclusively." #-}
+pattern ErrorCallWithLocation :: String -> String -> ErrorCall
+pattern ErrorCallWithLocation err loc <- ErrorCall ((\err -> (err, error "ErrorCallWithLocation has been deprecated in favour of ErrorCall (which does not have a location). Backtraces are now handled by the backtrace exception mechanisms exclusively.")) -> (err, loc))
+  where ErrorCallWithLocation err _ = ErrorCall err
+{-# COMPLETE ErrorCallWithLocation #-}
 
 -- | @since base-4.0.0.0
 instance Exception ErrorCall

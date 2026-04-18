@@ -132,6 +132,36 @@ as such you shouldn't need to set any of them explicitly. A flag
     Enables Core-level constant folding, i.e. propagation of values
     that can be computed at compile time.
 
+.. ghc-flag:: -fnum-constant-folding
+    :shortdesc: Enable constant folding on nested numerical expressions. Implied by :ghc-flag:`-O`.
+    :type: dynamic
+    :reverse: -fno-num-constant-folding
+    :category:
+
+    :default: off but enabled by :ghc-flag:`-O`.
+
+    When enabled, the compiler uses associativity, commutativity, and
+    distributivity laws of numerical primops to perform constant folding on
+    nested numerical expressions.
+
+    Examples:
+
+        (10 + x) + 10
+        ===> 20 + x
+
+        5 + x + (y + (z + (t + 5)))
+        ===> 10 + (x + (y + (z + t)))
+
+        (5 + x) * 6
+        ===> 30 + 6*x
+
+        5 + x + (x + (x + (x + 5)))
+        ===> 10 + (4 * x)
+
+        (5 + 4*x) - (3*x + 2)
+        ===> 3 + x
+
+
 .. ghc-flag:: -fcase-merge
     :shortdesc: Enable case-merging. Implied by :ghc-flag:`-O`.
     :type: dynamic
@@ -405,6 +435,55 @@ as such you shouldn't need to set any of them explicitly. A flag
     intermediate language, where it is able to common up some subexpressions
     that differ in their types, but not their representation.
 
+.. ghc-flag:: -fspec-eval
+    :shortdesc: Enables speculative evaluation.
+    :type: dynamic
+    :category:
+    :reverse: -fno-spec-eval
+
+    :default: on
+    :since: 9.14.1
+
+    Enables speculative evaluation which usually results in fewer allocations.
+    Enabling speculative evaluation should not cause performance regressions.
+    If you encounter any, please open a ticket.
+
+    Note that disabling this flag will switch off speculative evaluation
+    completely, causing :ghc-flag:`-fspec-eval-dictfun` to have
+    no effect.
+
+.. ghc-flag:: -fspec-eval-dictfun
+    :shortdesc: Enables speculative evaluation of dictionary functions.
+    :type: dynamic
+    :category:
+    :reverse: -fno-spec-eval-dictfun
+
+    :default: off
+    :since: 9.14.1
+
+    Enables speculative (strict) evaluation of dictionary functions.
+
+    This is best explained with an example ::
+
+        instance C a => D a where ...
+
+        g :: D a => a -> Int
+        g x = ...
+
+        f :: C a => a -> Int
+        f x = g x
+
+    Function `f` has to pass a `D a` dictionary to `g`, and uses a dictionary
+    function `C a => D a` to compute it. If speculative evaluation for
+    dictionary functions is enabled, this dictionary is computed
+    strictly.
+
+    Speculative evalation of dictionary functions can lead to slightly better
+    performance, because a thunk is avoided. However, it results in unnecessary
+    computation and allocation if the dictionary goes unused. This causes
+    a significant increase in allocation if the dictionary is large.
+    See (:ghc-ticket:`25284`).
+
 .. ghc-flag:: -fdicts-cheap
     :shortdesc: Make dictionary-valued expressions seem cheap to the optimiser.
     :type: dynamic
@@ -637,6 +716,23 @@ as such you shouldn't need to set any of them explicitly. A flag
     worker/wrapper to turn a function into a thunk in the presence of
     ``-fno-full-laziness``. If that is inconvenient for you, please leave a
     comment `on the issue tracker (#21204) <https://gitlab.haskell.org/ghc/ghc/-/issues/21204>`__.
+
+.. ghc-flag:: -finter-module-far-jumps
+    :shortdesc: Assume code sections can be very large.
+    :type: dynamic
+    :reverse: -fno-inter-module-far-jumps
+    :category:
+
+    :default: Off
+
+    This flag forces GHC to use far jumps instead of near jumps for all jumps
+    which cross module boundries. This removes the need for jump islands/linker
+    jump fixups which some linkers struggle to deal with. (:ghc-ticket:`24648`)
+
+    This comes at a very modest code size (~2%) and runtime (~0.6%) overhead.
+
+    Note that this flag currently only affects the NCG AArch64 backend.
+
 
 .. ghc-flag:: -fignore-asserts
     :shortdesc: Ignore assertions in the source. Implied by :ghc-flag:`-O`.
@@ -1609,6 +1705,11 @@ as such you shouldn't need to set any of them explicitly. A flag
     as if it we were compiling for a 64-bit target even if fields are larger
     than a pointer on those platforms.
 
+    Also note: in modules that introduce type or data family instances,
+    GHC will not automatically use those instances for unpacking fields of other
+    declarations in the same module. To work around the issue, the use of
+    explicit ``UNPACK`` pragmas is advised.
+
 .. ghc-flag:: -funbox-strict-fields
     :shortdesc: Flatten strict constructor fields
     :type: dynamic
@@ -1635,6 +1736,11 @@ as such you shouldn't need to set any of them explicitly. A flag
 
     Alternatively you can use :ghc-flag:`-funbox-small-strict-fields` to only
     unbox strict fields which are "small".
+
+    Note: in modules that introduce type or data family instances,
+    GHC will not automatically use those instances for unpacking fields of other
+    declarations in the same module. To work around the issue, the use of
+    explicit ``UNPACK`` pragmas is advised.
 
 .. ghc-flag:: -funfolding-creation-threshold=⟨n⟩
     :shortdesc: *default: 750.* Tweak unfolding settings.

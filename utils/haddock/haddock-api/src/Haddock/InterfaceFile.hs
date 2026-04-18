@@ -139,7 +139,7 @@ binaryInterfaceMagic = 0xD0Cface
 -- (2) set `binaryInterfaceVersionCompatibility` to [binaryInterfaceVersion]
 --
 binaryInterfaceVersion :: Word16
-#if MIN_VERSION_ghc(9,11,0) && !MIN_VERSION_ghc(9,14,0)
+#if MIN_VERSION_ghc(9,11,0) && !MIN_VERSION_ghc(9,16,0)
 binaryInterfaceVersion = 46
 
 binaryInterfaceVersionCompatibility :: [Word16]
@@ -423,6 +423,8 @@ instance Binary DocOption where
     putByte bh 4
   put_ bh OptPrintRuntimeRep = do
     putByte bh 5
+  put_ bh OptRedactTypeSyns = do
+    putByte bh 6
   get bh = do
     h <- getByte bh
     case h of
@@ -438,6 +440,8 @@ instance Binary DocOption where
         return OptShowExtensions
       5 -> do
         return OptPrintRuntimeRep
+      6 -> do
+        return OptRedactTypeSyns
       n -> fail $ "invalid binary data found: " <> show n
 
 instance Binary Example where

@@ -61,13 +61,13 @@
 // 3. The main thread "scheduler loop" does one simple thing: check if
 //    the thread run queue is non-empty and if so, yield to other
 //    threads for execution, otherwise exit the loop.
-// 4. When a thread blocks for a JSFFI async import result, it pins
-//    the current TSO via a stable pointer, and calls Promise.then()
-//    on the particular Promise it's blocked on. When that Promise is
-//    fulfilled in the future, it will call back into the RTS, fetches
-//    the TSO indexed by that stable pointer, passes the result and
-//    wakes up the TSO, then finally does another round of scheduler
-//    loop. This is handled by stg_blockPromise.
+// 4. When a thread blocks for a JSFFI async import result, it pins an
+//    MVar to a stable pointer, calls Promise.then() on the particular
+//    Promise it's blocked on, then finally blocks by readMVar. When
+//    that Promise is fulfilled in the future, the Promise.then()
+//    callback writes the result to MVar and wakes up the TSO, then
+//    finally does another round of scheduler loop. This is handled by
+//    stg_blockPromise.
 //
 // The async JSFFI scheduler is idempotent, it's safe to run it
 // multiple times, now or later, though it's not safe to forget to run
@@ -113,8 +113,8 @@
 // JavaScript main thread.
 #define BUSY_YIELD_NS 15000000
 
-import CLOSURE ghczmprim_GHCziTuple_Z0T_closure;
 #if !defined(UnregisterisedCompiler)
+import CLOSURE ghc_hs_iface;
 import CLOSURE stg_scheduler_loop_epoch;
 import CLOSURE stg_scheduler_loop_tid;
 #endif
@@ -139,7 +139,7 @@ stg_scheduler_loopzh ()
   // Only meant to be run from a "main thread" (aka bound to an InCall
   // frame), not from a forked thread!
   if (StgTSO_bound(CurrentTSO) == NULL) {
-    return (ghczmprim_GHCziTuple_Z0T_closure);
+    return (HsIface_Z0T_closure(W_[ghc_hs_iface]));
   }
 
   // Entering the scheduler loop for the first time.
@@ -154,7 +154,7 @@ stg_scheduler_loopzh ()
 
   // Someone else is running the loop, not my business anymore.
   if (I64[stg_scheduler_loop_tid] != StgTSO_id(CurrentTSO)) {
-    return (ghczmprim_GHCziTuple_Z0T_closure);
+    return (HsIface_Z0T_closure(W_[ghc_hs_iface]));
   }
 
 work:
@@ -180,7 +180,7 @@ work:
 
 cleanup:
   I64[stg_scheduler_loop_tid] = 0 :: I64;
-  return (ghczmprim_GHCziTuple_Z0T_closure);
+  return (HsIface_Z0T_closure(W_[ghc_hs_iface]));
 }
 
 // After creating a new thread with only a stop frame on the stack,

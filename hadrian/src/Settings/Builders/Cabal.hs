@@ -11,8 +11,7 @@ import Settings.Builders.Common
 import qualified Settings.Builders.Common as S
 import Control.Exception (assert)
 import qualified Data.Set as Set
-import System.Directory
-import Settings.Program (programContext)
+import Settings.Program (programContext, ghcWithInterpreter)
 import GHC.Toolchain (ccLinkProgram, tgtCCompilerLink)
 import GHC.Toolchain.Program (prgFlags)
 
@@ -138,7 +137,8 @@ libraryArgs = do
     flavourWays <- getLibraryWays
     contextWay  <- getWay
     package     <- getPackage
-    withGhci    <- expr ghcWithInterpreter
+    stage       <- getStage
+    withGhci    <- expr $ ghcWithInterpreter stage
     dynPrograms <- expr (flavour >>= dynamicGhcPrograms)
     ghciObjsSupported <- expr platformSupportsGhciObjects
     let ways = Set.insert contextWay flavourWays

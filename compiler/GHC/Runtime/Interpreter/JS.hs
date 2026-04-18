@@ -129,12 +129,11 @@ startTHRunnerProcess interp_js settings = do
                                            (nodeExtraArgs settings)
   std_in <- readIORef interp_in
 
-  lo_ref <- newIORef Nothing
+  interpPipe <- mkPipeFromHandles rh wh
   lock <- newMVar ()
-  let pipe = Pipe { pipeRead = rh, pipeWrite = wh, pipeLeftovers = lo_ref }
   let proc = InterpProcess
               { interpHandle = hdl
-              , interpPipe   = pipe
+              , interpPipe
               , interpLock   = lock
               }
   pure (std_in, proc)
@@ -166,7 +165,7 @@ spawnJSInterp cfg = do
 
   -- get the unit-id of the ghci package. We need this to load the
   -- interpreter code.
-  ghci_unit_id <- case lookupPackageName (ue_units unit_env) (PackageName (fsLit "ghci")) of
+  ghci_unit_id <- case lookupPackageName (ue_homeUnitState unit_env) (PackageName (fsLit "ghci")) of
     Nothing -> cmdLineErrorIO "JS interpreter: couldn't find \"ghci\" package"
     Just i  -> pure i
 
@@ -228,9 +227,9 @@ jsLinkRts logger tmpfs tmp_dir cfg unit_env inst = do
         , lcLinkCsources    = False -- we know that there are no C sources to load for the RTS
         }
 
-  -- link the RTS and its dependencies (things it uses from `base`, etc.)
+  -- link the RTS and its dependencies (things it uses from `ghc-internal`, etc.)
   let link_spec = LinkSpec
-        { lks_unit_ids        = [rtsUnitId, ghcInternalUnitId, primUnitId]
+        { lks_unit_ids        = [rtsUnitId, ghcInternalUnitId]
         , lks_obj_root_filter = const False
         , lks_extra_roots     = mempty
         , lks_objs_hs         = mempty
@@ -265,7 +264,7 @@ jsLinkInterp logger tmpfs tmp_dir cfg unit_env inst = do
   let ghci_unit_id = instGhciUnitId (instExtra inst)
 
   -- compute unit dependencies of ghc_unit_id
-  let unit_map = unitInfoMap (ue_units unit_env)
+  let unit_map = unitInfoMap (ue_homeUnitState unit_env)
   dep_units <- mayThrowUnitErr $ closeUnitDeps unit_map [(ghci_unit_id,Nothing)]
   let units = dep_units ++ [ghci_unit_id]
 
@@ -304,7 +303,7 @@ jsLinkObjects logger tmpfs tmp_dir cfg unit_env inst objs is_root = do
         , lcLinkCsources    = True  -- enable C sources, if any
         }
 
-  let units = preloadUnits (ue_units unit_env)
+  let units = preloadUnits (ue_homeUnitState unit_env)
 
   -- compute dependencies
   let link_spec = LinkSpec

@@ -6,7 +6,14 @@
 -- (c) The GHC Team 2017
 --
 -----------------------------------------------------------------------------
-module GHC.SysTools.Process where
+module GHC.SysTools.Process
+  ( readCreateProcessWithExitCode'
+  , getGccEnv
+  , runSomething
+  , runSomethingResponseFile
+  , runSomethingFiltered
+  , runSomethingWith
+  ) where
 
 import GHC.Prelude
 
@@ -21,6 +28,14 @@ import GHC.Utils.CliOption
 
 import GHC.Types.SrcLoc ( SrcLoc, mkSrcLoc, mkSrcSpan )
 import GHC.Data.FastString
+
+import GHC.IO.Encoding
+
+#if defined(__IO_MANAGER_WINIO__)
+import GHC.IO.SubSystem ((<!>))
+import GHC.IO.Handle.Windows (handleToHANDLE)
+import GHC.Event.Windows (associateHandle')
+#endif
 
 import Control.Concurrent
 import Data.Char
@@ -67,26 +82,6 @@ readCreateProcessWithExitCode' proc = do
     ex <- waitForProcess pid
 
     return (ex, output)
-
-replaceVar :: (String, String) -> [(String, String)] -> [(String, String)]
-replaceVar (var, value) env =
-    (var, value) : filter (\(var',_) -> var /= var') env
-
--- | Version of @System.Process.readProcessWithExitCode@ that takes a
--- key-value tuple to insert into the environment.
-readProcessEnvWithExitCode
-    :: String -- ^ program path
-    -> [String] -- ^ program args
-    -> (String, String) -- ^ addition to the environment
-    -> IO (ExitCode, String, String) -- ^ (exit_code, stdout, stderr)
-readProcessEnvWithExitCode prog args env_update = do
-    current_env <- getEnvironment
-    readCreateProcessWithExitCode (proc prog args) {
-        env = Just (replaceVar env_update current_env) } ""
-
--- Don't let gcc localize version info string, #8825
-c_locale_env :: (String, String)
-c_locale_env = ("LANGUAGE", "C")
 
 -- If the -B<dir> option is set, add <dir> to PATH.  This works around
 -- a bug in gcc on Windows Vista where it can't find its auxiliary
@@ -141,7 +136,7 @@ runSomethingResponseFile
   :: Logger
   -> TmpFs
   -> TempDir
-  -> (String->String)
+  -> ([String] -> [String])
   -> String
   -> String
   -> [Option]
@@ -187,7 +182,7 @@ runSomethingResponseFile logger tmpfs tmp_dir filter_fn phase_name pgm args mb_e
         ]
 
 runSomethingFiltered
-  :: Logger -> (String->String) -> String -> String -> [Option]
+  :: Logger -> ([String] -> [String]) -> String -> String -> [Option]
   -> Maybe FilePath -> Maybe [(String,String)] -> IO ()
 
 runSomethingFiltered logger filter_fn phase_name pgm args mb_cwd mb_env =
@@ -220,20 +215,30 @@ handleProc pgm phase_name proc = do
           then does_not_exist
           else throwGhcExceptionIO (ProgramError $ show err)
 
-    does_not_exist = throwGhcExceptionIO (InstallationError ("could not execute: " ++ pgm))
+    does_not_exist =
+      throwGhcExceptionIO $
+        InstallationError (phase_name ++ ": could not execute: " ++ pgm)
 
+withPipe :: ((Handle, Handle) -> IO a) -> IO a
+withPipe = bracket createPipe $ \ (readEnd, writeEnd) -> do
+  hClose readEnd
+  hClose writeEnd
 
-builderMainLoop :: Logger -> (String -> String) -> FilePath
+builderMainLoop :: Logger -> ([String] -> [String]) -> FilePath
                 -> [String] -> Maybe FilePath -> Maybe [(String, String)]
                 -> IO ExitCode
-builderMainLoop logger filter_fn pgm real_args mb_cwd mb_env = do
-  chan <- newChan
+builderMainLoop logger filter_fn pgm real_args mb_cwd mb_env = withPipe $ \ (readEnd, writeEnd) -> do
+
+#if defined(__IO_MANAGER_WINIO__)
+  return () <!> do
+    associateHandle' =<< handleToHANDLE readEnd
+#endif
 
   -- We use a mask here rather than a bracket because we want
   -- to distinguish between cleaning up with and without an
   -- exception. This is to avoid calling terminateProcess
   -- unless an exception was raised.
-  let safely inner = mask $ \restore -> do
+  mask $ \restore -> do
         -- acquire
         -- On Windows due to how exec is emulated the old process will exit and
         -- a new process will be created. This means waiting for termination of
@@ -243,105 +248,86 @@ builderMainLoop logger filter_fn pgm real_args mb_cwd mb_env = do
         -- finish.
         let procdata =
               enableProcessJobs
-              $ (proc pgm real_args) { cwd = mb_cwd
-                                     , env = mb_env
-                                     , std_in  = CreatePipe
-                                     , std_out = CreatePipe
-                                     , std_err = CreatePipe
-                                     }
-        (Just hStdIn, Just hStdOut, Just hStdErr, hProcess) <- restore $
+              $ (proc pgm real_args) {
+                cwd = mb_cwd
+              , env = mb_env
+              , std_in  = CreatePipe
+
+              -- We used to treat stdout/stderr as separate streams, but this
+              -- was racy (see #25517).  We now treat them as one stream and
+              -- that is fine for our use-case.  We rely on upstream programs
+              -- to serialize writes to the two streams appropriately (note
+              -- that they already need to do that to produce deterministic
+              -- output when used interactively / on the command-line).
+              , std_out = UseHandle writeEnd
+              , std_err = UseHandle writeEnd
+              }
+        (Just hStdIn, Nothing, Nothing, hProcess) <- restore $
           createProcess_ "builderMainLoop" procdata
-        let cleanup_handles = do
-              hClose hStdIn
-              hClose hStdOut
-              hClose hStdErr
+        hClose writeEnd
         r <- try $ restore $ do
-          hSetBuffering hStdOut LineBuffering
-          hSetBuffering hStdErr LineBuffering
-          let make_reader_proc h = forkIO $ readerProc chan h filter_fn
-          bracketOnError (make_reader_proc hStdOut) killThread $ \_ ->
-            bracketOnError (make_reader_proc hStdErr) killThread $ \_ ->
-            inner hProcess
+          getLocaleEncoding >>= hSetEncoding readEnd
+          hSetNewlineMode readEnd nativeNewlineMode
+          hSetBuffering readEnd LineBuffering
+          messages <- parseBuildMessages . filter_fn . lines <$> hGetContents readEnd
+          mapM_ processBuildMessage messages
+          waitForProcess hProcess
+        hClose hStdIn
         case r of
-          -- onException
           Left (SomeException e) -> do
             terminateProcess hProcess
-            cleanup_handles
             throw e
-          -- cleanup when there was no exception
           Right s -> do
-            cleanup_handles
             return s
-  safely $ \h -> do
-    -- we don't want to finish until 2 streams have been complete
-    -- (stdout and stderr)
-    log_loop chan (2 :: Integer)
-    -- after that, we wait for the process to finish and return the exit code.
-    waitForProcess h
   where
-    -- t starts at the number of streams we're listening to (2) decrements each
-    -- time a reader process sends EOF. We are safe from looping forever if a
-    -- reader thread dies, because they send EOF in a finally handler.
-    log_loop _ 0 = return ()
-    log_loop chan t = do
-      msg <- readChan chan
+    processBuildMessage :: BuildMessage -> IO ()
+    processBuildMessage msg = do
       case msg of
         BuildMsg msg -> do
           logInfo logger $ withPprStyle defaultUserStyle msg
-          log_loop chan t
         BuildError loc msg -> do
           logMsg logger errorDiagnostic (mkSrcSpan loc loc)
               $ withPprStyle defaultUserStyle msg
-          log_loop chan t
-        EOF ->
-          log_loop chan  (t-1)
 
-readerProc :: Chan BuildMessage -> Handle -> (String -> String) -> IO ()
-readerProc chan hdl filter_fn =
-    (do str <- hGetContents hdl
-        loop (linesPlatform (filter_fn str)) Nothing)
-    `finally`
-       writeChan chan EOF
-        -- ToDo: check errors more carefully
-        -- ToDo: in the future, the filter should be implemented as
-        -- a stream transformer.
+parseBuildMessages :: [String] -> [BuildMessage]
+parseBuildMessages str = loop str Nothing
     where
-        loop []     Nothing    = return ()
-        loop []     (Just err) = writeChan chan err
+        loop :: [String] -> Maybe BuildMessage -> [BuildMessage]
+        loop []     Nothing    = []
+        loop []     (Just err) = [err]
         loop (l:ls) in_err     =
                 case in_err of
                   Just err@(BuildError srcLoc msg)
                     | leading_whitespace l ->
                         loop ls (Just (BuildError srcLoc (msg $$ text l)))
-                    | otherwise -> do
-                        writeChan chan err
-                        checkError l ls
+                    | otherwise ->
+                        err : checkError l ls
                   Nothing ->
                         checkError l ls
-                  _ -> panic "readerProc/loop"
+                  _ -> panic "parseBuildMessages/loop"
 
+        checkError :: String -> [String] -> [BuildMessage]
         checkError l ls
            = case parseError l of
-                Nothing -> do
-                    writeChan chan (BuildMsg (text l))
-                    loop ls Nothing
-                Just (file, lineNum, colNum, msg) -> do
-                    let srcLoc = mkSrcLoc (mkFastString file) lineNum colNum
+                Nothing ->
+                    BuildMsg (text l) : loop ls Nothing
+                Just (srcLoc, msg) -> do
                     loop ls (Just (BuildError srcLoc (text msg)))
 
+        leading_whitespace :: String -> Bool
         leading_whitespace []    = False
         leading_whitespace (x:_) = isSpace x
 
-parseError :: String -> Maybe (String, Int, Int, String)
+parseError :: String -> Maybe (SrcLoc, String)
 parseError s0 = case breakColon s0 of
                 Just (filename, s1) ->
                     case breakIntColon s1 of
                     Just (lineNum, s2) ->
                         case breakIntColon s2 of
                         Just (columnNum, s3) ->
-                            Just (filename, lineNum, columnNum, s3)
+                            Just (mkSrcLoc (mkFastString filename) lineNum columnNum, s3)
                         Nothing ->
-                            Just (filename, lineNum, 0, s2)
+                            Just (mkSrcLoc (mkFastString filename) lineNum 0, s2)
                     Nothing -> Nothing
                 Nothing -> Nothing
 
@@ -371,22 +357,3 @@ breakIntColon xs = case break (':' ==) xs of
 data BuildMessage
   = BuildMsg   !SDoc
   | BuildError !SrcLoc !SDoc
-  | EOF
-
--- Divvy up text stream into lines, taking platform dependent
--- line termination into account.
-linesPlatform :: String -> [String]
-#if !defined(mingw32_HOST_OS)
-linesPlatform ls = lines ls
-#else
-linesPlatform "" = []
-linesPlatform xs =
-  case lineBreak xs of
-    (as,xs1) -> as : linesPlatform xs1
-  where
-   lineBreak "" = ("","")
-   lineBreak ('\r':'\n':xs) = ([],xs)
-   lineBreak ('\n':xs) = ([],xs)
-   lineBreak (x:xs) = let (as,bs) = lineBreak xs in (x:as,bs)
-
-#endif

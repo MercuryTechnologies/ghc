@@ -44,6 +44,7 @@ module GHC.Iface.Type (
         SuppressBndrSig(..),
         UseBndrParens(..),
         PrintExplicitKinds(..),
+        PrintArityInvisibles(..),
         pprIfaceType, pprParendIfaceType, pprPrecIfaceType,
         pprIfaceContext, pprIfaceContextArr,
         pprIfaceIdBndr, pprIfaceLamBndr, pprIfaceTvBndr, pprIfaceTyConBinders,
@@ -56,6 +57,7 @@ module GHC.Iface.Type (
         isIfaceRhoType,
 
         suppressIfaceInvisibles,
+        visibleTypeVarOccurencies,
         stripIfaceInvisVars,
         stripInvisArgs,
 
@@ -98,6 +100,9 @@ import Data.Word (Word8)
 import Control.Arrow (first)
 import Control.DeepSeq
 import Control.Monad ((<$!>))
+import Data.List (dropWhileEnd)
+import qualified Data.List.NonEmpty as NonEmpty
+import qualified Data.Set as Set
 
 {-
 ************************************************************************
@@ -609,15 +614,65 @@ splitIfaceReqForallTy (IfaceForAllTy bndr ty)
   = case splitIfaceReqForallTy ty of { (bndrs, rho) -> (bndr:bndrs, rho) }
 splitIfaceReqForallTy rho = ([], rho)
 
-suppressIfaceInvisibles :: PrintExplicitKinds -> [IfaceTyConBinder] -> [a] -> [a]
-suppressIfaceInvisibles (PrintExplicitKinds True) _tys xs = xs
-suppressIfaceInvisibles (PrintExplicitKinds False) tys xs = suppress tys xs
+newtype PrintArityInvisibles = MkPrintArityInvisibles Bool
+
+-- See Note [Print invisible binders in interface declarations]
+-- for the definition of what binders are considered insignificant
+suppressIfaceInvisibles :: PrintArityInvisibles
+                        -> PrintExplicitKinds
+                        -> Set.Set IfLclName
+                        -> [IfaceTyConBinder]
+                        -> [a]
+                        -> [a]
+suppressIfaceInvisibles _ (PrintExplicitKinds True) _ _tys xs = xs
+
+suppressIfaceInvisibles -- This case is semantically the same as the third case, but it should be way f
+  (MkPrintArityInvisibles False) (PrintExplicitKinds False) mentioned_vars tys xs
+  | Set.null mentioned_vars = suppress tys xs
     where
       suppress _       []      = []
       suppress []      a       = a
       suppress (k:ks) (x:xs)
         | isInvisibleTyConBinder k =     suppress ks xs
         | otherwise                = x : suppress ks xs
+
+suppressIfaceInvisibles
+  (MkPrintArityInvisibles arity_invisibles)
+  (PrintExplicitKinds False) mentioned_vars tys xs
+  = map snd (suppress (zip tys xs))
+    where
+      -- Consider this example:
+      --   type T :: forall k1 k2. Type
+      --   type T @a @b = b
+      -- `@a` is not mentioned on the RHS. However, we can't just
+      -- drop it because implicit argument positioning matters.
+      --
+      -- Hence just drop the end
+      only_mentioned_binders = dropWhileEnd (not . is_binder_mentioned)
+
+      is_binder_mentioned (bndr, _) = ifTyConBinderName bndr `Set.member` mentioned_vars
+
+      suppress_invisibles group =
+        applyWhen invis_group only_mentioned_binders bndrs
+        where
+          bndrs       = NonEmpty.toList group
+          invis_group = is_invisible_bndr (NonEmpty.head group)
+
+      suppress_invisible_groups [] = []
+      suppress_invisible_groups [group] =
+          if arity_invisibles
+            then NonEmpty.toList group -- the last group affects arity
+            else suppress_invisibles group
+      suppress_invisible_groups (group : groups)
+        = suppress_invisibles group ++ suppress_invisible_groups groups
+
+      suppress
+        = suppress_invisible_groups            -- Filter out insignificant invisible binders
+        . NonEmpty.groupWith is_invisible_bndr -- Find chunks of @-binders
+        . filterOut          is_inferred_bndr  -- We don't want to display @{binders}
+
+      is_inferred_bndr = isInferredTyConBinder . fst
+      is_invisible_bndr = isInvisibleTyConBinder . fst
 
 stripIfaceInvisVars :: PrintExplicitKinds -> [IfaceTyConBinder] -> [IfaceTyConBinder]
 stripIfaceInvisVars (PrintExplicitKinds True)  tyvars = tyvars
@@ -658,6 +713,29 @@ ifTypeIsVarFree ty = go ty
 
     go_args IA_Nil = True
     go_args (IA_Arg arg _ args) = go arg && go_args args
+
+visibleTypeVarOccurencies :: IfaceType -> Set.Set IfLclName
+-- Returns True if the type contains this name. Doesn't count
+-- invisible application
+-- Just used to control pretty printing
+visibleTypeVarOccurencies = go
+  where
+    (<>) = Set.union
+
+    go (IfaceTyVar var)         = Set.singleton var
+    go (IfaceFreeTyVar {})      = mempty
+    go (IfaceAppTy fun args)    = go fun <> go_args args
+    go (IfaceFunTy _ w arg res) = go w <> go arg <> go res
+    go (IfaceForAllTy bndr ty)  = go (ifaceBndrType $ binderVar bndr) <> go ty
+    go (IfaceTyConApp _ args)   = go_args args
+    go (IfaceTupleTy _ _ args)  = go_args args
+    go (IfaceLitTy _)           = mempty
+    go (IfaceCastTy {})         = mempty -- Safe
+    go (IfaceCoercionTy {})     = mempty -- Safe
+
+    go_args IA_Nil = mempty
+    go_args (IA_Arg arg Required args) = go arg <> go_args args
+    go_args (IA_Arg _arg _ args) = go_args args
 
 {- Note [Substitution on IfaceType]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1669,7 +1747,7 @@ pprTyTcApp ctxt_prec tc tys =
        , IA_Arg (IfaceLitTy (IfaceStrTyLit n))
                 Required (IA_Arg ty Required IA_Nil) <- tys
        -> maybeParen ctxt_prec funPrec
-         $ char '?' <> ftext (getLexicalFastString n) <> text "::" <> ppr_ty topPrec ty
+         $ char '?' <> ftext (getLexicalFastString n) <> dcolon <> ppr_ty topPrec ty
 
        | IfaceTupleTyCon arity sort <- ifaceTyConSort info
        , not debug
@@ -2499,18 +2577,23 @@ instance Binary (DefMethSpec IfaceType) where
               0 -> return VanillaDM
               _ -> do { t <- get bh; return (GenericDM t) }
 
+instance NFData (DefMethSpec IfaceType) where
+  rnf = \case
+    VanillaDM -> ()
+    GenericDM t -> rnf t
+
 instance NFData IfaceType where
   rnf = \case
     IfaceFreeTyVar f1 -> f1 `seq` ()
     IfaceTyVar f1 -> rnf f1
     IfaceLitTy f1 -> rnf f1
     IfaceAppTy f1 f2 -> rnf f1 `seq` rnf f2
-    IfaceFunTy f1 f2 f3 f4 -> f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4
-    IfaceForAllTy f1 f2 -> f1 `seq` rnf f2
+    IfaceFunTy f1 f2 f3 f4 -> rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4
+    IfaceForAllTy f1 f2 -> rnf f1 `seq` rnf f2
     IfaceTyConApp f1 f2 -> rnf f1 `seq` rnf f2
     IfaceCastTy f1 f2 -> rnf f1 `seq` rnf f2
     IfaceCoercionTy f1 -> rnf f1
-    IfaceTupleTy f1 f2 f3 -> f1 `seq` f2 `seq` rnf f3
+    IfaceTupleTy f1 f2 f3 -> rnf f1 `seq` rnf f2 `seq` rnf f3
 
 instance NFData IfaceTyLit where
   rnf = \case
@@ -2521,21 +2604,25 @@ instance NFData IfaceTyLit where
 instance NFData IfaceCoercion where
   rnf = \case
     IfaceReflCo f1 -> rnf f1
-    IfaceGReflCo f1 f2 f3 -> f1 `seq` rnf f2 `seq` rnf f3
-    IfaceFunCo f1 f2 f3 f4 -> f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4
-    IfaceTyConAppCo f1 f2 f3 -> f1 `seq` rnf f2 `seq` rnf f3
+    IfaceGReflCo f1 f2 f3 -> rnf f1 `seq` rnf f2 `seq` rnf f3
+    IfaceFunCo f1 f2 f3 f4 -> rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4
+    IfaceTyConAppCo f1 f2 f3 -> rnf f1 `seq` rnf f2 `seq` rnf f3
     IfaceAppCo f1 f2 -> rnf f1 `seq` rnf f2
     IfaceForAllCo f1 f2 f3 f4 f5 -> rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf f5
     IfaceCoVarCo f1 -> rnf f1
     IfaceAxiomCo f1 f2 -> rnf f1 `seq` rnf f2
-    IfaceUnivCo f1 f2 f3 f4 deps -> rnf f1 `seq` f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf deps
+    IfaceUnivCo f1 f2 f3 f4 deps -> rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq` rnf deps
     IfaceSymCo f1 -> rnf f1
     IfaceTransCo f1 f2 -> rnf f1 `seq` rnf f2
     IfaceSelCo f1 f2 -> rnf f1 `seq` rnf f2
-    IfaceLRCo f1 f2 -> f1 `seq` rnf f2
+    IfaceLRCo f1 f2 -> rnf f1 `seq` rnf f2
     IfaceInstCo f1 f2 -> rnf f1 `seq` rnf f2
     IfaceKindCo f1 -> rnf f1
     IfaceSubCo f1 -> rnf f1
+    -- These are not deeply forced because they are not used in ModIface,
+    -- these constructors are for pretty-printing.
+    -- See Note [Free TyVars and CoVars in IfaceType]
+    -- See Note [Holes in IfaceCoercion]
     IfaceFreeCoVar f1 -> f1 `seq` ()
     IfaceHoleCo f1 -> f1 `seq` ()
 
@@ -2546,15 +2633,17 @@ instance NFData IfaceAxiomRule where
     IfaceAR_B n i -> rnf n `seq` rnf i
 
 instance NFData IfaceMCoercion where
-  rnf x = seq x ()
+  rnf IfaceMRefl = ()
+  rnf (IfaceMCo c) = rnf c
 
 instance NFData IfaceOneShot where
-  rnf x = seq x ()
+  rnf IfaceOneShot = ()
+  rnf IfaceNoOneShot = ()
 
 instance NFData IfaceTyConSort where
   rnf = \case
     IfaceNormalTyCon -> ()
-    IfaceTupleTyCon arity sort -> rnf arity `seq` sort `seq` ()
+    IfaceTupleTyCon arity sort -> rnf arity `seq` rnf sort `seq` ()
     IfaceSumTyCon arity -> rnf arity
     IfaceEqualityTyCon -> ()
 
@@ -2562,7 +2651,7 @@ instance NFData IfLclName where
   rnf (IfLclName lfs) = rnf lfs
 
 instance NFData IfaceTyConInfo where
-  rnf (IfaceTyConInfo f s) = f `seq` rnf s
+  rnf (IfaceTyConInfo f s) = rnf f `seq` rnf s
 
 instance NFData IfaceTyCon where
   rnf (IfaceTyCon nm info) = rnf nm `seq` rnf info
@@ -2575,4 +2664,4 @@ instance NFData IfaceBndr where
 instance NFData IfaceAppArgs where
   rnf = \case
     IA_Nil -> ()
-    IA_Arg f1 f2 f3 -> rnf f1 `seq` f2 `seq` rnf f3
+    IA_Arg f1 f2 f3 -> rnf f1 `seq` rnf f2 `seq` rnf f3

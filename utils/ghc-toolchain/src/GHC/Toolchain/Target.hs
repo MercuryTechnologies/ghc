@@ -22,15 +22,6 @@ data WordSize = WS4 | WS8
 data Endianness = LittleEndian | BigEndian
     deriving (Show, Read, Eq, Ord)
 
--- TODO(#23674): Move the remaining relevant `settings-xxx` to Target:
--- * llc command
--- * opt command
--- * install_name_tool
--- * otool command
---
--- Those are all things that are put into GHC's settings, and that might be
--- different across targets
-
 -- | A 'Target' consists of:
 --
 -- * a target architecture and operating system
@@ -72,8 +63,18 @@ data Target = Target
     , tgtMergeObjs :: Maybe MergeObjs
     -- ^ We don't need a merge objects tool if we @Ar@ supports @-L@
 
+      -- LLVM backend toolchain
+    , tgtLlc :: Maybe Program
+    , tgtOpt :: Maybe Program
+    , tgtLlvmAs :: Maybe Program
+    -- ^ assembler used to assemble LLVM backend output; typically @clang@
+
       -- Windows-specific tools
     , tgtWindres :: Maybe Program
+
+      -- Darwin-specific tools
+    , tgtOtool   :: Maybe Program
+    , tgtInstallNameTool :: Maybe Program
     }
     deriving (Read, Eq, Ord)
 
@@ -121,6 +122,11 @@ instance Show Target where
     , ", tgtRanlib = " ++ show tgtRanlib
     , ", tgtNm = " ++ show tgtNm
     , ", tgtMergeObjs = " ++ show tgtMergeObjs
+    , ", tgtLlc = " ++ show tgtLlc
+    , ", tgtOpt = " ++ show tgtOpt
+    , ", tgtLlvmAs = " ++ show tgtLlvmAs
     , ", tgtWindres = " ++ show tgtWindres
+    , ", tgtOtool = " ++ show tgtOtool
+    , ", tgtInstallNameTool = " ++ show tgtInstallNameTool
     , "}"
     ]

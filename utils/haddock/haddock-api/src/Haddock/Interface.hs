@@ -2,6 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE BangPatterns      #-}
 {-# LANGUAGE TupleSections     #-}
+{-# LANGUAGE LambdaCase        #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Haddock.Interface
@@ -70,7 +71,8 @@ import GHC.Types.Error (mkUnknownDiagnostic)
 import GHC.Types.Name.Occurrence (emptyOccEnv)
 import GHC.Unit.Finder (findImportedModule, FindResult(Found))
 import GHC.Unit.Home.ModInfo
-import GHC.Unit.Module.Graph (ModuleGraphNode (..))
+import GHC.Unit.Home.PackageTable
+import GHC.Unit.Module.Graph (ModuleGraphNode (..), ModuleNodeInfo(..))
 import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.ModIface (mi_semantic_module, mi_boot)
 import GHC.Unit.Module.ModSummary (isBootSummary)
@@ -100,7 +102,6 @@ processModules
                                 -- environment
 processModules verbosity modules flags extIfaces = do
   liftIO Compat.setEncoding
-  dflags <- getDynFlags
 
   -- Map from a module to a corresponding installed interface
   let instIfaceMap :: InstIfaceMap
@@ -120,10 +121,11 @@ processModules verbosity modules flags extIfaces = do
         Set.unions $ map (Set.fromList . ifaceExports) $
         filter (\i -> not $ OptHide `elem` ifaceOptions i) interfaces
       mods = Set.fromList $ map ifaceMod interfaces
+      expInfo = (exportedNames, mods)
 
   interfaces' <- {-# SCC attachInstances #-}
                  withTimingM "attachInstances" (const ()) $ do
-                   attachInstances (exportedNames, mods) interfaces instIfaceMap (isJust oneShotHiFile)
+                   attachInstances expInfo interfaces instIfaceMap (isJust oneShotHiFile)
 
   -- Combine the link envs of the external packages into one
   let extLinks  = Map.unions (map ifLinkEnv extIfaces)
@@ -138,7 +140,7 @@ processModules verbosity modules flags extIfaces = do
     withTimingM "renameAllInterfaces" (const ()) $
       for interfaces' $ \i -> do
         withTimingM ("renameInterface: " <+> pprModuleName (moduleName (ifaceMod i))) (const ()) $
-          renameInterface dflags ignoredSymbolSet links warnings (Flag_Hoogle `elem` flags) i
+          renameInterface ignoredSymbolSet links expInfo warnings (Flag_Hoogle `elem` flags) i
 
   return (interfaces'', homeLinks)
 
@@ -223,7 +225,7 @@ createIfaces verbosity modules flags instIfaceMap = do
       -- but if module A {-# SOURCE #-} imports B, then we can't say the same.
       --
   let
-      go (AcyclicSCC (ModuleNode _ ms))
+      go (AcyclicSCC (ModuleNode _ (ModuleNodeCompile ms)))
         | NotBoot <- isBootSummary ms = [ms]
         | otherwise = []
       go (AcyclicSCC _) = []
@@ -278,14 +280,15 @@ processModule verbosity modSummary flags ifaceMap instIfaceMap warningMap = do
 
   (mod_iface, insts) <- if Flag_NoCompilation `elem` flags
     then liftIO $ loadHiFile hsc_env doc $ ms_mod modSummary
-    else
-      let hmi = case lookupHpt (hsc_HPT hsc_env) (moduleName $ ms_mod modSummary) of
-            Nothing -> error "processModule: All modules should be loaded into the HPT by this point"
-            Just x -> x
-          cls_insts = instEnvElts . md_insts $ hm_details hmi
+    else do
+      hmi <- liftIO $ lookupHpt (hsc_HPT hsc_env) (moduleName $ ms_mod modSummary) >>= \case
+          Nothing -> error "processModule: All modules should be loaded into the HPT by this point"
+          Just x -> return x
+
+      let cls_insts = instEnvElts . md_insts $ hm_details hmi
           fam_insts = md_fam_insts $ hm_details hmi
 
-      in pure (hm_iface hmi, (cls_insts, fam_insts))
+      pure (hm_iface hmi, (cls_insts, fam_insts))
 
   !interface <- do
     logger <- getLogger

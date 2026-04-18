@@ -13,6 +13,7 @@ Type checking of type signatures in interface files
 {-# LANGUAGE RecursiveDo #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE RecordWildCards #-}
 
@@ -20,9 +21,10 @@ module GHC.IfaceToCore (
         tcLookupImported_maybe,
         importDecl, checkWiredInTyCon, tcHiBootIface, typecheckIface,
         typecheckWholeCoreBindings,
+        tcIfaceDefaults,
         typecheckIfacesForMerging,
         typecheckIfaceForInstantiate,
-        tcIfaceDecl, tcIfaceDecls, tcIfaceDefaults,
+        tcIfaceDecl, tcIfaceDecls,
         tcIfaceInst, tcIfaceFamInst, tcIfaceRules,
         tcIfaceAnnotations, tcIfaceCompleteMatches,
         tcIfaceExpr,    -- Desired by HERMIT (#7683)
@@ -73,18 +75,19 @@ import GHC.Core.Unfold.Make
 import GHC.Core.Lint
 import GHC.Core.Make
 import GHC.Core.Class
+import GHC.Core.Predicate( isUnaryClass )
 import GHC.Core.TyCon
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
 import GHC.Core.Ppr
 
-import GHC.Unit.Env
 import GHC.Unit.External
 import GHC.Unit.Module
 import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Home.ModInfo
+import qualified GHC.Unit.Home.Graph as HUG
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
@@ -103,6 +106,7 @@ import GHC.Types.SourceText
 import GHC.Types.Basic hiding ( SuccessFlag(..) )
 import GHC.Types.CompleteMatch
 import GHC.Types.SrcLoc
+import GHC.Types.Avail
 import GHC.Types.TypeEnv
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.DSet ( mkUniqDSet )
@@ -113,9 +117,9 @@ import GHC.Types.Literal
 import GHC.Types.Var as Var
 import GHC.Types.Var.Set
 import GHC.Types.Name
-import GHC.Types.Name.Reader
+import GHC.Types.Name.Set
 import GHC.Types.Name.Env
-import GHC.Types.DefaultEnv ( ClassDefaults(..), defaultEnv )
+import GHC.Types.DefaultEnv ( ClassDefaults(..), DefaultEnv, mkDefaultEnv, DefaultProvenance(..) )
 import GHC.Types.Id
 import GHC.Types.Id.Make
 import GHC.Types.Id.Info
@@ -134,10 +138,7 @@ import GHC.Driver.Env.KnotVars
 import GHC.Unit.Module.WholeCoreBindings
 import Data.IORef
 import Data.Foldable
-import Data.Function ( on )
 import Data.List(nub)
-import Data.List.NonEmpty ( NonEmpty )
-import qualified Data.List.NonEmpty as NE
 import GHC.Builtin.Names (ioTyConName, rOOT_MAIN)
 import GHC.Iface.Errors.Types
 
@@ -234,7 +235,7 @@ typecheckIface iface
         ; let type_env = mkNameEnv names_w_things
 
                 -- Now do those rules, instances and annotations
-        ; defaults  <- mapM (tcIfaceDefault iface_mod) (mi_defaults iface)
+        ; defaults  <- tcIfaceDefaults iface_mod (mi_defaults iface)
         ; insts     <- mapM tcIfaceInst (mi_insts iface)
         ; fam_insts <- mapM tcIfaceFamInst (mi_fam_insts iface)
         ; rules     <- tcIfaceRules ignore_prags (mi_rules iface)
@@ -253,7 +254,7 @@ typecheckIface iface
                          -- an example where this would cause non-termination.
                          text "Type envt:" <+> ppr (map fst names_w_things)])
         ; return $ ModDetails { md_types     = type_env
-                              , md_defaults  = defaultEnv defaults
+                              , md_defaults  = defaults
                               , md_insts     = mkInstEnv insts
                               , md_fam_insts = fam_insts
                               , md_rules     = rules
@@ -383,7 +384,7 @@ d1 `withRolesFrom` d2
     = d1 { ifRoles = mergeRoles roles1 roles2 }
     | otherwise = d1
   where
-    mergeRoles roles1 roles2 = zipWithEqual "mergeRoles" max roles1 roles2
+    mergeRoles roles1 roles2 = zipWithEqual max roles1 roles2
 
 isRepInjectiveIfaceDecl :: IfaceDecl -> Bool
 isRepInjectiveIfaceDecl IfaceData{ ifCons = IfDataTyCon{} } = True
@@ -485,7 +486,7 @@ typecheckIfacesForMerging mod ifaces tc_env_vars =
         -- But note that we use this type_env to typecheck references to DFun
         -- in 'IfaceInst'
         setImplicitEnvM type_env $ do
-        defaults  <- mapM (tcIfaceDefault $ mi_semantic_module iface) (mi_defaults iface)
+        defaults  <- tcIfaceDefaults (mi_semantic_module iface) (mi_defaults iface)
         insts     <- mapM tcIfaceInst (mi_insts iface)
         fam_insts <- mapM tcIfaceFamInst (mi_fam_insts iface)
         rules     <- tcIfaceRules ignore_prags (mi_rules iface)
@@ -493,7 +494,7 @@ typecheckIfacesForMerging mod ifaces tc_env_vars =
         exports   <- ifaceExportNames (mi_exports iface)
         complete_matches <- tcIfaceCompleteMatches (mi_complete_matches iface)
         return $ ModDetails { md_types     = type_env
-                            , md_defaults  = defaultEnv defaults
+                            , md_defaults  = defaults
                             , md_insts     = mkInstEnv insts
                             , md_fam_insts = fam_insts
                             , md_rules     = rules
@@ -527,7 +528,7 @@ typecheckIfaceForInstantiate nsubst iface
             return (mkNameEnv decls)
     -- See Note [rnIfaceNeverExported]
     setImplicitEnvM type_env $ do
-    defaults  <- mapM (tcIfaceDefault iface_mod) (mi_defaults iface)
+    defaults  <- tcIfaceDefaults iface_mod (mi_defaults iface)
     insts     <- mapM tcIfaceInst (mi_insts iface)
     fam_insts <- mapM tcIfaceFamInst (mi_fam_insts iface)
     rules     <- tcIfaceRules ignore_prags (mi_rules iface)
@@ -535,7 +536,7 @@ typecheckIfaceForInstantiate nsubst iface
     exports   <- ifaceExportNames (mi_exports iface)
     complete_matches <- tcIfaceCompleteMatches (mi_complete_matches iface)
     return $ ModDetails { md_types     = type_env
-                        , md_defaults  = defaultEnv defaults
+                        , md_defaults  = defaults
                         , md_insts     = mkInstEnv insts
                         , md_fam_insts = fam_insts
                         , md_rules     = rules
@@ -609,10 +610,11 @@ tcHiBootIface hsc_src mod
                 -- And that's fine, because if M's ModInfo is in the HPT, then
                 -- it's been compiled once, and we don't need to check the boot iface
           then do { (_, hug) <- getEpsAndHug
-                 ; case lookupHugByModule mod hug  of
+                  ; liftIO $
+                    HUG.lookupHugByModule mod hug >>= pure . \case
                       Just info | mi_boot (hm_iface info) == IsBoot
-                                -> return $ SelfBoot { sb_mds = hm_details info }
-                      _ -> return NoSelfBoot }
+                                -> SelfBoot { sb_mds = hm_details info }
+                      _ -> NoSelfBoot }
           else do
 
         -- OK, so we're in one-shot mode.
@@ -805,7 +807,7 @@ tc_iface_decl _parent _ignore_prags
                          ifBody = IfAbstractClass})
   = bindIfaceTyConBinders binders $ \ binders' -> do
     { fds  <- mapM tc_fd rdr_fds
-    ; cls  <- buildClass tc_name binders' roles fds Nothing
+    ; cls  <- buildAbstractClass tc_name binders' roles fds
     ; return (ATyCon (classTyCon cls)) }
 
 tc_iface_decl _parent ignore_prags
@@ -816,7 +818,7 @@ tc_iface_decl _parent ignore_prags
                          ifBody = IfConcreteClass {
                              ifClassCtxt = rdr_ctxt,
                              ifATs = rdr_ats, ifSigs = rdr_sigs,
-                             ifMinDef = if_mindef
+                             ifMinDef = if_mindef, ifUnary = unary
                          }})
   = bindIfaceTyConBinders binders $ \ binders' -> do
     { traceIf (text "tc-iface-class1" <+> ppr tc_name)
@@ -829,7 +831,7 @@ tc_iface_decl _parent ignore_prags
     ; cls  <- fixM $ \ cls -> do
               { ats  <- mapM (tc_at cls) rdr_ats
               ; traceIf (text "tc-iface-class4" <+> ppr tc_name)
-              ; buildClass tc_name binders' roles fds (Just (ctxt, ats, sigs, mindef)) }
+              ; buildClass tc_name binders' roles fds ctxt ats sigs mindef unary }
     ; return (ATyCon (classTyCon cls)) }
   where
    tc_sc pred = forkM (mk_sc_doc pred) (tcIfaceType pred)
@@ -1235,7 +1237,7 @@ tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
                                       ; return (HsUnpack (Just co)) }
 
     src_strict :: IfaceSrcBang -> HsSrcBang
-    src_strict (IfSrcBang unpk bang) = mkHsSrcBang NoSourceText unpk bang
+    src_strict (IfSrcBang unpk bang) = HsSrcBang NoSourceText unpk bang
 
 tcIfaceEqSpec :: IfaceEqSpec -> IfL [EqSpec]
 tcIfaceEqSpec spec
@@ -1275,23 +1277,70 @@ tcRoughTyCon :: Maybe IfaceTyCon -> RoughMatchTc
 tcRoughTyCon (Just tc) = RM_KnownTc (ifaceTyConName tc)
 tcRoughTyCon Nothing   = RM_WildCard
 
-tcIfaceDefaults :: Module -> [(Module, IfaceDefault)] -> IfG [NonEmpty ClassDefaults]
-tcIfaceDefaults this_mod defaults
-  = initIfaceLcl this_mod (text "Import defaults") NotBoot
-    $ NE.groupBy ((==) `on` cd_class)
-    <$> mapM (uncurry tcIfaceDefault) defaults
+{- Note [Tricky rehydrating IfaceDefaults loop]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+There's a potential circular dependency when rehydrating IfaceDefaults into
+a DefaultEnv (a map from class names to defaults):
+
+1. To construct a DefaultEnv, we need the Class objects corresponding to
+   the class names in the IfaceDefault
+
+2. If a class is defined in the current module, rehydrating it requires
+   looking into the ModDetails we're currently building
+
+3. But that ModDetails needs the DefaultEnv we're trying to create!
+
+This creates a circular dependency:
+   - DefaultEnv needs Class objects
+   - Class objects (for current module) need ModDetails
+   - ModDetails needs DefaultEnv
+
+Our solution is to break this loop by using just the class name from
+IfaceDefault, rather than trying to fully resolve the Class. Since
+DefaultEnv is keyed by Name anyway, we don't need the full Class object
+for the map construction - we only need it for the map values.
+
+In tcIfaceDefault we create ClassDefaults records containing the actual
+Class objects, but we do this *after* creating the DefaultEnv keyed by Name.
+
+This approach allows us to tie the knot properly without causing a loop.
+-}
+
+-- | 'tcIfaceDefaults' rehydrates a list of default declarations
+-- lazily, and returns a DefaultEnv.
+tcIfaceDefaults :: Module -> [IfaceDefault] -> IfL DefaultEnv
+tcIfaceDefaults this_mod defaults = do
+  defaults <- mapM do_one defaults
+  return $ mkDefaultEnv defaults
+  where
+    do_one idf = do
+      -- Invariant: (className class_default) == name
+      -- see Note [Tricky rehydrating IfaceDefaults loop]
+      let name = ifDefaultCls idf
+
+      -- Now look up the Class and the default types.
+      -- We must use forkM here, as these may be knot-tied (see #25858).
+      -- See Note [Rehydrating Modules] in GHC.Driver.Make
+      -- as well as Note [Knot-tying typecheckIface] in GHC.IfaceToCore.
+      class_default <- forkM (text "tcIfaceDefault" <+> ppr name) $ tcIfaceDefault this_mod idf
+      return (name, class_default)
 
 tcIfaceDefault :: Module -> IfaceDefault -> IfL ClassDefaults
-tcIfaceDefault this_mod IfaceDefault { ifDefaultCls = clsCon
+tcIfaceDefault this_mod IfaceDefault { ifDefaultCls = cls_name
                                      , ifDefaultTys = tys
                                      , ifDefaultWarn = iface_warn }
-  = do { clsCon' <- tcIfaceTyCon clsCon
+  = do { cls <- fmap tyThingConClass (tcIfaceImplicit cls_name)
        ; tys' <- traverse tcIfaceType tys
        ; let warn = fmap fromIfaceWarningTxt iface_warn
-       ; return ClassDefaults { cd_class = clsCon'
+       ; return ClassDefaults { cd_class = cls
                               , cd_types = tys'
-                              , cd_module = Just this_mod
+                              , cd_provenance = DP_Imported this_mod
                               , cd_warn = warn } }
+    where
+       tyThingConClass :: TyThing -> Class
+       tyThingConClass th = case tyConClass_maybe $ tyThingTyCon th of
+                         Just cls -> cls
+                         Nothing  -> pprPanic "tcIfaceDefault, expected class" (ppr th)
 
 tcIfaceInst :: IfaceClsInst -> IfL ClsInst
 tcIfaceInst (IfaceClsInst { ifDFun = dfun_name, ifOFlag = oflag
@@ -1684,9 +1733,9 @@ tcIfaceTickish :: IfaceTickish -> IfL CoreTickish
 tcIfaceTickish (IfaceHpcTick modl ix)   = return (HpcTick modl ix)
 tcIfaceTickish (IfaceSCC  cc tick push) = return (ProfNote cc tick push)
 tcIfaceTickish (IfaceSource src name)   = return (SourceNote src (LexicalFastString name))
-tcIfaceTickish (IfaceBreakpoint ix fvs modl) = do
+tcIfaceTickish (IfaceBreakpoint bid fvs) = do
   fvs' <- mapM tcIfaceExpr fvs
-  return (Breakpoint NoExtField ix [f | Var f <- fvs'] modl)
+  return (Breakpoint NoExtField bid [f | Var f <- fvs'])
 
 -------------------------
 tcIfaceLit :: Literal -> IfL Literal
@@ -1737,10 +1786,9 @@ tcIfaceDataAlt mult con inst_tys arg_strs rhs
 -}
 
 tcIdDetails :: Name -> Type -> IfaceIdDetails -> IfL IdDetails
-tcIdDetails _ _  IfVanillaId = return VanillaId
+tcIdDetails _ _  IfVanillaId           = return VanillaId
 tcIdDetails _ _  (IfWorkerLikeId dmds) = return $ WorkerLikeId dmds
-tcIdDetails _ ty IfDFunId
-  = return (DFunId (isNewTyCon (classTyCon cls)))
+tcIdDetails _ ty IfDFunId              = return (DFunId (isUnaryClass cls))
   where
     (_, _, cls, _) = tcSplitDFunTy ty
 
@@ -2240,9 +2288,10 @@ hydrateCgBreakInfo CgBreakInfo{..} = do
 
 -- | This function is only used to construct the environment for GHCi,
 -- so we make up fake locations
-tcIfaceImport :: HscEnv -> IfaceImport -> ImportUserSpec
-tcIfaceImport _ (IfaceImport spec ImpIfaceAll) = ImpUserSpec spec ImpUserAll
-tcIfaceImport _ (IfaceImport spec (ImpIfaceEverythingBut ns)) = ImpUserSpec spec (ImpUserEverythingBut ns)
-tcIfaceImport hsc_env (IfaceImport spec (ImpIfaceExplicit gre)) = ImpUserSpec spec (ImpUserExplicit (hydrateGlobalRdrEnv get_GRE_info gre))
-  where
-    get_GRE_info nm = tyThingGREInfo <$> lookupGlobal hsc_env nm
+tcIfaceImport :: IfaceImport -> ImportUserSpec
+tcIfaceImport (IfaceImport spec ImpIfaceAll)
+  = ImpUserSpec spec ImpUserAll
+tcIfaceImport (IfaceImport spec (ImpIfaceEverythingBut ns))
+  = ImpUserSpec spec (ImpUserEverythingBut (mkNameSet ns))
+tcIfaceImport (IfaceImport spec (ImpIfaceExplicit gre implicit_parents))
+  = ImpUserSpec spec (ImpUserExplicit (getDetOrdAvails gre) $ mkNameSet implicit_parents)
