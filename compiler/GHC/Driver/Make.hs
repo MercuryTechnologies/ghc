@@ -55,6 +55,7 @@ import GHC.Linker.Types
 
 import GHC.Platform.Ways
 
+import GHC.Driver.Backend (backendGeneratesCode)
 import GHC.Driver.Config.Finder (initFinderOpts)
 import GHC.Driver.Config.Parser (initParserOpts)
 import GHC.Driver.Config.Diagnostic
@@ -153,6 +154,9 @@ import GHC.Data.Graph.Directed.Reachability
 import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.PackageTable
 
+import Data.Time.Clock
+import System.IO
+
 -- -----------------------------------------------------------------------------
 -- Loading the program
 
@@ -248,7 +252,7 @@ depanalPartial excluded_mods allow_dup_roots = do
     -- cached finder data.
     liftIO $ flushFinderCaches (hsc_FC hsc_env) (hsc_unit_env hsc_env)
 
-    (errs, graph_nodes) <- liftIO $ downsweep
+    (errs, graph_nodes) <- liftIO $ downsweep True
       hsc_env (mgModSummaries old_graph) Nothing
       excluded_mods allow_dup_roots
     let
@@ -1561,7 +1565,8 @@ moduleGraphNodeMap graph =
 -- The returned list of [ModSummary] nodes has one node for each home-package
 -- module, plus one for any hs-boot files.  The imports of these nodes
 -- are all there, including the imports of non-home-package modules.
-downsweep :: HscEnv
+downsweep :: Bool -> -- ^ do_enable_code_gen_for_th
+             HscEnv
           -> [ModSummary]
           -- ^ Old summaries
           -> Maybe ModuleGraph
@@ -1575,10 +1580,16 @@ downsweep :: HscEnv
                 -- The non-error elements of the returned list all have distinct
                 -- (Modules, IsBoot) identifiers, unless the Bool is true in
                 -- which case there can be repeats
-downsweep hsc_env old_summaries old_graph excl_mods allow_dup_roots = do
+downsweep do_enable_code_gen_for_th hsc_env old_summaries old_graph excl_mods allow_dup_roots = do
   n_jobs <- mkWorkerLimit (hsc_dflags hsc_env)
+  t1 <- getCurrentTime
   new <- rootSummariesParallel n_jobs hsc_env summary
-  downsweep_imports hsc_env old_summary_map old_graph excl_mods allow_dup_roots new
+  t2 <- getCurrentTime
+  (r,s) <- downsweep_imports do_enable_code_gen_for_th hsc_env old_summary_map old_graph excl_mods allow_dup_roots new
+  t3 <- getCurrentTime
+  hPutStrLn stderr ("t2 - t1 = " ++ show (nominalDiffTimeToSeconds (diffUTCTime t2 t1)))
+  hPutStrLn stderr ("t3 - t2 = " ++ show (nominalDiffTimeToSeconds (diffUTCTime t3 t2)))
+  pure (r, s)
   where
     summary = getRootSummary excl_mods old_summary_map
 
@@ -1591,19 +1602,23 @@ downsweep hsc_env old_summaries old_graph excl_mods allow_dup_roots = do
     old_summary_map =
       M.fromList [((ms_unitid ms, OsPath.unsafeEncodeUtf (msHsFilePath ms)), ms) | ms <- old_summaries]
 
-downsweep_imports :: HscEnv
+downsweep_imports :: Bool -> -- ^ do_enable_code_gen_for_th
+                     HscEnv
                   -> M.Map (UnitId, OsPath) ModSummary
                   -> Maybe ModuleGraph
                   -> [ModuleName]
                   -> Bool
                   -> ([(UnitId, DriverMessages)], [ModSummary])
                   -> IO ([DriverMessages], [ModuleGraphNode])
-downsweep_imports hsc_env old_summaries old_graph excl_mods allow_dup_roots (root_errs, rootSummariesOk)
+downsweep_imports do_enable_code_gen_for_th hsc_env old_summaries old_graph excl_mods allow_dup_roots (root_errs, rootSummariesOk)
    = do
        let root_map = mkRootMap rootSummariesOk
+       t21 <- getCurrentTime
        checkDuplicates root_map
+       t22 <- getCurrentTime
        let done0 = maybe M.empty moduleGraphNodeMap old_graph
        (deps, map0) <- loopSummaries rootSummariesOk (done0, root_map)
+       t23 <- getCurrentTime
        let unit_env = hsc_unit_env hsc_env
        let tmpfs    = hsc_tmpfs    hsc_env
 
@@ -1619,7 +1634,25 @@ downsweep_imports hsc_env old_summaries old_graph excl_mods allow_dup_roots (roo
        -- for dependencies of modules that have -XTemplateHaskell,
        -- otherwise those modules will fail to compile.
        -- See Note [-fno-code mode] #8025
-       th_enabled_nodes <- enableCodeGenForTH logger tmpfs unit_env all_nodes
+
+       hPutStrLn stderr ("len = " ++ show (length all_errs))
+       t24 <- getCurrentTime
+       let dflags = hsc_dflags hsc_env
+           do_enable_code_gen_for_th' = backendGeneratesCode (backend dflags) && ghcMode dflags /= MkDepend
+
+       th_enabled_nodes <-        
+         if do_enable_code_gen_for_th'
+           then
+             enableCodeGenForTH do_enable_code_gen_for_th' logger tmpfs unit_env all_nodes
+           else
+             pure all_nodes
+
+       t25 <- getCurrentTime
+       hPutStrLn stderr ("t22 - t21 = " ++ show (nominalDiffTimeToSeconds (diffUTCTime t22 t21)))
+       hPutStrLn stderr ("t23 - t22 = " ++ show (nominalDiffTimeToSeconds (diffUTCTime t23 t22)))
+       hPutStrLn stderr ("t24 - t23 = " ++ show (nominalDiffTimeToSeconds (diffUTCTime t24 t23)))
+       hPutStrLn stderr ("t25 - t24 = " ++ show (nominalDiffTimeToSeconds (diffUTCTime t25 t24)))       
+
        if null all_root_errs
          then return (all_errs, th_enabled_nodes)
          else pure $ (all_root_errs, [])
@@ -1871,13 +1904,14 @@ checkHomeUnitsClosed ue
 -- and .o file locations to be temporary files.
 -- See Note [-fno-code mode]
 enableCodeGenForTH
-  :: Logger
+  :: Bool -> -- ^ do_enable_code_gen_for_th
+     Logger
   -> TmpFs
   -> UnitEnv
   -> [ModuleGraphNode]
   -> IO [ModuleGraphNode]
-enableCodeGenForTH logger tmpfs unit_env =
-  enableCodeGenWhen logger tmpfs TFL_CurrentModule TFL_GhcSession unit_env
+enableCodeGenForTH do_enable_code_gen_for_th logger tmpfs unit_env =
+  enableCodeGenWhen do_enable_code_gen_for_th logger tmpfs TFL_CurrentModule TFL_GhcSession unit_env
 
 
 data CodeGenEnable = EnableByteCode | EnableObject | EnableByteCodeAndObject deriving (Eq, Show, Ord)
@@ -1892,14 +1926,15 @@ instance Outputable CodeGenEnable where
 -- modules. The second parameter is a condition to check before
 -- marking modules for code generation.
 enableCodeGenWhen
-  :: Logger
+  :: Bool -> -- ^ do_enable_code_gen_for_th
+     Logger
   -> TmpFs
   -> TempFileLifetime
   -> TempFileLifetime
   -> UnitEnv
   -> [ModuleGraphNode]
   -> IO [ModuleGraphNode]
-enableCodeGenWhen logger tmpfs staticLife dynLife unit_env mod_graph =
+enableCodeGenWhen do_enable_code_gen_for_th logger tmpfs staticLife dynLife unit_env mod_graph =
   mapM enable_code_gen mod_graph
   where
     defaultBackendOf ms = platformDefaultBackend (targetPlatform $ ue_unitFlags (ms_unitid ms) unit_env)
@@ -2030,12 +2065,14 @@ enableCodeGenWhen logger tmpfs staticLife dynLife unit_env mod_graph =
 
     -- A map which tells us how to enable code generation for a NodeKey
     needs_codegen_map :: Map.Map NodeKey CodeGenEnable
-    needs_codegen_map =
-      -- Another option here would be to just produce object code, rather than both object and
-      -- byte code
-      Map.unionWith (\_ _ -> EnableByteCodeAndObject)
-        (Map.fromList $ [(m, EnableObject) | m <- Set.toList needs_obj_set])
-        (Map.fromList $ [(m, EnableByteCode) | m <- Set.toList needs_bc_set])
+    needs_codegen_map
+      | do_enable_code_gen_for_th =
+        -- Another option here would be to just produce object code, rather than both object and
+        -- byte code
+        Map.unionWith (\_ _ -> EnableByteCodeAndObject)
+          (Map.fromList $ [(m, EnableObject) | m <- Set.toList needs_obj_set])
+          (Map.fromList $ [(m, EnableByteCode) | m <- Set.toList needs_bc_set])
+      | otherwise = Map.empty
 
     -- The direct dependencies of modules which require object code
     need_obj_set =

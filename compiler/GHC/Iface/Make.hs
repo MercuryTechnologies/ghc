@@ -15,6 +15,7 @@ module GHC.Iface.Make
    , mkIfaceTc
    , mkIfaceExports
    , toIfaceWarningTxt
+   , shareIface
    )
 where
 

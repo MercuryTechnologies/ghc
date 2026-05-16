@@ -121,7 +121,6 @@ doMkDependHS srcs = do
 
     -- If -ddump-mod-cycles, show cycles in the module graph
     liftIO $ dumpModCycles logger module_graph
-
     -- Tidy up
     liftIO $ endMkDependHS logger files
 

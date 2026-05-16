@@ -331,4 +331,3 @@ hptInternalTableFromRef ref = do
   return HPT {
     table = ref
   }
-
