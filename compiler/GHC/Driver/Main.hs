@@ -1079,15 +1079,14 @@ initWholeCoreBindings ::
   Linkable ->
   IO Linkable
 initWholeCoreBindings hsc_env iface details (Linkable utc_time this_mod uls) =
-  Linkable utc_time this_mod <$> mapM go uls
+  Linkable utc_time this_mod . join <$> mapM go uls
   where
     go = \case
       CoreBindings wcb -> do
         add_iface_to_hpt iface details hsc_env
-        ~(bco, fos) <- unsafeInterleaveIO $
-                       compileWholeCoreBindings hsc_env type_env wcb
-        pure (LazyBCOs bco fos)
-      l -> pure l
+        (bco, fos) <- compileWholeCoreBindings hsc_env type_env wcb
+        pure (BCOs bco :| [DotO fo ForeignObject | fo <- fos])
+      l -> pure (NE.singleton l)
 
     type_env = md_types details
 
