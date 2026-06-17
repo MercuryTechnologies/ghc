@@ -1084,8 +1084,7 @@ initWholeCoreBindings hsc_env iface details (Linkable utc_time this_mod uls) =
     go = \case
       CoreBindings wcb -> do
         add_iface_to_hpt iface details hsc_env
-        ~(bco, fos) <- unsafeInterleaveIO $
-                       compileWholeCoreBindings hsc_env type_env wcb
+        (bco, fos) <- compileWholeCoreBindings hsc_env type_env wcb
         pure (LazyBCOs bco fos)
       l -> pure l
 
