@@ -66,6 +66,7 @@ import {-# SOURCE #-} GHC.Driver.Main
 import Data.Time.Clock
 import GHC.Unit.Home.Graph
 
+import GHC.Utils.Outputable (showPprUnsafe)
 
 data LinkDepsOpts = LinkDepsOpts
   { ldObjSuffix   :: !String                        -- ^ Suffix of .o files
@@ -277,7 +278,7 @@ get_link_deps opts pls maybe_normal_osuf span mods = do
   -- results.
     module_linkable = \case
       LinkHomeModule hmi ->
-        adjust_linkable (expectJust "getLinkDeps" (homeModLinkable hmi))
+        adjust_linkable (expectJust ("getLinkDeps: " ++ showPprUnsafe (mi_module (hm_iface hmi))) (homeModLinkable hmi))
 
       LinkObjectModule mod loc -> do
         findObjectLinkableMaybe mod loc >>= \case
