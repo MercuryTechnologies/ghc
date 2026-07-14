@@ -2246,7 +2246,8 @@ failIfM msg = do
 --
 -- See Note [Masking exceptions in forkM]
 forkM :: SDoc -> IfL a -> IfL a
-forkM doc thing_inside
+forkM doc thing_inside = thing_inside
+{-
  = unsafeInterleaveM $ uninterruptibleMaskM_ $
     do { traceIf (text "Starting fork {" <+> doc)
        ; mb_res <- tryM $
@@ -2270,6 +2271,7 @@ forkM doc thing_inside
                 ; traceIf (text "} ending fork (badly)" <+> doc)
                 ; pgmError "Cannot continue after interface file error" }
     }
+-}
 
 setImplicitEnvM :: TypeEnv -> IfL a -> IfL a
 setImplicitEnvM tenv m = updLclEnv (\lcl -> lcl
