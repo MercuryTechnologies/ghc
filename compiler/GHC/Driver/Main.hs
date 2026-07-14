@@ -160,6 +160,8 @@ import GHC.Hs.Stats         ( ppSourceStats )
 import GHC.HsToCore
 
 import GHC.StgToByteCode    ( byteCodeGen )
+import GHC.Types.HpcInfo
+import GHC.Types.Tickish ( GenTickish(..) )
 import GHC.StgToJS          ( stgToJS )
 import GHC.StgToJS.Ids
 import GHC.StgToJS.Types
@@ -1154,15 +1156,51 @@ compileWholeCoreBindings hsc_env type_env wcb = do
       (tmpDir (hsc_dflags hsc_env)) wcb_foreign
 
     gen_bytecode core_binds stubs foreign_files = do
-      let cgi_guts = CgInteractiveGuts wcb_module core_binds
+      let hpc_info = hpcInfoFromCore wcb_module core_binds
+          cgi_guts = CgInteractiveGuts wcb_module core_binds
                       (typeEnvTyCons type_env) stubs foreign_files
-                      Nothing []
+                      hpc_info Nothing []
       trace_if logger (text "Generating ByteCode for" <+> ppr wcb_module)
       generateByteCode hsc_env cgi_guts wcb_mod_location
 
     WholeCoreBindings {wcb_module, wcb_mod_location, wcb_foreign} = wcb
 
     logger = hsc_logger hsc_env
+
+-- | Derive 'HpcInfo' by counting HPC tick indices in Core bindings.
+--
+-- When bytecode is compiled from interface Core bindings (the
+-- 'WholeCoreBindings' / lazy bytecode path), the original 'HpcInfo'
+-- is not available. We reconstruct the tick count by finding the
+-- maximum 'HpcTick' index in the Core.
+--
+-- The hash is set to 0 because it is only needed for consistency
+-- checking in 'hs_hpc_module' (which only matters when the same
+-- module is registered twice), and during compilation for TH
+-- evaluation only the bytecode path registers, not the C stub.
+hpcInfoFromCore :: Module -> [CoreBind] -> HpcInfo
+hpcInfoFromCore this_mod binds =
+  case maxTickIndex of
+    Nothing -> emptyHpcInfo False
+    Just n  -> HpcInfo (n + 1) 0
+  where
+    maxTickIndex = go_binds binds Nothing
+
+    go_binds [] acc = acc
+    go_binds (b:bs) acc = go_binds bs $! go_bind b acc
+
+    go_bind (NonRec _ rhs) acc = go_expr rhs acc
+    go_bind (Rec pairs) acc = foldl' (\a (_, rhs) -> go_expr rhs a) acc pairs
+
+    go_expr (Tick (HpcTick mod idx) e) acc
+      | mod == this_mod = go_expr e (Just $! maybe idx (max idx) acc)
+    go_expr (Tick _ e) acc = go_expr e acc
+    go_expr (App f a) acc = go_expr a $! go_expr f acc
+    go_expr (Lam _ e) acc = go_expr e acc
+    go_expr (Let b e) acc = go_expr e $! go_bind b acc
+    go_expr (Case e _ _ alts) acc = foldl' (\a (Alt _ _ rhs) -> go_expr rhs a) (go_expr e acc) alts
+    go_expr (Cast e _) acc = go_expr e acc
+    go_expr _ acc = acc
 
 {-
 Note [ModDetails and --make mode]
@@ -1991,14 +2029,15 @@ hscGenHardCode hsc_env cgguts location output_filename = do
         -- Run late plugins
         -- This is the last use of the ModGuts in a compilation.
         -- From now on, we just use the bits we need.
-        ( CgGuts
+        ( cgguts@CgGuts
             { cg_tycons        = tycons,
               cg_foreign       = foreign_stubs0,
               cg_foreign_files = foreign_files,
               cg_dep_pkgs      = dependencies,
               cg_spt_entries   = spt_entries,
               cg_binds         = late_binds,
-              cg_ccs           = late_local_ccs
+              cg_ccs           = late_local_ccs,
+              cg_hpc_info      = hpc_info
             }
           , _
           ) <-
@@ -2099,6 +2138,7 @@ hscGenHardCode hsc_env cgguts location output_filename = do
               cmms <- {-# SCC "StgToCmm" #-}
                 doCodeGen hsc_env this_mod denv data_tycons
                 cost_centre_info
+                hpc_info
                 stg_binds
 
               ------------------  Code output -----------------------
@@ -2130,13 +2170,14 @@ data CgInteractiveGuts = CgInteractiveGuts { cgi_module :: Module
                                            , cgi_tycons :: [TyCon]
                                            , cgi_foreign :: ForeignStubs
                                            , cgi_foreign_files :: [(ForeignSrcLang, FilePath)]
+                                           , cgi_hpc_info :: HpcInfo
                                            , cgi_modBreaks ::  Maybe ModBreaks
                                            , cgi_spt_entries :: [SptEntry]
                                            }
 
 mkCgInteractiveGuts :: CgGuts -> CgInteractiveGuts
-mkCgInteractiveGuts CgGuts{cg_module, cg_binds, cg_tycons, cg_foreign, cg_foreign_files, cg_modBreaks, cg_spt_entries}
-  = CgInteractiveGuts cg_module cg_binds cg_tycons cg_foreign cg_foreign_files cg_modBreaks cg_spt_entries
+mkCgInteractiveGuts CgGuts{cg_module, cg_binds, cg_tycons, cg_foreign, cg_foreign_files, cg_hpc_info, cg_modBreaks, cg_spt_entries}
+  = CgInteractiveGuts cg_module cg_binds cg_tycons cg_foreign cg_foreign_files cg_hpc_info cg_modBreaks cg_spt_entries
 
 hscInteractive :: HscEnv
                -> CgInteractiveGuts
@@ -2152,6 +2193,7 @@ hscInteractive hsc_env cgguts location = do
                cgi_binds    = core_binds,
                cgi_tycons   = tycons,
                cgi_foreign  = foreign_stubs,
+               cgi_hpc_info = hpc_info,
                cgi_modBreaks = mod_breaks,
                cgi_spt_entries = spt_entries } = cgguts
 
@@ -2179,7 +2221,7 @@ hscInteractive hsc_env cgguts location = do
     let (stg_binds,_stg_deps) = unzip stg_binds_with_deps
 
     -----------------  Generate byte code ------------------
-    comp_bc <- byteCodeGen hsc_env this_mod stg_binds data_tycons mod_breaks spt_entries
+    comp_bc <- byteCodeGen hsc_env this_mod stg_binds data_tycons hpc_info mod_breaks spt_entries
 
     ------------------ Create f-x-dynamic C-side stuff -----
     (_istub_h_exists, istub_c_exists)
@@ -2305,13 +2347,14 @@ This reduces residency towards the end of the CodeGen phase significantly
 
 doCodeGen :: HscEnv -> Module -> InfoTableProvMap -> [TyCon]
           -> CollectedCCs
+          -> HpcInfo
           -> [CgStgTopBinding] -- ^ Bindings come already annotated with fvs
           -> IO (CgStream CmmGroupSRTs CmmCgInfos)
          -- Note we produce a 'Stream' of CmmGroups, so that the
          -- backend can be run incrementally.  Otherwise it generates all
          -- the C-- up front, which has a significant space cost.
 doCodeGen hsc_env this_mod denv data_tycons
-              cost_centre_info stg_binds_w_fvs = do
+              cost_centre_info hpc_info stg_binds_w_fvs = do
     let dflags     = hsc_dflags hsc_env
         logger     = hsc_logger hsc_env
         hooks      = hsc_hooks  hsc_env
@@ -2323,8 +2366,8 @@ doCodeGen hsc_env this_mod denv data_tycons
         (pprGenStgTopBindings stg_ppr_opts stg_binds_w_fvs)
 
     let stg_to_cmm dflags mod = case stgToCmmHook hooks of
-                        Nothing -> StgToCmm.codeGen logger tmpfs (initStgToCmmConfig dflags mod)
-                        Just h  -> h                             (initStgToCmmConfig dflags mod)
+                        Nothing -> StgToCmm.codeGen logger tmpfs (initStgToCmmConfig dflags mod hpc_info)
+                        Just h  -> h                             (initStgToCmmConfig dflags mod hpc_info)
 
     let cmm_stream :: CgStream CmmGroup ModuleLFInfos
         -- See Note [Forcing of stg_binds]
@@ -2824,6 +2867,7 @@ hscCompileCoreExpr' hsc_env srcspan ds_expr = do
                 this_mod
                 stg_binds
                 []
+                (emptyHpcInfo False)
                 Nothing -- modbreaks
                 [] -- spt entries
 

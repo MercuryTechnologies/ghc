@@ -300,9 +300,10 @@ hs_hpc_module(char *modName,
           }
           stg_exit(EXIT_FAILURE);
       }
-      // The existing tixArr was made up when we read the .tix file,
+      // The existing tixArr was made up when we read the .tix file
+      // or from a previous registration (e.g. C stub constructor),
       // whereas this is the real tixArr, so copy the data from the
-      // .tix into the real tixArr.
+      // old into the real tixArr.
       for(i=0;i < modCount;i++) {
           tixArr[i] = tmpModule->tixArr[i];
       }
@@ -311,8 +312,19 @@ hs_hpc_module(char *modName,
           stgFree(tmpModule->modName);
           stgFree(tmpModule->tixArr);
       }
+      tmpModule->tixArr = tixArr;
       tmpModule->from_file = false;
   }
+}
+
+// Trivial function used as a tail-call target from Cmm-generated
+// HPC module initializers.  When the NCG generates a CmmCall to this
+// label, it emits a JMP instruction.  Since this function is a normal
+// C function, its RET returns to the original caller (the dynamic
+// linker / .init_array machinery).
+void
+hs_hpc_return(void)
+{
 }
 
 static void

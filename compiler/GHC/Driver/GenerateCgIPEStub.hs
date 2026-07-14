@@ -20,6 +20,7 @@ import GHC.Driver.Env.Types (HscEnv)
 import GHC.Driver.Flags (GeneralFlag (..), DumpFlag(Opt_D_ipe_stats))
 import GHC.Driver.DynFlags (gopt, targetPlatform)
 import GHC.Driver.Config.StgToCmm
+import GHC.Types.HpcInfo (emptyHpcInfo)
 import GHC.Driver.Config.Cmm ( initCmmConfig )
 import GHC.Prelude
 import GHC.Runtime.Heap.Layout (isStackRep)
@@ -211,7 +212,7 @@ generateCgIPEStub hsc_env this_mod denv (nonCaffySet, moduleLFInfos, infoTablesW
 
   -- Yield Cmm for Info Table Provenance Entries (IPEs)
   let denv' = denv {provInfoTables = Map.mapKeys cit_lbl infoTablesWithTickishes}
-      ((mIpeStub, ipeCmmGroup), _) = runC (initStgToCmmConfig dflags this_mod) fstate cgState $ getCmm (initInfoTableProv initStats (Map.keys infoTablesWithTickishes) denv')
+      ((mIpeStub, ipeCmmGroup), _) = runC (initStgToCmmConfig dflags this_mod (emptyHpcInfo False)) fstate cgState $ getCmm (initInfoTableProv initStats (Map.keys infoTablesWithTickishes) denv')
 
   -- TODO: Renaming here
 

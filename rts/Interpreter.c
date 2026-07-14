@@ -2019,6 +2019,22 @@ run_BCO:
             goto nextInsn;
         }
 
+        case bci_HPC_TICK: {
+            W_ arg_tickarray = BCO_GET_LARGE_ARG;
+            W_ tick_index    = BCO_GET_LARGE_ARG;
+            // The tick array is stored as a MutableByteArray# in the
+            // BCO ptrs array (similar to break arrays in bci_BRK_FUN).
+            // We need to extract the payload address from the heap object.
+            // A null pointer means HPC is not available (e.g. external
+            // interpreter or missing tick array).
+            StgArrBytes *arr = (StgArrBytes *) BCO_PTR(arg_tickarray);
+            if (arr != NULL) {
+                StgWord64 *tixArr = (StgWord64 *) arr->payload;
+                tixArr[tick_index]++;
+            }
+            goto nextInsn;
+        }
+
         case bci_PRIMCALL: {
             Sp_subW(1);
             SpW(0) = (W_)&stg_primcall_info;

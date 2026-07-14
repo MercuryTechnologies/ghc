@@ -10,6 +10,7 @@ import GHC.Platform
 import GHC.Unit.Module
 import GHC.Utils.Outputable
 import GHC.Utils.TmpFs
+import GHC.Types.HpcInfo
 
 import GHC.Cmm.MachOp ( FMASign(..) )
 import GHC.Prelude
@@ -82,6 +83,7 @@ data StgToCmmConfig = StgToCmmConfig
   , stgToCmmAvx            :: !Bool              -- ^ check for Advanced Vector Extensions
   , stgToCmmAvx2           :: !Bool              -- ^ check for Advanced Vector Extensions 2
   , stgToCmmAvx512f        :: !Bool              -- ^ check for Advanced Vector 512-bit Extensions
+  , stgToCmmHpcInfo        :: !HpcInfo           -- ^ HPC tick box info for this module
   }
 
 

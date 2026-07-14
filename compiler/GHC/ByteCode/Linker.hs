@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP                   #-}
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE MagicHash             #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -19,6 +20,7 @@ where
 import GHC.Prelude
 
 import GHC.Runtime.Interpreter
+import GHC.Runtime.Interpreter.Types (InterpInstance(..))
 import GHC.ByteCode.Types
 import GHCi.RemoteTypes
 import GHCi.ResolvedBCO
@@ -48,6 +50,17 @@ import Language.Haskell.Syntax.Module.Name
 import Data.Array.Unboxed
 import Foreign.Ptr
 import GHC.Exts
+import GHCi.BreakArray (BreakArray)
+import GHC.Unit.Module.Env (ModuleEnv, lookupModuleEnv)
+
+-- | Check if the interpreter is an external process (iserv/JS).
+-- In that case, local pointers are not valid in the interpreter's address space.
+isExternalInterp :: Interp -> Bool
+isExternalInterp interp = case interpInstance interp of
+  ExternalInterp {} -> True
+#if defined(HAVE_INTERNAL_INTERPRETER)
+  InternalInterp    -> False
+#endif
 
 {-
   Linking interpretables into something we can run
@@ -57,15 +70,16 @@ linkBCO
   :: Interp
   -> PkgsLoaded
   -> LinkerEnv
+  -> ModuleEnv (ForeignRef BreakArray)  -- ^ HPC tick arrays
   -> NameEnv Int
   -> UnlinkedBCO
   -> IO ResolvedBCO
-linkBCO interp pkgs_loaded le bco_ix
+linkBCO interp pkgs_loaded le hpc_tickarrays bco_ix
            (UnlinkedBCO _ arity insns bitmap lits0 ptrs0) = do
   -- fromIntegral Word -> Word64 should be a no op if Word is Word64
   -- otherwise it will result in a cast to longlong on 32bit systems.
   (lits :: [Word]) <- mapM (fmap fromIntegral . lookupLiteral interp pkgs_loaded le) (elemsFlatBag lits0)
-  ptrs <- mapM (resolvePtr interp pkgs_loaded le bco_ix) (elemsFlatBag ptrs0)
+  ptrs <- mapM (resolvePtr interp pkgs_loaded le hpc_tickarrays bco_ix) (elemsFlatBag ptrs0)
   let lits' = listArray (0 :: Int, fromIntegral (sizeFlatBag lits0)-1) lits
   return (ResolvedBCO isLittleEndian arity
               insns
@@ -142,10 +156,11 @@ resolvePtr
   :: Interp
   -> PkgsLoaded
   -> LinkerEnv
+  -> ModuleEnv (ForeignRef BreakArray)  -- ^ HPC tick arrays
   -> NameEnv Int
   -> BCOPtr
   -> IO ResolvedBCOPtr
-resolvePtr interp pkgs_loaded le bco_ix ptr = case ptr of
+resolvePtr interp pkgs_loaded le hpc_tickarrays bco_ix ptr = case ptr of
   BCOPtrName nm
     | Just ix <- lookupNameEnv bco_ix nm
     -> return (ResolvedBCORef ix) -- ref to another BCO in this group
@@ -166,10 +181,24 @@ resolvePtr interp pkgs_loaded le bco_ix ptr = case ptr of
     -> ResolvedBCOStaticPtr <$> lookupPrimOp interp pkgs_loaded op
 
   BCOPtrBCO bco
-    -> ResolvedBCOPtrBCO <$> linkBCO interp pkgs_loaded le bco_ix bco
+    -> ResolvedBCOPtrBCO <$> linkBCO interp pkgs_loaded le hpc_tickarrays bco_ix bco
 
   BCOPtrBreakArray breakarray
     -> withForeignRef breakarray $ \ba -> return (ResolvedBCOPtrBreakArray ba)
+
+  BCOPtrHpcTickArray hpc_mod
+    -> case lookupModuleEnv hpc_tickarrays hpc_mod of
+            Just ref
+              -- For external interpreter, the tick array is in the compiler's
+              -- address space, not the interpreter's. Pass a null pointer so
+              -- bci_HPC_TICK safely skips the increment.
+              | isExternalInterp interp -> return (ResolvedBCOStaticPtr (toRemotePtr nullPtr))
+              -- Store as BreakArray (MutableByteArray#) in the BCO ptrs array.
+              -- This ensures the GC can properly handle the pointer, unlike a
+              -- raw malloc'd Ptr which could crash the GC if HEAP_ALLOCED_GC
+              -- misidentifies it as a heap pointer.
+              | otherwise -> withForeignRef ref $ \ba -> return (ResolvedBCOPtrBreakArray ba)
+            Nothing  -> return (ResolvedBCOStaticPtr (toRemotePtr nullPtr))
 
 -- | Look up the address of a Haskell symbol in the currently
 -- loaded units.

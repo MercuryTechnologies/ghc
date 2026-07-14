@@ -7,6 +7,8 @@ import GHC.Cmm.Parser.Config
 import GHC.Driver.Config.Parser
 import GHC.Driver.Config.StgToCmm
 import GHC.Driver.DynFlags
+import GHC.Types.HpcInfo (emptyHpcInfo)
+import GHC.Prelude (Bool(..))
 
 import GHC.Utils.Panic
 
@@ -20,6 +22,6 @@ initCmmParserConfig :: DynFlags -> CmmParserConfig
 initCmmParserConfig dflags = CmmParserConfig
   { cmmpParserOpts = initParserOpts dflags
   , cmmpPDConfig = initPDConfig dflags
-  , cmmpStgToCmmConfig = initStgToCmmConfig dflags (panic "initCmmParserConfig: no module")
+  , cmmpStgToCmmConfig = initStgToCmmConfig dflags (panic "initCmmParserConfig: no module") (emptyHpcInfo False)
   }
 
