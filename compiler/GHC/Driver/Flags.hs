@@ -270,6 +270,7 @@ data GeneralFlag
    | Opt_PolymorphicSpecialisation
    | Opt_InlineGenerics
    | Opt_InlineGenericsAggressively
+   | Opt_DsGenericCheap
    | Opt_StaticArgumentTransformation
    | Opt_CSE
    | Opt_StgCSE
