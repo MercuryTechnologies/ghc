@@ -1,0 +1,6 @@
+-- Benchmark: Load 200 modules, reload, measure peak residency.
+-- After reload, modules should use CoreBindings/LazyBCOs from .hi files.
+-- Only modules whose code is evaluated should have BCOs in memory.
+:l TopMod.hs
+:r
+topF 42
