@@ -21,7 +21,10 @@ import GHC.Driver.Pipeline.Monad
 import GHC.Driver.Pipeline.Phases
 import GHC.Driver.Env hiding (Hsc)
 import GHC.Unit.Module.Location
-import GHC.Unit.Module.ModGuts (cg_foreign, cg_foreign_files)
+import GHC.Unit.Module.ModGuts (cg_foreign, cg_foreign_files, cg_spt_entries)
+import GHC.Linker.Types (Linkable (..), LinkablePart (..))
+import qualified Data.List.NonEmpty as NE
+import Data.Time (getCurrentTime)
 import GHC.Driver.Phases
 import GHC.Unit.Types
 import GHC.Types.ForeignStubs (ForeignStubs (NoStubs))
@@ -587,9 +590,25 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
               hscMaybeWriteIface logger dflags False final_iface mb_old_iface_hash mod_location
               mlinkable <-
                 if gopt Opt_ByteCodeAndObjectCode dflags
-                  then do
-                    bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
-                    return $ emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }
+                  then case iface_core_bindings final_iface mod_location of
+                    -- Don't generate bytecode eagerly: it is only needed if
+                    -- a later splice (or GHCi) loads this module, which is
+                    -- rare in a large project. Instead store the Core
+                    -- bindings from the interface, exactly like we do for
+                    -- modules that are up to date ('loadByteCode'); they are
+                    -- compiled to bytecode on demand by
+                    -- 'initWholeCoreBindings'.
+                    --
+                    -- We stay eager for modules with static pointer table
+                    -- entries, since those have to be registered as soon as
+                    -- the module is loaded (see 'addSptEntries').
+                    Just wcb | null (cg_spt_entries cgguts) -> do
+                      t <- getCurrentTime
+                      return $ emptyHomeModInfoLinkable
+                        { homeMod_bytecode = Just (Linkable t (mi_module final_iface) (NE.singleton (CoreBindings wcb))) }
+                    _ -> do
+                      bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
+                      return $ emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }
 
                   else return emptyHomeModInfoLinkable
 
