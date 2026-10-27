@@ -270,7 +270,7 @@ hugSomeThingsBelowUs extract include_hi_boot hsc_env uid mn
       -- the inverse) in the module graph to avoid filtering the boots out of
       -- the transitive closure out every time this is called
     | (ModNodeKeyWithUid (GWIB { gwib_mod = mod, gwib_isBoot = is_boot }) mod_uid)
-          <- Set.toList (moduleGraphModulesBelow mg uid mn)
+          <- moduleGraphModulesBelow mg uid mn
     , include_hi_boot || (is_boot == NotBoot)
 
         -- unsavoury: when compiling the base package with --make, we
