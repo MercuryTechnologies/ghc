@@ -41,6 +41,7 @@ module GHC.Unit.Home.Graph
   -- * Very important queries
   , allInstances
   , allFamInstances
+  , famInstancesForModules
   , allAnns
   , allCompleteSigs
 
@@ -72,6 +73,7 @@ import GHC.Unit.Home.ModInfo
 import GHC.Unit.Home.PackageTable
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.ModDetails (ModDetails (..))
 import GHC.Unit.State
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -107,6 +109,16 @@ allInstances hug = foldr go (pure (emptyInstEnv, [])) hug where
 allFamInstances :: HomeUnitGraph -> IO (ModuleEnv FamInstEnv)
 allFamInstances hug = foldr go (pure emptyModuleEnv) hug where
   go hue = liftA2 plusModuleEnv (hptAllFamInstances (homeUnitEnv_hpt hue))
+
+-- | The family instance environments of the given modules that are home
+-- modules. Unlike 'allFamInstances', this doesn't traverse the whole
+-- 'HomeUnitGraph', which matters when it is called for every module compiled
+-- in a large project.
+famInstancesForModules :: HomeUnitGraph -> [Module] -> IO (ModuleEnv FamInstEnv)
+famInstancesForModules hug mods = mkModuleEnv . catMaybes <$> mapM one mods
+  where
+    one m = fmap (\hmi -> (m, extendFamInstEnvList emptyFamInstEnv (md_fam_insts (hm_details hmi))))
+              <$> lookupHugByModule m hug
 
 allAnns :: HomeUnitGraph -> IO AnnEnv
 allAnns hug = foldr go (pure emptyAnnEnv) hug where

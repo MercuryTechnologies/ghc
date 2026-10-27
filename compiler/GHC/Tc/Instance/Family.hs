@@ -273,10 +273,16 @@ checkFamInstConsistency directlyImpMods
              -- See Note [Order of type family consistency checks]
              }
 
-       ; hpt_fam_insts <- liftIO $ HUG.allFamInstances hug
-       ; debug_consistent_set <- mapM (\x -> (\y -> (x, length y)) <$> modConsistent x) directlyImpMods
+       ; consistent_sets <- mapM (\x -> (x,) <$> modConsistent x) directlyImpMods
+       ; let debug_consistent_set = [ (x, length y) | (x, y) <- consistent_sets ]
        ; traceTc "init_consistent_set" (ppr debug_consistent_set)
        ; let init_consistent_set = map fst (reverse (sortOn snd debug_consistent_set))
+         -- Every module that 'checkMany' may look at is one of these, so only
+         -- fetch their family instances from the HUG, rather than building an
+         -- environment for every module in the home package (which made this
+         -- linear in the number of home modules, for every module compiled).
+             relevant_mods = moduleSetElts (mkModuleSet (concatMap snd consistent_sets))
+       ; hpt_fam_insts <- liftIO $ HUG.famInstancesForModules hug relevant_mods
        ; checkMany hpt_fam_insts modConsistent init_consistent_set
 
        }
