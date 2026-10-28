@@ -16,6 +16,7 @@ import GHC.Platform.Ways
 
 import Data.IORef
 import GHC.Data.FastString
+import GHC.Data.FastString.Env
 import qualified Data.Set as Set
 
 -- | The 'FinderCache' maps modules to the result of
@@ -24,7 +25,11 @@ import qualified Data.Set as Set
 -- contents of this cache.
 --
 type FinderCacheState = InstalledModuleEnv InstalledFindResult
-type FileCacheState   = M.Map FilePath Fingerprint
+-- | Keyed by 'FastString' rather than 'FilePath': the recompilation checker
+-- looks up every file usage of every module here (hundreds per module when
+-- Template Haskell records the libraries it loaded), and comparing 'String'
+-- keys (after unpacking them) was a significant cost of a no-op rebuild.
+type FileCacheState   = FastStringEnv Fingerprint
 data FinderCache = FinderCache { fcModuleCache :: (IORef FinderCacheState)
                                , fcFileCache   :: (IORef FileCacheState)
                                }
