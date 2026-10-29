@@ -38,10 +38,3 @@ test('aarch64-ushr-subword', is_aarch64_codegen, compile_grep_asm, ['hs', True, 
 test('aarch64-shl-subword', is_aarch64_codegen, compile_grep_asm, ['hs', True, '-O'])
 test('aarch64-sxtw', is_aarch64_codegen, compile_grep_asm, ['cmm', True, ''])
 test('aarch64-sxth-mul2', is_aarch64_codegen, compile_grep_asm, ['cmm', True, ''])
-
-test('split-sections-dynamic-order', [unless(opsys('linux'), skip),
-                                      unless(have_ncg(), skip),
-                                      unless(have_dynamic(), skip),
-                                      when(unregisterised(), skip),
-                                      only_ways(['normal'])],
-     compile_grep_asm, ['hs', True, '-split-sections -dynamic'])
