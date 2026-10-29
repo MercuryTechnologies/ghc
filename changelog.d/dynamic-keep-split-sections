@@ -1,0 +1,15 @@
+section: compiler
+synopsis: :ghc-flag:`-dynamic` no longer turns off :ghc-flag:`-split-sections`.
+issues: #TODO
+mrs: !TODO
+
+description: {
+  Previously, :ghc-flag:`-dynamic` unset :ghc-flag:`-split-sections` at the
+  point it was parsed, so ``-split-sections -dynamic`` compiled without split
+  sections while ``-dynamic -split-sections`` split. Both orders now keep split
+  sections. On platforms that use subsections-via-symbols (e.g. Darwin),
+  :ghc-flag:`-split-sections` is still ignored with a warning, as before.
+
+  ``GHC.Platform.Ways.wayUnsetGeneralFlags`` has been removed from the ``ghc``
+  library, since no way unsets any flags any more.
+}

@@ -2985,9 +2985,7 @@ addWay' w dflags0 =
        dflags1 = dflags0 { targetWays_ = addWay w (targetWays_ dflags0) }
        dflags2 = foldr setGeneralFlag' dflags1
                        (wayGeneralFlags platform w)
-       dflags3 = foldr unSetGeneralFlag' dflags2
-                       (wayUnsetGeneralFlags platform w)
-   in dflags3
+   in dflags2
 
 removeWayDynP :: Way -> DynP ()
 removeWayDynP w = upd (\dfs -> dfs { targetWays_ = removeWay w (targetWays_ dfs) })
@@ -3950,10 +3948,7 @@ makeDynFlagsConsistent dflags
             dflags_b = foldl gopt_set dflags_a
                      $ concatMap (wayGeneralFlags platform)
                                  hostFullWays
-            dflags_c = foldl gopt_unset dflags_b
-                     $ concatMap (wayUnsetGeneralFlags platform)
-                                 hostFullWays
-        in dflags_c
+        in dflags_b
 
  | gopt Opt_InfoTableMap dflags
  , NotValid msg <- backendInfoTableMapValidity (backend dflags)
