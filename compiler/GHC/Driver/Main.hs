@@ -52,6 +52,7 @@ module GHC.Driver.Main
     , initWholeCoreBindings
     , loadIfaceByteCode
     , loadIfaceByteCodeLazy
+    , iface_core_bindings
     , hscMaybeWriteIface
     , hscCompileCmmFile
 
