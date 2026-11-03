@@ -1,3 +1,9 @@
+# windows_skip is not defined in the GHC 9.10 testsuite driver (this test was
+# backported from a newer GHC); define it here.
+def windows_skip(name, opts):
+    if config.os == 'mingw32':
+        skip(name, opts)
+
 # This test compiles the boot file separately from its source file, which causes
 # a debug assertion warning.
 # Since this appears to be intentional according to the Note [Loading your own hi-boot file],
