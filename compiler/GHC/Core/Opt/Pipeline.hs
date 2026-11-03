@@ -10,6 +10,8 @@ module GHC.Core.Opt.Pipeline ( core2core, simplifyExpr ) where
 
 import GHC.Prelude
 
+import System.IO.Unsafe ( unsafeInterleaveIO )
+
 import GHC.Driver.DynFlags
 import GHC.Driver.Plugins ( withPlugins, installCoreToDos )
 import GHC.Driver.Env
@@ -76,7 +78,11 @@ core2core :: HscEnv -> ModGuts -> IO ModGuts
 core2core hsc_env guts@(ModGuts { mg_module  = mod
                                 , mg_loc     = loc
                                 , mg_rdr_env = rdr_env })
-  = do { hpt_rule_base <- home_pkg_rules
+  = do { -- Computing the home-package rule base walks the whole transitive
+         -- closure of this module, which is expensive in large projects. Only
+         -- do it if something actually consults the rules: with -O0 rewrite
+         -- rules are disabled and nothing does.
+         hpt_rule_base <- unsafeInterleaveIO home_pkg_rules
        ; let builtin_passes = getCoreToDo dflags hpt_rule_base extra_vars
              uniq_tag = 's'
        ; query <- hscUnitIndexQuery hsc_env

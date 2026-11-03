@@ -624,25 +624,26 @@ type ModNodeKey = ModuleNameWithIsBoot
 -- be reached by following the given dependencies. Additionally, if both the
 -- boot module and the non-boot module can be reached, it only returns the
 -- non-boot one.
-moduleGraphModulesBelow :: ModuleGraph -> UnitId -> ModuleNameWithIsBoot -> Set ModNodeKeyWithUid
-moduleGraphModulesBelow mg uid mn = filtered_mods [ mn | NodeKey_Module mn <- modules_below ]
+--
+-- The result is in the (deterministic) order of the reachability index. This
+-- is called for every module compiled in --make mode, on closures of
+-- thousands of modules, so we avoid sorting by 'ModuleName' (a lexical string
+-- comparison) and building a 'Set': boot modules are filtered with a
+-- reachability query instead.
+moduleGraphModulesBelow :: ModuleGraph -> UnitId -> ModuleNameWithIsBoot -> [ModNodeKeyWithUid]
+moduleGraphModulesBelow mg uid mn =
+    [ m | NodeKey_Module m <- modules_below, keep m ]
   where
-    modules_below = maybe [] (map mkNodeKey) (mgReachable mg (NodeKey_Module (ModNodeKeyWithUid mn uid)))
-    filtered_mods = Set.fromDistinctAscList . filter_mods . sort
+    root          = NodeKey_Module (ModNodeKeyWithUid mn uid)
+    modules_below = maybe [] (map mkNodeKey) (mgReachable mg root)
+    (td_map, lookup_node) = mg_graph mg
 
-    -- IsBoot and NotBoot modules are necessarily consecutive in the sorted list
-    -- (cf Ord instance of GenWithIsBoot). Hence we only have to perform a
-    -- linear sweep with a window of size 2 to remove boot modules for which we
-    -- have the corresponding non-boot.
-    filter_mods = \case
-      (r1@(ModNodeKeyWithUid (GWIB m1 b1) uid1) : r2@(ModNodeKeyWithUid (GWIB m2 _) uid2): rs)
-        | m1 == m2  && uid1 == uid2 ->
-                       let !r' = case b1 of
-                                  NotBoot -> r1
-                                  IsBoot  -> r2
-                       in r' : filter_mods rs
-        | otherwise -> r1 : filter_mods (r2:rs)
-      rs -> rs
+    -- Drop a boot module if the corresponding non-boot module is reachable too.
+    keep (ModNodeKeyWithUid (GWIB m IsBoot) u)
+      | Just root_node <- lookup_node root
+      , Just non_boot  <- lookup_node (NodeKey_Module (ModNodeKeyWithUid (GWIB m NotBoot) u))
+      = not (isReachable td_map root_node non_boot)
+    keep _ = True
 
 mgReachable :: HasCallStack => ModuleGraph -> NodeKey -> Maybe [ModuleGraphNode]
 mgReachable mg nk = map summaryNodeSummary <$> modules_below where

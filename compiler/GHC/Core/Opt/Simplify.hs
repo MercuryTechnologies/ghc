@@ -133,7 +133,10 @@ data SimplifyOpts = SimplifyOpts
                           -- Nothing => Do not Lint
                           -- Just cfg => Lint like this
 
-  , so_hpt_rules       :: !RuleBase
+  , so_hpt_rules       :: RuleBase
+    -- ^ Lazy on purpose: computing the home-package rules walks the
+    -- transitive closure of the module, and is wasted work when RULES are
+    -- disabled (e.g. with -O0). See 'core2core'.
   , so_top_env_cfg     :: !TopEnvConfig
   }
 
@@ -174,7 +177,11 @@ simplifyPgm logger unit_env name_ppr_ctx opts
     !guts_no_binds = guts { mg_binds = [], mg_rules = [] }
 
     hpt_rule_env :: RuleEnv
-    hpt_rule_env = mkRuleEnv guts emptyRuleBase (so_hpt_rules opts)
+    hpt_rule_env = mkRuleEnv guts emptyRuleBase hpt_rules
+    -- Don't force the home-package rules unless RULES are enabled; see the
+    -- comment on 'so_hpt_rules'.
+    hpt_rules | sm_rules mode = so_hpt_rules opts
+              | otherwise     = emptyRuleBase
                    -- emptyRuleBase: no EPS rules yet; we will update
                    -- them on each iteration to pick up the most up to date set
 
