@@ -601,8 +601,10 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
                     --
                     -- We stay eager for modules with static pointer table
                     -- entries, since those have to be registered as soon as
-                    -- the module is loaded (see 'addSptEntries').
-                    Just wcb | null (cg_spt_entries cgguts) -> do
+                    -- the module is loaded (see 'addSptEntries'), and when
+                    -- the bytecode is being dumped.
+                    Just wcb | null (cg_spt_entries cgguts)
+                             , not (dopt Opt_D_dump_BCOs dflags) -> do
                       t <- getCurrentTime
                       return $ emptyHomeModInfoLinkable
                         { homeMod_bytecode = Just (Linkable t (mi_module final_iface) (NE.singleton (CoreBindings wcb))) }
