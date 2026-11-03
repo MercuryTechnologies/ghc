@@ -70,6 +70,7 @@ import GHC.Types.Name.Env
 import GHC.Types.SrcLoc
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.DFM
+import GHC.Types.Unique.Set
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -90,6 +91,8 @@ import qualified GHC.Data.Maybe as Maybe
 import GHC.Linker.Deps
 import GHC.Linker.MacOS
 import GHC.Linker.Dynamic
+import GHC.Linker.External (runLink)
+import GHC.Driver.Config.Linker (initLinkerConfig)
 import GHC.Linker.Types
 
 -- Standard libraries
@@ -1121,6 +1124,7 @@ loadPackages interp hsc_env new_pkgs = do
 
 loadPackages' :: Interp -> HscEnv -> [UnitId] -> LoaderState -> IO LoaderState
 loadPackages' interp hsc_env new_pks pls = do
+    preloadPackageDylibs interp hsc_env (pkgs_loaded pls) new_pks
     pkgs' <- link (pkgs_loaded pls) new_pks
     return $! pls { pkgs_loaded = pkgs'
                   }
@@ -1148,6 +1152,99 @@ loadPackages' interp hsc_env new_pks pls = do
         | otherwise
         = throwGhcExceptionIO (CmdLineError ("unknown package: " ++ unpackFS (unitIdFS new_pkg)))
 
+
+{-
+Note [Bulk-loading package dylibs on Darwin]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When the interpreter is dynamic, 'loadPackage' loads each package's Haskell
+library with its own call to dlopen, dependencies first. On recent versions of
+macOS every dlopen that maps a new image makes dyld regenerate a description of
+*all* images loaded in the process (dyld4::RuntimeState::notifyDebuggerLoad ->
+ExternallyViewableState::generateAtlas). Loading N package dylibs one at a time
+is therefore quadratic in the number of loaded images. With a few hundred
+packages (common for Template Haskell or plugins in large projects) this costs
+10-20 seconds per GHC process.
+
+Package dylibs are linked with -dead_strip_dylibs and -undefined
+dynamic_lookup, so their load commands do not cover the package dependency
+closure, and dlopen-ing only the "top" packages does not help either.
+
+Instead, before the per-package loop, we link a tiny "umbrella" dylib whose
+load commands name every Haskell dylib we are about to load (by absolute path,
+via text-based stubs so that no rpaths are involved) and dlopen it once. dyld
+then maps all of the images in a single operation. The per-package loop below
+is unchanged; its dlopen calls now just return handles to images that are
+already mapped.
+
+This is purely an optimisation: if anything goes wrong we fall back silently to
+the normal behaviour.
+-}
+
+-- | See Note [Bulk-loading package dylibs on Darwin]
+preloadPackageDylibs :: Interp -> HscEnv -> PkgsLoaded -> [UnitId] -> IO ()
+preloadPackageDylibs interp hsc_env already_loaded new_pks
+  | OSDarwin <- platformOS platform
+  , interpreterDynamic interp
+  = do
+      -- Packages to be loaded, dependencies first.
+      let go (seen, acc) uid
+            | uid `elemUDFM` already_loaded || uid `elementOfUniqSet` seen
+            = (seen, acc)
+            | Just cfg <- lookupUnitId (hsc_units hsc_env) uid
+            = let (seen', acc') = foldl' go (addOneToUniqSet seen uid, acc) (unitDepends cfg)
+              in (seen', cfg : acc')
+            | otherwise
+            = (addOneToUniqSet seen uid, acc)
+          todo = reverse (snd (foldl' go (emptyUniqSet, []) new_pks))
+      dylibs <- fmap concat $ forM todo $ \pkg -> do
+        let dirs = map ST.unpack (Packages.unitLibraryDynDirs pkg)
+            libs = filter ("HSffi" /=) (map ST.unpack (Packages.unitLibraries pkg))
+        fmap catMaybes $ forM libs $ \lib ->
+          findFile dirs (platformHsSOName platform (lib ++ dynLibSuffix (ghcNameVersion dflags)))
+      when (length dylibs >= bulk_threshold) $
+        MC.handle handler (bulk_load dylibs)
+  | otherwise
+  = return ()
+  where
+    dflags   = hsc_dflags hsc_env
+    logger   = hsc_logger hsc_env
+    tmpfs    = hsc_tmpfs hsc_env
+    platform = targetPlatform dflags
+
+    -- Below this a single extra link step is not worth it.
+    bulk_threshold = 8
+
+    bulk_load dylibs = do
+      dir <- newTempSubDir logger tmpfs (tmpDir dflags)
+      let stubs = [ dir </> ("dep" ++ show i) <.> "tbd" | i <- [0 .. length dylibs - 1] ]
+          out   = dir </> "libghc_preload.dylib"
+      addFilesToClean tmpfs TFL_GhcSession (out : stubs)
+      zipWithM_ (\f p -> writeFile f (tbd_stub p)) stubs dylibs
+      runLink logger tmpfs (initLinkerConfig dflags)
+        ( [ Option "-dynamiclib", Option "-o", FileOption "" out
+          , Option "-undefined", Option "dynamic_lookup"
+          , Option "-install_name", Option out ]
+          ++ map (FileOption "") stubs )
+      r <- loadDLL interp out
+      case r of
+        Left err -> debugTraceMsg logger 2 (text "Bulk dylib preload failed:" <+> text err)
+        Right _  -> debugTraceMsg logger 2 (text "Preloaded" <+> int (length dylibs) <+> text "package dylibs")
+
+    -- A text-based stub whose install name is the absolute path of the dylib,
+    -- so that the umbrella's load command refers to it directly.
+    tbd_stub path = unlines
+      [ "--- !tapi-tbd"
+      , "tbd-version: 4"
+      , "targets: [ x86_64-macos, arm64-macos ]"
+      , "install-name: '" ++ concatMap (\c -> if c == '\'' then "''" else [c]) path ++ "'"
+      , "current-version: 0"
+      , "compatibility-version: 0"
+      , "..." ]
+
+    handler :: SomeException -> IO ()
+    handler e
+      | Just (_ :: SomeAsyncException) <- fromException e = throwIO e
+      | otherwise = debugTraceMsg logger 2 (text "Bulk dylib preload failed:" <+> text (show e))
 
 loadPackage :: Interp -> HscEnv -> UnitInfo -> IO ([LibrarySpec], [LibrarySpec], [RemotePtr LoadedDLL])
 loadPackage interp hsc_env pkg
@@ -1425,6 +1522,10 @@ locateLib interp hsc_env is_hs lib_dirs gcc_dirs lib0
      loading_dynamic_hs_libs  = interpreterDynamic  interp
 
      import_libs
+       -- Import libraries only exist on Windows. Don't ask the C compiler
+       -- to search for them elsewhere: each candidate costs a process spawn
+       -- in 'tryGcc'.
+       | os /= OSMinGW32 = []
        | verbatim = [lib]
        | otherwise = [ lib <.> "lib"
                      , "lib" ++ lib <.> "lib"
