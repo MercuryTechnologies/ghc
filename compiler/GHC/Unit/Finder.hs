@@ -45,6 +45,8 @@ import GHC.Platform.Ways
 import GHC.Builtin.Names ( gHC_PRIM )
 
 import GHC.Data.OsPath
+import GHC.Data.FastString
+import GHC.Data.FastString.Env
 
 import GHC.Unit.Env
 import GHC.Unit.Types
@@ -112,7 +114,7 @@ InstalledNotFound.
 
 initFinderCache :: IO FinderCache
 initFinderCache = FinderCache <$> newIORef emptyInstalledModuleEnv
-                              <*> newIORef M.empty
+                              <*> newIORef emptyFsEnv
 
 -- remove all the home modules from the cache; package modules are
 -- assumed to not move around during a session; also flush the file hash
@@ -120,7 +122,7 @@ initFinderCache = FinderCache <$> newIORef emptyInstalledModuleEnv
 flushFinderCaches :: FinderCache -> UnitEnv -> IO ()
 flushFinderCaches (FinderCache mod_cache file_cache) ue = do
   atomicModifyIORef' mod_cache $ \fm -> (filterInstalledModuleEnv is_ext fm, ())
-  atomicModifyIORef' file_cache $ \_ -> (M.empty, ())
+  atomicModifyIORef' file_cache $ \_ -> (emptyFsEnv, ())
  where
   is_ext mod _ = not (isUnitEnvInstalledModule ue mod)
 
@@ -142,13 +144,13 @@ removeFromFinderCache :: FinderCache -> InstalledModule -> IO ()
 removeFromFinderCache (FinderCache ref _) key =
   atomicModifyIORef' ref $ \c -> (delInstalledModuleEnv c key, ())
 
-lookupFileCache :: FinderCache -> FilePath -> IO Fingerprint
+lookupFileCache :: FinderCache -> FastString -> IO Fingerprint
 lookupFileCache (FinderCache _ file_cache) key = do
    c <- readIORef file_cache
-   case M.lookup key c of
+   case lookupFsEnv c key of
      Nothing -> do
-       hash <- getFileHash key
-       atomicModifyIORef' file_cache $ \c -> (M.insert key hash c, ())
+       hash <- getFileHash (unpackFS key)
+       atomicModifyIORef' file_cache $ \c -> (extendFsEnv c key hash, ())
        return hash
      Just fp -> return fp
 
