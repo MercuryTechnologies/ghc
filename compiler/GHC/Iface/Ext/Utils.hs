@@ -490,8 +490,9 @@ mergeAsts xs@(a:as) ys@(b:bs)
   -- module, which all sit below a node spanning the whole module.
   --
   -- This is only equivalent to inserting them one at a time if the run and the
-  -- children are sorted and disjoint, which is not always the case (spans can
-  -- overlap, see above), so we check that and fall back otherwise.
+  -- children are sorted and pairwise disjoint (neither 'leftOf'-adjacent spans
+  -- that contain each other, nor overlapping spans, see above), so we check
+  -- that and fall back otherwise.
   | span_a `containsSpan`   span_b
   , (run@(_:_:_), rest) <- takeRun span_a ys
   , sortedDisjoint (nodeChildren a)
@@ -520,11 +521,16 @@ mergeAsts xs@(a:as) ys@(b:bs)
       where
         go prev (n:ns)
           | strictlyInside outer n
-          , maybe True (`leftOf` nodeSpan n) prev
+          , maybe True (`strictlyBefore` nodeSpan n) prev
           = let (run, rest) = go (Just (nodeSpan n)) ns in (n : run, rest)
         go _ ns = ([], ns)
 
-    sortedDisjoint ns = and (zipWith (\x y -> nodeSpan x `leftOf` nodeSpan y) ns (drop 1 ns))
+    sortedDisjoint ns = and (zipWith (\x y -> nodeSpan x `strictlyBefore` nodeSpan y) ns (drop 1 ns))
+
+    -- 'leftOf' alone does not make two spans disjoint: a zero-width span at
+    -- the end of another is both 'leftOf' it and contained in it, and
+    -- inserting one at a time would nest it.
+    strictlyBefore x y = x `leftOf` y && not (x `containsSpan` y) && not (y `containsSpan` x)
 
     -- Insert a sorted, disjoint run of nodes, all strictly contained in the
     -- given node, into its children. Equivalent to inserting them one by one.
