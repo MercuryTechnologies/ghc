@@ -1258,7 +1258,12 @@ upsweep
     -> IO (SuccessFlag, [HomeModInfo])
 upsweep n_jobs hsc_env hmi_cache diag_wrapper mHscMessage old_hpt build_plan = do
     (cycle, pipelines, collect_result) <- interpretBuildPlan (hsc_HUG hsc_env) hmi_cache old_hpt build_plan
-    runPipelines n_jobs hsc_env diag_wrapper mHscMessage pipelines
+    -- During the upsweep, the targets are only consulted by 'compileOne'', to
+    -- find out whether a module was loaded with object code disallowed (GHCi's
+    -- @:load *M@). That lookup is a linear search, done for every module, so
+    -- keep only the targets for which the answer is interesting (usually none).
+    let hsc_env_upsweep = hsc_env { hsc_targets = filter (not . targetAllowObjCode) (hsc_targets hsc_env) }
+    runPipelines n_jobs hsc_env_upsweep diag_wrapper mHscMessage pipelines
     res <- collect_result
 
     let completed = [m | Just (Just m) <- res]
