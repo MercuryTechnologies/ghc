@@ -73,6 +73,7 @@ module GHC.Utils.Binary
    lazyGet',
    lazyPut',
    lazyGetMaybe,
+   lazyGetMaybeInner,
    lazyPutMaybe,
 
    -- * User data
@@ -1356,6 +1357,27 @@ lazyGet' f bh = do
         f bh'
     seekBinReader bh (makeAbsoluteBin p) -- skip over the object for now
     return a
+
+-- | Deserialize a @Maybe a@ that was written with 'lazyPut' (not
+-- 'lazyPutMaybe'), strictly in the constructor but lazily in the value inside
+-- the 'Just'. This reads the same format as 'lazyGet', but checking whether
+-- the value is present doesn't deserialize it.
+lazyGetMaybeInner :: Binary a => ReadBinHandle -> IO (Maybe a)
+lazyGetMaybeInner bh = do
+    p   <- getRelBin bh    -- pointer to the end of the serialized 'Maybe'
+    tag <- getWord8 bh
+    r <- case tag of
+      0 -> pure Nothing
+      _ -> do
+        p_a <- tellBinReader bh
+        Just <$> unsafeInterleaveIO (do
+          -- NB: Use a fresh rbm_off_r variable, see 'lazyGet''.
+          off_r <- newFastMutInt 0
+          let bh' = bh { rbm_off_r = off_r }
+          seekBinReader bh' p_a
+          get bh')
+    seekBinReader bh (makeAbsoluteBin p)
+    return r
 
 -- | Serialize the constructor strictly but lazily serialize a value inside a
 -- 'Just'.

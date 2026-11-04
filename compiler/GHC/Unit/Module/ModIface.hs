@@ -536,7 +536,10 @@ instance Binary ModIface where
         warns       <- {-# SCC "bin_warns" #-} lazyGet bh
         anns        <- {-# SCC "bin_anns" #-} lazyGet bh
         decls       <- {-# SCC "bin_tycldecls" #-} get bh
-        extra_decls <- lazyGet bh
+        -- Strict in the 'Maybe', so that checking whether there is bytecode
+        -- for an up-to-date module (see 'GHC.Driver.Main.loadByteCode')
+        -- doesn't deserialize all of its Core bindings.
+        extra_decls <- lazyGetMaybeInner bh
         foreign_    <- get bh
         insts       <- {-# SCC "bin_insts" #-} get bh
         fam_insts   <- {-# SCC "bin_fam_insts" #-} get bh
