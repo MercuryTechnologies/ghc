@@ -483,6 +483,24 @@ mergeAsts :: [HieAST Type] -> [HieAST Type] -> [HieAST Type]
 mergeAsts xs [] = xs
 mergeAsts [] ys = ys
 mergeAsts xs@(a:as) ys@(b:bs)
+  -- If one node strictly contains a run of several nodes from the other list,
+  -- merge the whole run into its children in one go. Inserting them one at a
+  -- time (via 'combineAst'/'insertAst') rescans the children list for every
+  -- element, which is quadratic: e.g. for the top-level declarations of a
+  -- module, which all sit below a node spanning the whole module.
+  --
+  -- This is only equivalent to inserting them one at a time if the run and the
+  -- children are sorted and pairwise disjoint (neither 'leftOf'-adjacent spans
+  -- that contain each other, nor overlapping spans, see above), so we check
+  -- that and fall back otherwise.
+  | span_a `containsSpan`   span_b
+  , (run@(_:_:_), rest) <- takeRun span_a ys
+  , sortedDisjoint (nodeChildren a)
+  = mergeAsts (insertAsts run a : as) rest
+  | span_b `containsSpan`   span_a
+  , (run@(_:_:_), rest) <- takeRun span_b xs
+  , sortedDisjoint (nodeChildren b)
+  = mergeAsts rest (insertAsts run b : bs)
   | span_a `containsSpan`   span_b = mergeAsts (combineAst a b : as) bs
   | span_b `containsSpan`   span_a = mergeAsts as (combineAst a b : bs)
   | span_a `rightOf`        span_b = b : mergeAsts xs bs
@@ -494,6 +512,29 @@ mergeAsts xs@(a:as) ys@(b:bs)
   where
     span_a = nodeSpan a
     span_b = nodeSpan b
+
+    strictlyInside outer n = outer `containsSpan` nodeSpan n && outer /= nodeSpan n
+
+    -- The longest prefix of nodes that are strictly inside the given span and
+    -- pairwise disjoint.
+    takeRun outer = go Nothing
+      where
+        go prev (n:ns)
+          | strictlyInside outer n
+          , maybe True (`strictlyBefore` nodeSpan n) prev
+          = let (run, rest) = go (Just (nodeSpan n)) ns in (n : run, rest)
+        go _ ns = ([], ns)
+
+    sortedDisjoint ns = and (zipWith (\x y -> nodeSpan x `strictlyBefore` nodeSpan y) ns (drop 1 ns))
+
+    -- 'leftOf' alone does not make two spans disjoint: a zero-width span at
+    -- the end of another is both 'leftOf' it and contained in it, and
+    -- inserting one at a time would nest it.
+    strictlyBefore x y = x `leftOf` y && not (x `containsSpan` y) && not (y `containsSpan` x)
+
+    -- Insert a sorted, disjoint run of nodes, all strictly contained in the
+    -- given node, into its children. Equivalent to inserting them one by one.
+    insertAsts run (Node inf spn children) = Node inf spn (mergeAsts run children)
 
 rightOf :: Span -> Span -> Bool
 rightOf s1 s2
