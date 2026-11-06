@@ -239,13 +239,13 @@ select_link_deps
   -> SrcSpan
   -> ([Linkable], [LinkModule], UniqDSet UnitId, [UnitId])
   -> IO LinkDeps
-select_link_deps opts maybe_normal_osuf span (loaded_modules, needed_modules, ldAllUnits, ldNeededUnits) = do
+select_link_deps opts maybe_normal_osuf span (loaded_modules, needed_modules, ldNeededUnits, ldUnits) = do
   ldNeededLinkables <- mapM module_linkable needed_modules
   pure LinkDeps {
     ldNeededLinkables,
     ldAllLinkables = loaded_modules ++ ldNeededLinkables,
-    ldNeededUnits,
-    ldAllUnits
+    ldUnits,
+    ldNeededUnits
   }
   where
 

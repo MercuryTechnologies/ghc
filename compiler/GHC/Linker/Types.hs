@@ -487,8 +487,8 @@ data LinkDeps =
   LinkDeps {
     ldNeededLinkables :: [Linkable],
     ldAllLinkables :: [Linkable],
-    ldNeededUnits :: [UnitId],
-    ldAllUnits :: UniqDSet UnitId
+    ldUnits :: [UnitId],
+    ldNeededUnits :: UniqDSet UnitId
   }
 
 data Linkables where
