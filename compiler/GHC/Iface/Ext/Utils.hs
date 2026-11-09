@@ -488,8 +488,11 @@ mergeAsts xs@(a:as) ys@(b:bs)
   | span_a `rightOf`        span_b = b : mergeAsts xs bs
   | span_a `leftOf`         span_b = a : mergeAsts as ys
 
-  -- These cases are to work around ASTs that are not fully disjoint
-  | span_a `startsRightOf`  span_b = b : mergeAsts as ys
+  -- These cases are to work around ASTs that are not fully disjoint.
+  -- Emit whichever node starts first and keep the other one: the spans
+  -- overlap, so both nodes still have to appear in the result. (Emitting @b@
+  -- while continuing with @as ys@ used to drop @a@ and emit @b@ twice.)
+  | span_a `startsRightOf`  span_b = b : mergeAsts xs bs
   | otherwise                      = a : mergeAsts as ys
   where
     span_a = nodeSpan a
