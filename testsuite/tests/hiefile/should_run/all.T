@@ -7,3 +7,5 @@ test('SpliceTypes', [req_th, extra_run_opts('"' + config.libdir + '"'), extra_fi
 test('HieVdq', [extra_run_opts('"' + config.libdir + '"'), extra_files(['TestUtils.hs'])], compile_and_run, ['-package ghc -fwrite-ide-info'])
 test('T23540', [extra_run_opts('"' + config.libdir + '"'), extra_files(['TestUtils.hs'])], compile_and_run, ['-package ghc -fwrite-ide-info'])
 test('T23120', [extra_run_opts('"' + config.libdir + '"'), extra_files(['TestUtils.hs'])], compile_and_run, ['-package ghc -fwrite-ide-info'])
+test('HieMergeOverlap', normal, compile_and_run, ['-package ghc'])
+test('HieLinePragma', [extra_run_opts('"' + config.libdir + '"'), extra_files(['TestUtils.hs'])], compile_and_run, ['-package ghc -fwrite-ide-info'])
