@@ -109,6 +109,8 @@ import Data.List (intercalate, isPrefixOf, nub, partition)
 import Data.Maybe
 import Data.Either
 import Control.Concurrent.MVar
+import Control.Concurrent (forkIO, getNumCapabilities, killThread)
+import Control.Applicative ((<|>))
 import qualified Control.Monad.Catch as MC
 import qualified Data.List.NonEmpty as NE
 
@@ -122,7 +124,7 @@ import System.Win32.Info (getSystemDirectory)
 #endif
 
 import GHC.Utils.Exception
-import GHC.Unit.Home.Graph (lookupHug, unitEnv_foldWithKey)
+import GHC.Unit.Home.Graph (lookupHug, lookupHugByModule, unitEnv_foldWithKey)
 import GHC.Driver.Downsweep
 import qualified GHC.Runtime.Interpreter as GHCi
 import qualified Data.IntMap.Strict as IM
@@ -676,6 +678,93 @@ get_reachable_nodes hsc_env mods
     get_mod_info _ = return Nothing
 
 
+{-
+Note [Compiling lazy bytecode outside the loader lock]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In --make mode with -fprefer-byte-code, the bytecode of home modules that are
+up to date is only generated when a splice first needs it: their 'HomeModInfo'
+holds 'LazyBCOs', whose thunk compiles the Core bindings stored in the
+interface. These thunks used to be forced while linking, i.e. while holding
+the loader lock (see 'modifyLoaderState'). After a change to a module low in
+the dependency graph, the first splices to run may need the bytecode of
+hundreds of modules, which were then compiled one after the other while every
+other module with a splice waited for the lock.
+
+So before taking the lock, 'prepareLazyByteCode' collects the 'LazyBCOs' of
+the home modules reachable from the splice's free names, choosing each
+module's linkable the way the locked path does ('homeModLinkable' in
+"GHC.Linker.Deps"), and forces them in parallel. It only reads the module graph
+and the HUG: it doesn't load interfaces, consult the finder or look for files.
+
+Forcing is idempotent ('LazyBCOs' are built with 'unsafeInterleaveIO', so each
+is evaluated at most once even when several threads force it), so this is
+purely an optimisation. Thunks that were forced before cost nothing.
+Synchronous exceptions are ignored here: the locked path forces the same
+thunks and reports them as before. Asynchronous exceptions are rethrown, and
+the workers are killed if the caller is interrupted.
+
+In one-shot mode the HUG holds no home modules: their bytecode is compiled
+from the interfaces by the locked path itself ('ldLoadByteCode'), on demand,
+and cached in the 'LoaderState'. There is nothing to prepare, so
+'prepareLazyByteCode' does nothing there (it would have to compile that
+bytecode again for every splice).
+-}
+
+prepareLazyByteCode :: HscEnv -> [Module] -> IO ()
+prepareLazyByteCode hsc_env mods
+  | isOneShot (ghcMode dflags) || isEmptyMG (hsc_mod_graph hsc_env) = pure ()
+  | otherwise = MC.handle ignore $ do
+      (home_mods, _) <- get_reachable_nodes hsc_env (filter (not . isInteractiveModule) mods)
+      hmis <- catMaybes <$> mapM (\m -> lookupHugByModule m (hsc_HUG hsc_env)) home_mods
+      forceInParallel
+        [ bcos | hmi <- hmis
+               , Just l <- [pick hmi]
+               , LazyBCOs bcos _ <- NE.toList (linkableParts l) ]
+  where
+    dflags = hsc_dflags hsc_env
+
+    -- The same choice as 'homeModLinkable' in "GHC.Linker.Deps".
+    pick hmi
+      | gopt Opt_UseBytecodeRatherThanObjects dflags
+      = homeModInfoByteCode hmi <|> homeModInfoObject hmi
+      | otherwise
+      = homeModInfoObject hmi <|> homeModInfoByteCode hmi
+
+    ignore :: SomeException -> IO ()
+    ignore e
+      | isAsyncException e = throwIO e
+      | otherwise          = pure ()
+
+isAsyncException :: SomeException -> Bool
+isAsyncException e = isJust (fromException e :: Maybe SomeAsyncException)
+
+-- | Evaluate the given values to WHNF using up to 'getNumCapabilities' threads.
+-- Synchronous exceptions from the values are ignored; asynchronous ones end the
+-- worker that receives them. If the caller is interrupted, the workers are
+-- killed.
+forceInParallel :: [a] -> IO ()
+forceInParallel []  = pure ()
+forceInParallel xs  = do
+    n_caps <- getNumCapabilities
+    queue  <- newIORef xs
+    let worker = do
+          next <- atomicModifyIORef' queue $ \case
+                    []     -> ([], Nothing)
+                    (y:ys) -> (ys, Just y)
+          case next of
+            Nothing -> pure ()
+            Just y  -> do
+              r <- try (evaluate y)
+              case r of
+                Left e | isAsyncException e -> throwIO e
+                _                           -> worker
+    workers <- replicateM (min n_caps (length xs)) $ do
+      done <- newEmptyMVar
+      tid  <- forkIO (worker `MC.finally` putMVar done ())
+      pure (tid, done)
+    mapM_ (takeMVar . snd) workers
+      `MC.onException` mapM_ (killThread . fst) workers
+
 {- **********************************************************************
 
               Loading a Decls statement
@@ -686,6 +775,9 @@ loadDecls :: Interp -> HscEnv -> SrcSpan -> Linkable -> IO ([(Name, ForeignHValu
 loadDecls interp hsc_env span linkable = do
     -- Initialise the linker (if it's not been done already)
     initLoaderState interp hsc_env
+
+    -- See Note [Compiling lazy bytecode outside the loader lock]
+    prepareLazyByteCode hsc_env needed_mods
 
     -- Take lock for the actual work.
     modifyLoaderState interp $ \pls0 -> do
