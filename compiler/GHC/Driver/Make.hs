@@ -61,6 +61,9 @@ import GHC.Linker.Types
 
 import GHC.Driver.Config.Diagnostic
 import GHC.Driver.Pipeline
+import GHC.Driver.Pipeline.Phases (TPhase (..), PhaseHook (..))
+import GHC.Driver.Pipeline.Execute (runPhase)
+import GHC.Driver.Hooks (Hooks (..))
 import GHC.Driver.Session
 import GHC.Driver.DynFlags (ReexportedModule(..))
 import GHC.Driver.Monad
@@ -1597,7 +1600,8 @@ executeCompileNode :: Int
 executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
   me@MakeEnv{..} <- ask
   -- Rehydrate any dependencies if this module had a boot file or is a signature file.
-  lift $ MaybeT (withAbstractSem compile_sem $ withLoggerHsc k me $ \hsc_env -> do
+  lift $ MaybeT (withAbstractSem compile_sem $ withLoggerHsc k me $ \hsc_env0 -> do
+     let hsc_env = releaseSemDuringExternalTools compile_sem hsc_env0
      hsc_env' <- liftIO $ maybeRehydrateBefore (setHUG hug hsc_env) mni fixed_mrehydrate_mods
      case mni of
        ModuleNodeCompile mod -> executeCompileNodeWithSource hsc_env' me  mod
@@ -1645,6 +1649,37 @@ executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
       cleanCurrentModuleTempFilesMaybe (hsc_logger hsc_env) (hsc_tmpfs hsc_env) lcl_dynflags
       return res
 
+
+-- | Give up our compile slot while an external tool (the assembler or the C
+-- compiler) runs on the module's behalf, and take it back afterwards.
+--
+-- The slot limits how many modules GHC compiles at once, but while the
+-- assembler runs the compilation is just waiting on another process. Holding
+-- the slot then leaves a capability idle: in a large project with cheap
+-- modules, a significant fraction of the slots can be stuck waiting for the
+-- assembler (process startup is particularly slow on macOS).
+--
+-- This cannot deadlock: a module only takes a slot once all its dependencies
+-- have been compiled, so slot holders never wait for each other.
+releaseSemDuringExternalTools :: AbstractSem -> HscEnv -> HscEnv
+releaseSemDuringExternalTools sem hsc_env =
+  hsc_env { hsc_hooks = hooks { runPhaseHook = Just (PhaseHook hook) } }
+  where
+    hooks = hsc_hooks hsc_env
+
+    run_phase :: TPhase a -> IO a
+    run_phase = case runPhaseHook hooks of
+      Just (PhaseHook h) -> h
+      Nothing            -> runPhase
+
+    hook :: TPhase a -> IO a
+    hook ph = case ph of
+      T_As {} -> without_slot (run_phase ph)
+      T_Cc {} -> without_slot (run_phase ph)
+      _       -> run_phase ph
+
+    without_slot :: IO b -> IO b
+    without_slot = MC.bracket_ (releaseSem sem) (acquireSem sem)
 
 {- Rehydration, see Note [Rehydrating Modules] -}
 
