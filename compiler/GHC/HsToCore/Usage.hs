@@ -177,7 +177,7 @@ mkObjectUsage pit plugins fc hug th_links_needed th_pkgs_needed = do
 
     msg m = moduleNameString (moduleName m) ++ "[TH] changed"
 
-    fing mmsg fn = UsageFile (mkFastString fn) <$> lookupFileCache fc fn <*> pure mmsg
+    fing mmsg fn = let fs = mkFastString fn in UsageFile fs <$> lookupFileCache fc fs <*> pure mmsg
 
     partToUsage m part =
       case linkablePartPath part of

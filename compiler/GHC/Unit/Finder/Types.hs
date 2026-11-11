@@ -17,6 +17,7 @@ import GHC.Platform.Ways
 import GHC.Unit.Env
 
 import GHC.Data.FastString
+import GHC.Data.FastString.Env
 import qualified Data.Set as Set
 
 -- | The 'FinderCache' maps modules to the result of
@@ -25,7 +26,11 @@ import qualified Data.Set as Set
 -- contents of this cache.
 --
 type FinderCacheState = InstalledModuleEnv InstalledFindResult
-type FileCacheState   = M.Map FilePath Fingerprint
+-- | Keyed by 'FastString' rather than 'FilePath': the recompilation checker
+-- looks up every file usage of every module here (hundreds per module when
+-- Template Haskell records the libraries it loaded), and comparing 'String'
+-- keys (after unpacking them) was a significant cost of a no-op rebuild.
+type FileCacheState   = FastStringEnv Fingerprint
 data FinderCache = FinderCache { flushFinderCaches :: UnitEnv -> IO ()
                                -- ^ remove all the home modules from the cache; package modules are
                                -- assumed to not move around during a session; also flush the file hash
@@ -34,7 +39,7 @@ data FinderCache = FinderCache { flushFinderCaches :: UnitEnv -> IO ()
                                -- ^ Add a found location to the cache for the module.
                                , lookupFinderCache :: InstalledModule -> IO (Maybe InstalledFindResult)
                                -- ^ Look for a location in the cache.
-                               , lookupFileCache   :: FilePath -> IO Fingerprint
+                               , lookupFileCache   :: FastString -> IO Fingerprint
                                -- ^ Look for the hash of a file in the cache. This should add it to the
                                -- cache. If the file doesn't exist, raise an IOException.
                                }

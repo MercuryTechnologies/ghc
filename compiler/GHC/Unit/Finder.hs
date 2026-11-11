@@ -64,6 +64,8 @@ import Control.Applicative ((<|>))
 import Control.Monad
 import Data.Time
 import qualified Data.Map as M
+import GHC.Data.FastString ( FastString, unpackFS )
+import GHC.Data.FastString.Env
 import GHC.Driver.Env
 import GHC.Driver.Config.Finder
 import qualified Data.Set as Set
@@ -105,11 +107,11 @@ InstalledNotFound.
 initFinderCache :: IO FinderCache
 initFinderCache = do
   mod_cache <- newIORef emptyInstalledModuleEnv
-  file_cache <- newIORef M.empty
+  file_cache <- newIORef emptyFsEnv
   let flushFinderCaches :: UnitEnv -> IO ()
       flushFinderCaches ue = do
         atomicModifyIORef' mod_cache $ \fm -> (filterInstalledModuleEnv is_ext fm, ())
-        atomicModifyIORef' file_cache $ \_ -> (M.empty, ())
+        atomicModifyIORef' file_cache $ \_ -> (emptyFsEnv, ())
        where
         is_ext mod _ = not (isUnitEnvInstalledModule ue mod)
 
@@ -127,13 +129,13 @@ initFinderCache = do
          c <- readIORef mod_cache
          return $! lookupInstalledModuleEnv c key
 
-      lookupFileCache :: FilePath -> IO Fingerprint
+      lookupFileCache :: FastString -> IO Fingerprint
       lookupFileCache key = do
          c <- readIORef file_cache
-         case M.lookup key c of
+         case lookupFsEnv c key of
            Nothing -> do
-             hash <- getFileHash key
-             atomicModifyIORef' file_cache $ \c -> (M.insert key hash c, ())
+             hash <- getFileHash (unpackFS key)
+             atomicModifyIORef' file_cache $ \c -> (extendFsEnv c key hash, ())
              return hash
            Just fp -> return fp
   return FinderCache{..}
