@@ -109,6 +109,7 @@ import Data.List (intercalate, isPrefixOf, nub, partition)
 import Data.Maybe
 import Data.Either
 import Control.Concurrent.MVar
+import Control.Concurrent (forkIO, getNumCapabilities)
 import qualified Control.Monad.Catch as MC
 import qualified Data.List.NonEmpty as NE
 
@@ -676,6 +677,59 @@ get_reachable_nodes hsc_env mods
     get_mod_info _ = return Nothing
 
 
+{-
+Note [Compiling lazy bytecode outside the loader lock]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With -fprefer-byte-code, the bytecode of home modules that are up to date is
+only generated when a splice first needs it: the linkable contains 'LazyBCOs' whose thunk
+compiles the Core bindings stored in the interface. These thunks used to be
+forced while linking, i.e. while holding the loader lock (see
+'modifyLoaderState'). After a change to a module low in the dependency graph,
+the first splices to run may need the bytecode of hundreds of modules, which
+were then compiled one after the other while every other module with a splice
+waited for the lock.
+
+So before taking the lock, 'prepareLazyByteCode' works out which linkables the
+splice needs and forces their bytecode, in parallel. Since it doesn't hold the
+lock it can't consult the current 'LoaderState'; it uses an empty one instead,
+which may select linkables that are already loaded, but their bytecode has
+already been forced, so this costs nothing. Forcing is idempotent, so this is
+purely an optimisation and any failure is ignored: the locked code path will
+force (and report) as before.
+-}
+
+prepareLazyByteCode :: Interp -> HscEnv -> SrcSpan -> [Module] -> IO ()
+prepareLazyByteCode interp hsc_env span mods = MC.handle ignore $ do
+    deps <- getLinkDeps (initLinkDepsOpts hsc_env) interp emptyLoaderState span mods
+    let lazy_bcos = [ bcos | l <- ldNeededLinkables deps
+                           , LazyBCOs bcos _ <- NE.toList (linkableParts l) ]
+    forceInParallel lazy_bcos
+  where
+    ignore :: SomeException -> IO ()
+    ignore e
+      | Just (_ :: SomeAsyncException) <- fromException e = throwIO e
+      | otherwise = pure ()
+
+-- | Evaluate the given values to WHNF using up to 'getNumCapabilities' threads.
+forceInParallel :: [a] -> IO ()
+forceInParallel []  = pure ()
+forceInParallel [x] = void (try @SomeException (evaluate x))
+forceInParallel xs  = do
+    n_caps <- getNumCapabilities
+    queue  <- newIORef xs
+    let worker = do
+          next <- atomicModifyIORef' queue $ \case
+                    []     -> ([], Nothing)
+                    (y:ys) -> (ys, Just y)
+          case next of
+            Nothing -> pure ()
+            Just y  -> try @SomeException (evaluate y) >> worker
+    dones <- replicateM (min n_caps (length xs)) $ do
+      done <- newEmptyMVar
+      _ <- forkIO (worker `MC.finally` putMVar done ())
+      pure done
+    mapM_ takeMVar dones
+
 {- **********************************************************************
 
               Loading a Decls statement
@@ -686,6 +740,9 @@ loadDecls :: Interp -> HscEnv -> SrcSpan -> Linkable -> IO ([(Name, ForeignHValu
 loadDecls interp hsc_env span linkable = do
     -- Initialise the linker (if it's not been done already)
     initLoaderState interp hsc_env
+
+    -- See Note [Compiling lazy bytecode outside the loader lock]
+    prepareLazyByteCode interp hsc_env span needed_mods
 
     -- Take lock for the actual work.
     modifyLoaderState interp $ \pls0 -> do
