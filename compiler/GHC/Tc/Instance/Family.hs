@@ -35,6 +35,8 @@ import GHC.Unit.External
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.Deps
+import GHC.Unit.Module.ModDetails ( ModDetails (..) )
+import GHC.Unit.Home.ModInfo ( HomeModInfo (..) )
 
 import GHC.Types.SrcLoc as SrcLoc
 import GHC.Types.Name.Reader
@@ -56,6 +58,7 @@ import Data.Function ( on )
 
 import qualified GHC.LanguageExtensions  as LangExt
 import Data.List (sortOn)
+import Data.IORef
 import qualified GHC.Unit.Home.Graph as HUG
 
 {- Note [The type family instance consistency story]
@@ -317,7 +320,7 @@ checkFamInstConsistency directlyImpMods
              -- See Note [Order of type family consistency checks]
              }
 
-       ; hpt_fam_insts <- liftIO $ HUG.allFamInstances hug
+       ; hpt_fam_insts <- liftIO $ homeFamInstsOnDemand hug
        ; debug_consistent_set <- mapM (\x -> (\y -> (x, length y)) <$> modConsistent x) directlyImpMods
        ; traceTc "init_consistent_set" (ppr debug_consistent_set)
        ; let init_consistent_set = map fst (reverse (sortOn snd debug_consistent_set))
@@ -327,7 +330,7 @@ checkFamInstConsistency directlyImpMods
   where
     -- See Note [Checking family instance optimization]
     checkMany
-      :: ModuleEnv FamInstEnv     -- home package family instances
+      :: (Module -> IO (Maybe FamInstEnv)) -- home package family instances
       -> (Module -> TcM [Module]) -- given A, modules checked when A was checked
       -> [Module]                 -- modules to process
       -> TcM ()
@@ -401,15 +404,40 @@ checkFamInstConsistency directlyImpMods
            ; mapM_ (checkForInjectivityConflicts (emptyFamInstEnv,env2)) check_now
  }
 
-getFamInsts :: ModuleEnv FamInstEnv -> Module -> TcM FamInstEnv
+getFamInsts :: (Module -> IO (Maybe FamInstEnv)) -> Module -> TcM FamInstEnv
 getFamInsts hpt_fam_insts mod
-  | Just env <- lookupModuleEnv hpt_fam_insts mod = return env
-  | otherwise = do { _ <- initIfaceTcRn (loadSysInterface doc mod)
-                   ; eps <- getEps
-                   ; return (expectJust $
-                             lookupModuleEnv (eps_mod_fam_inst_env eps) mod) }
+  = do { mb_env <- liftIO (hpt_fam_insts mod)
+       ; case mb_env of
+           Just env -> return env
+           Nothing  -> do { _ <- initIfaceTcRn (loadSysInterface doc mod)
+                          ; eps <- getEps
+                          ; return (expectJust $
+                                    lookupModuleEnv (eps_mod_fam_inst_env eps) mod) } }
   where
     doc = ppr mod <+> text "is a family-instance module"
+
+-- | The family instance environments of home modules, each built on demand
+-- (at most once).
+--
+-- 'checkFamInstConsistency' only looks at the modules whose consistency it
+-- actually needs to check. Building an environment for every module in the
+-- home package up front ('HUG.allFamInstances') instead made the check of
+-- every module compiled linear in the size of the home package.
+homeFamInstsOnDemand :: HUG.HomeUnitGraph -> IO (Module -> IO (Maybe FamInstEnv))
+homeFamInstsOnDemand hug = do
+  cache <- newIORef emptyModuleEnv
+  pure $ \mod -> do
+    c <- readIORef cache
+    case lookupModuleEnv c mod of
+      Just env -> pure (Just env)
+      Nothing -> do
+        mb_hmi <- HUG.lookupHugByModule mod hug
+        traverse (\hmi -> do
+                    let env = extendFamInstEnvList emptyFamInstEnv
+                                (md_fam_insts (hm_details hmi))
+                    modifyIORef' cache (\c' -> extendModuleEnv c' mod env)
+                    pure env)
+                 mb_hmi
 
 {-
 ************************************************************************
