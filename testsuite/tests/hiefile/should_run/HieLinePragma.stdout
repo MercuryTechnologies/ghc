@@ -1,0 +1,15 @@
+bar HieLinePragma.hs:30:1-3 bound in a type signature declaration
+bar HieLinePragma.hs:31:1-3 LHS of a match group
+bar HieLinePragma.hs:31:1-3 regular value bound with scope: ModuleScope bound at: HieLinePragma.hs:31:1-7
+bar HieLinePragma.hs:32:24-26 usage
+foozball HieLinePragma.hs:30:1-8 bound in a type signature declaration
+foozball HieLinePragma.hs:31:1-8 LHS of a match group
+foozball HieLinePragma.hs:31:1-8 regular value bound with scope: ModuleScope bound at: HieLinePragma.hs:31:1-12
+foozball HieLinePragma.hs:32:13-20 usage
+quuuuuux HieLinePragma.hs:30:6-13 bound in a type signature declaration
+quuuuuux HieLinePragma.hs:32:1-8 LHS of a match group
+quuuuuux HieLinePragma.hs:32:1-8 regular value bound with scope: ModuleScope bound at: HieLinePragma.hs:32:1-12
+quuuuuux HieLinePragma.hs:32:30-37 usage
+zap HieLinePragma.hs:31:1-3 bound in a type signature declaration
+zap HieLinePragma.hs:32:1-3 LHS of a match group
+zap HieLinePragma.hs:32:1-3 regular value bound with scope: ModuleScope bound at: HieLinePragma.hs:32:1-37
