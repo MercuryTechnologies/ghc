@@ -773,7 +773,7 @@ checkModUsage fc UsageFile{ usg_file_path = file,
                             usg_file_label = mlabel } =
   liftIO $
     handleIO handler $ do
-      new_hash <- lookupFileCache fc $ unpackFS file
+      new_hash <- lookupFileCache fc file
       if (old_hash /= new_hash)
          then return recomp
          else return UpToDate

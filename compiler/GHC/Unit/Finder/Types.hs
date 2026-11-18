@@ -24,7 +24,13 @@ import qualified Data.Set as Set
 -- contents of this cache.
 --
 type FinderCacheState = InstalledModuleEnv InstalledFindResult
-type FileCacheState   = M.Map FilePath Fingerprint
+-- | Keyed by 'OsPath' rather than 'FilePath': the recompilation checker looks
+-- up every file usage of every module here, hundreds per module when Template
+-- Haskell records the libraries it loaded, and comparing 'String' keys, after
+-- unpacking each usage's 'FastString' path, was a large part of a no-op
+-- rebuild. The keys are made by 'fastStringToOsPath', which on POSIX takes the
+-- 'FastString''s bytes without unpacking them, and are compared as bytes.
+type FileCacheState   = M.Map OsPath Fingerprint
 data FinderCache = FinderCache { fcModuleCache :: (IORef FinderCacheState)
                                , fcFileCache   :: (IORef FileCacheState)
                                }

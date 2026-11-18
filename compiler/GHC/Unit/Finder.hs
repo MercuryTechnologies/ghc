@@ -44,6 +44,7 @@ import GHC.Platform.Ways
 
 import GHC.Builtin.Names ( gHC_PRIM )
 
+import GHC.Data.FastString ( FastString, unpackFS )
 import GHC.Data.OsPath
 
 import GHC.Unit.Env
@@ -142,15 +143,20 @@ removeFromFinderCache :: FinderCache -> InstalledModule -> IO ()
 removeFromFinderCache (FinderCache ref _) key =
   atomicModifyIORef' ref $ \c -> (delInstalledModuleEnv c key, ())
 
-lookupFileCache :: FinderCache -> FilePath -> IO Fingerprint
-lookupFileCache (FinderCache _ file_cache) key = do
+-- | The hash of a file, from the cache, or read and added to it. The path is
+-- unpacked only to read the file. If the file doesn't exist, raise an
+-- 'IOException'.
+lookupFileCache :: FinderCache -> FastString -> IO Fingerprint
+lookupFileCache (FinderCache _ file_cache) path = do
    c <- readIORef file_cache
    case M.lookup key c of
      Nothing -> do
-       hash <- getFileHash key
+       hash <- getFileHash (unpackFS path)
        atomicModifyIORef' file_cache $ \c -> (M.insert key hash c, ())
        return hash
      Just fp -> return fp
+  where
+    key = fastStringToOsPath path
 
 -- -----------------------------------------------------------------------------
 -- The three external entry points
