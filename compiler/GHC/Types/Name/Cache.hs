@@ -9,6 +9,7 @@ module GHC.Types.Name.Cache
   , takeUniqFromNameCache
   , updateNameCache'
   , updateNameCache
+  , internModule
 
   -- * OrigNameCache
   , OrigNameCache
@@ -36,6 +37,9 @@ import GHC.Utils.Panic
 
 import Control.Applicative
 import Control.Concurrent.MVar
+import Data.IORef
+import qualified GHC.Data.Word64Map.Strict as W64
+import GHC.Data.FastString ( uniqueOfFS )
 import Control.Monad
 
 {-
@@ -112,13 +116,43 @@ there, hyperlinks won't work as expected. Test case: haddockHtmlTest (Bug923.hs)
 data NameCache = NameCache
   { nsUniqChar :: {-# UNPACK #-} !Char
   , nsNames    :: {-# UNPACK #-} !(MVar OrigNameCache)
+  , nsModules  :: {-# UNPACK #-} !(IORef ModuleInternTable)
+    -- ^ Shared 'Module' values for interface dependency lists.
+    -- See Note [Interning Modules read from interface files]
   }
+
+-- | 'Module's of definite units, keyed by the uniques of the unit id's and
+-- the module name's 'FastString's.
+type ModuleInternTable = W64.Word64Map (W64.Word64Map Module)
+
+{- Note [Interning Modules read from interface files]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The 'dep_orphs' and 'dep_finsts' fields of an interface's 'Dependencies' are
+transitive: every interface lists every orphan module and every module with
+family instances below it, so the same few thousand modules are repeated in
+every interface. Decoding builds a fresh 'Module' (and 'RealUnit') closure for
+each entry; only the 'FastString's inside are shared, via the FastString table.
+
+In a large project this is a lot of memory once all interfaces are loaded
+(e.g. by --make, GHCi or a persistent compile server): in one 30,696-module
+application interfaces list on average 398 orphan and 1,214 family-instance
+modules, i.e. ~49M 'Module' + 'RealUnit' closures (~2 GB), referring to only
+~33k distinct modules.
+
+So when reading an interface, 'GHC.Iface.Binary.getTables' registers a
+'BinaryReader' for 'Module' that decodes the module and returns the shared
+value from 'nsModules', and the 'Binary Dependencies' instance reads these two
+lists through it when present. The table lives in the 'NameCache' because that
+is already the per-session store of deduplicated names that every interface
+read goes through; it only grows, like the 'OrigNameCache'. Interning does not
+change any output: 'Module' equality and ordering are by value.
+-}
 
 -- | Per-module cache of original 'OccName's given 'Name's
 type OrigNameCache   = ModuleEnv (OccEnv Name)
 
 takeUniqFromNameCache :: NameCache -> IO Unique
-takeUniqFromNameCache (NameCache c _) = uniqFromTag c
+takeUniqFromNameCache (NameCache c _ _) = uniqFromTag c
 
 lookupOrigNameCache :: OrigNameCache -> Module -> OccName -> Maybe Name
 lookupOrigNameCache nc mod occ = lookup_infinite <|> lookup_normal
@@ -152,7 +186,7 @@ newNameCache = newNameCacheWith 'r' knownKeysOrigNameCache
 --
 -- Use `newNameCache` when possible.
 newNameCacheWith :: Char -> OrigNameCache -> IO NameCache
-newNameCacheWith c nc = NameCache c <$> newMVar nc
+newNameCacheWith c nc = NameCache c <$> newMVar nc <*> newIORef W64.empty
 
 -- | This takes a tag for uniques to be generated and the list of knownKeyNames
 -- These must be initialized properly to ensure that names generated from this
@@ -171,7 +205,24 @@ updateNameCache'
   :: NameCache
   -> (OrigNameCache -> IO (OrigNameCache, c))  -- The updating function
   -> IO c
-updateNameCache' (NameCache _c nc) upd_fn = modifyMVar' nc upd_fn
+updateNameCache' (NameCache _c nc _) upd_fn = modifyMVar' nc upd_fn
+
+-- | Return the shared copy of a 'Module' of a definite unit, adding it if this
+-- is the first time we see it. Other modules are returned unchanged.
+-- See Note [Interning Modules read from interface files]
+internModule :: NameCache -> Module -> IO Module
+internModule nc m@(Module (RealUnit (Definite uid)) mod_name) = do
+  tbl <- readIORef (nsModules nc)
+  case look tbl of
+    Just m' -> pure m'
+    Nothing -> atomicModifyIORef' (nsModules nc) $ \tbl' -> case look tbl' of
+      Just m' -> (tbl', m')
+      Nothing -> (W64.insertWith W64.union k1 (W64.singleton k2 m) tbl', m)
+  where
+    k1 = fromIntegral (uniqueOfFS (unitIdFS uid))
+    k2 = fromIntegral (uniqueOfFS (moduleNameFS mod_name))
+    look t = W64.lookup k1 t >>= W64.lookup k2
+internModule _ m = pure m
 
 -- this should be in `base`
 modifyMVar' :: MVar a -> (a -> IO (a,b)) -> IO b

@@ -84,6 +84,7 @@ module GHC.Utils.Binary
    ReaderUserData, getReaderUserData, setReaderUserData, noReaderUserData,
    WriterUserData, getWriterUserData, setWriterUserData, noWriterUserData,
    mkWriterUserData, mkReaderUserData,
+   lookupUserDataReader,
    newReadState, newWriteState,
    addReaderToUserData, addWriterToUserData,
    findUserDataReader, findUserDataWriter,
@@ -1497,6 +1498,16 @@ mkReader :: (ReadBinHandle -> IO s) -> BinaryReader s
 mkReader f = BinaryReader
   { getEntry = f
   }
+
+-- | Like 'findUserDataReader', but returns 'Nothing' if no 'BinaryReader'
+-- has been configured for the type.
+lookupUserDataReader :: forall a . Refl.Typeable a => Proxy a -> ReadBinHandle -> Maybe (BinaryReader a)
+lookupUserDataReader query bh =
+  case Map.lookup (Refl.someTypeRep query) (ud_reader_data $ getReaderUserData bh) of
+    Nothing -> Nothing
+    Just (SomeBinaryReader _ (reader :: BinaryReader x)) ->
+      Just (unsafeCoerce @(BinaryReader x) @(BinaryReader a) reader)
+      -- See the comment in 'findUserDataReader' about this 'unsafeCoerce'.
 
 -- | Find the 'BinaryReader' for the 'Binary' instance for the type identified by 'Proxy a'.
 --

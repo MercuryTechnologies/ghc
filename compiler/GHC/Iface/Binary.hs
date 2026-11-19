@@ -235,8 +235,13 @@ getTables name_cache bh = do
       , decodeReaderTable ifaceTypeReaderTable
       ]
 
-    writeIORef bhRef (getReaderUserData bhFinal)
-    pure bhFinal
+    -- Share 'Module's in dependency lists across interfaces.
+    -- See Note [Interning Modules read from interface files] in GHC.Types.Name.Cache
+    let moduleReader = mkReader (\h -> get h >>= internModule name_cache)
+        bhInterning  = addReaderToUserData moduleReader bhFinal
+
+    writeIORef bhRef (getReaderUserData bhInterning)
+    pure bhInterning
 
 -- | Write an interface file.
 --

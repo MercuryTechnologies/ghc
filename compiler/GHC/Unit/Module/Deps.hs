@@ -50,6 +50,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Bifunctor
 import Control.DeepSeq
+import Control.Monad (replicateM)
+import Data.Proxy (Proxy(..))
 import GHC.Types.Name.Set
 
 
@@ -251,8 +253,8 @@ instance Binary Dependencies where
                 tps <- get bh
                 hsigms <- get bh
                 sms <- get bh
-                os <- get bh
-                fis <- get bh
+                os <- getModuleList bh
+                fis <- getModuleList bh
                 return (Deps { dep_direct_mods_ = dms
                              , dep_direct_pkgs_ = dps
                              , dep_plugin_pkgs_ = plugin_pkgs
@@ -261,6 +263,16 @@ instance Binary Dependencies where
                              , dep_trusted_pkgs_ = tps
                              , dep_orphs_ = os,
                                dep_finsts_ = fis })
+
+-- | Read a @['Module']@ written by 'put_', sharing the 'Module's if the
+-- handle has a 'BinaryReader' for them.
+-- See Note [Interning Modules read from interface files] in GHC.Types.Name.Cache
+getModuleList :: ReadBinHandle -> IO [Module]
+getModuleList bh = case lookupUserDataReader (Proxy :: Proxy Module) bh of
+  Nothing  -> get bh
+  Just rdr -> do
+    n <- get bh :: IO Int
+    replicateM n (getEntry rdr bh)
 
 noDependencies :: Dependencies
 noDependencies = Deps
